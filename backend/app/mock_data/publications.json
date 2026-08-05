@@ -1,0 +1,16 @@
+[
+    {
+      "id": "paper-1",
+      "title": "Fault-Tolerant Quantum Systems",
+      "author_ids": ["author-1", "author-2"],
+      "year": 2026,
+      "grant_numbers": ["DE-SC0021234"]
+    },
+    {
+      "id": "paper-2",
+      "title": "Quantum Control Methods",
+      "author_ids": ["author-1"],
+      "year": 2025,
+      "grant_numbers": []
+    }
+  ]

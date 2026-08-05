@@ -1,0 +1,19 @@
+{
+  "name": "research-intelligence-tool",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "setup": "node scripts/setup.js",
+    "setup:frontend": "npm --prefix frontend install",
+    "setup:backend": "node scripts/setup-backend.js",
+    "setup:database": "node scripts/setup-database.js",
+    "dev": "concurrently -k -s first \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "dev:backend": "node scripts/backend-python.mjs -m uvicorn app.main:app --reload",
+    "test:setup": "node --test scripts/tests/**/*.test.js"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}
