@@ -1,20 +1,195 @@
 # Research Intelligence Platform
 
-Search researchers, publications, and grants, then filter results, explore collaboration patterns, and export data to CSV.
+A research intelligence tool for discovering researchers, analyzing publications, exploring grant-linked outputs, and understanding collaboration patterns across institutions, citations, and journals.
 
-Current data sources: **OpenAlex** and **arXiv**. Some arXiv author and grant matching is experimental.
+The platform combines multiple scholarly data providers behind a unified search and analysis workflow, with canonical author/work identity stored locally in SQLite.
+
+## Easy Setup for Non-Technical Users
+
+Use this guide if you want to run the app on your own laptop. No separate database install is needed — the app stores data locally on your computer.
+
+**You only need to install these once:** [Git](https://git-scm.com/downloads) (optional if you use ZIP download), [Node.js LTS](https://nodejs.org/) (includes `npm`, the tool that runs setup commands), and [Python 3](https://www.python.org/downloads/). On Windows, check **“Add Python to PATH”** during Python install.
+
+### Get the project files
+
+**Easiest (no Git):**
+
+1. On GitHub, click **Code** → **Download ZIP**.
+2. Unzip the folder (for example, to your Desktop).
+3. Open **Terminal** (Mac) or **PowerShell** (Windows) inside that folder (see step 5 below).
+
+**Recommended for updates (uses Git):**
+
+1. Install Git from the link above.
+2. In Terminal or PowerShell, run:
+   ```bash
+   git clone <repository-url>
+   cd research-intelligence-tool
+   ```
+
+### First-time setup
+
+#### Mac
+
+1. Install [Git](https://git-scm.com/downloads) (skip if you used Download ZIP).
+2. Install [Node.js LTS](https://nodejs.org/).
+3. Install [Python 3](https://www.python.org/downloads/).
+4. Get the project (ZIP or Git clone above).
+5. Open **Terminal** in the project folder:
+   - Finder → open the folder → right-click → **New Terminal at Folder**  
+   - or type `cd `, drag the folder into Terminal, press Enter.
+6. Create your settings file:
+   ```bash
+   cp backend/.env.example backend/.env
+   ```
+   `.env` is a local settings file for API keys and configuration. You can leave optional keys blank at first; features that need those services may not work until you add them. **Do not share or upload your `.env` file.**
+7. Run setup (installs what the app needs and prepares the local database):
+   ```bash
+   npm run setup
+   ```
+8. Start the app:
+   ```bash
+   npm run dev
+   ```
+9. Open the web address shown in Terminal (usually [http://localhost:5173/](http://localhost:5173/)).
+
+#### Windows
+
+1. Install [Git](https://git-scm.com/downloads) (skip if you used Download ZIP).
+2. Install [Node.js LTS](https://nodejs.org/).
+3. Install [Python 3](https://www.python.org/downloads/) — enable **“Add Python to PATH”**.
+4. Get the project (ZIP or Git clone above).
+5. Open **PowerShell** in the project folder:
+   - File Explorer → open the folder → click the address bar → type `powershell` → Enter.
+6. Create your settings file:
+   ```powershell
+   copy backend\.env.example backend\.env
+   ```
+   `.env` is a local settings file for API keys and configuration. You can leave optional keys blank at first; features that need those services may not work until you add them. **Do not share or upload your `.env` file.**
+7. Run setup:
+   ```powershell
+   npm run setup
+   ```
+8. Start the app:
+   ```powershell
+   npm run dev
+   ```
+9. Open the web address shown in PowerShell (usually [http://localhost:5173/](http://localhost:5173/)).
+
+### Every time you want to use the app
+
+1. Open the project folder.
+2. Open **Terminal** (Mac) or **PowerShell** (Windows) there.
+3. Run:
+   ```bash
+   npm run dev
+   ```
+4. Open the `localhost` address shown (usually port **5173**).
+5. When finished, press **Ctrl+C** in the terminal window to stop the app.
+
+### Easy setup — common problems
+
+| Problem | What to try |
+| --- | --- |
+| **`npm` is not recognized** | Install Node.js LTS, close and reopen Terminal/PowerShell, then try again. |
+| **`python` or `python3` not found** | Reinstall Python and enable **Add to PATH** (Windows). On Mac, install Python from python.org. |
+| **Port already in use** | Another copy of the app may be running. Close other terminal windows running `npm run dev`, or restart your computer. The app uses ports **5173** and **8000**. |
+| **`.env` missing or setup can’t find settings** | Make sure `backend\.env` exists (copy from `backend\.env.example` as in step 6). |
+| **`npm run setup` failed** | Read the error text in the terminal. Often it means Node, Python, or internet access is missing. Fix those, then run `npm run setup` again. |
+| **Database / migration error** | Run `npm run setup` again. The local database file is `backend/author_identity.db`. |
+
+For more detail (API keys, testing, project layout), see [Developer Setup](#developer-setup) below.
 
 ## What it does
 
-- Search authors
-- Search works / publications
-- Search publications by grant number
-- Select one or more authors
-- View one author’s publications
-- Find publications shared by multiple authors
-- Filter by year, source, journal/venue, grant, and author where supported
-- View publication and collaboration analysis
-- Export results to CSV
+- **Researcher / author discovery** — search by name or ORCID iD across OpenAlex, ORCID, and arXiv
+- **Publication analysis** — view, filter, sort, and export an author’s publications or publications shared by multiple authors
+- **Grant-linked publication discovery** — find works associated with a grant number
+- **Collaboration insights** — metrics, charts, and tables over stored publication data for selected authors
+- **Institution, citation, and journal analysis** — affiliation metadata, citation activity, institution networks/partnerships, and Scopus journal metrics (CiteScore, SJR, SNIP) where available
+
+## Current data sources
+
+| Source | Role |
+| --- | --- |
+| **OpenAlex** | Primary author and publication metadata (names, works, institutions, topics, citations, grants) |
+| **ORCID** | Author identity, search, and enrichment; strong cross-provider identity signal |
+| **arXiv** | Secondary author and publication source (some author/grant matching is experimental) |
+| **Scopus / Elsevier** | Journal metrics (CiteScore, SJR, SNIP) via the Serial Title API |
+
+**ORCID as an identity bridge.** When an ORCID iD matches exactly across providers, the platform links records: **ORCID → exact OpenAlex match → canonical author → OpenAlex publications**. Name similarity alone is never used to merge identities.
+
+## Author Search
+
+- **All Sources** is the default search mode.
+- You can also search **OpenAlex**, **ORCID**, or **arXiv** individually.
+- **Name search** — find researchers by display name (with optional affiliation hint).
+- **Direct ORCID iD search** — paste an ORCID such as `0000-0001-6860-9566` (with or without the `https://orcid.org/` prefix).
+- **Exact-ORCID cross-provider linking** — when OpenAlex and ORCID rows share the same ORCID iD, they are linked; duplicate OpenAlex rows are collapsed onto the ORCID-anchored result.
+- **Same-name researchers are not merged by name alone** — two different people named “Lin Lin” remain separate unless their ORCID iDs match.
+- **Conflicting ORCIDs remain separate** — the platform never merges solely on normalized display name.
+
+## Analyze Authors
+
+From Author Search, select one or more authors and open **Analyze authors**.
+
+- **One author** — that author’s publications.
+- **Multiple authors** — publications that include every selected author (intersection / common publications).
+- **Sorting and filtering** — by grant, institution, venue, source, date/year, and related facets where supported.
+- **Infinite scroll / load-more pagination** — the publications table fetches provider pages incrementally as you scroll.
+- **CSV export** — export the full filtered publication set (not only visible rows).
+- **Publication exclusions** — exclude specific works from the active analysis set.
+- **Author affiliation hover metadata** — hover author names in the table for available author and institution details.
+
+**Performance and sample-based statistics**
+
+- Normal table loading fetches provider pages incrementally; the first page renders without waiting for a full provider crawl.
+- The **Publications over time** chart and filter facet counts on Analyze Authors are based on the **initially loaded publication sample**, not the complete corpus. The UI states this explicitly (for example, “Based on the first *N* loaded publications” and “Filter options and counts are from currently loaded publications, not the full corpus.”).
+- **CSV export** can collect the full matching corpus according to your active filters.
+
+## Collaboration Insights
+
+Read-only analysis over stored/canonical publication data for the selected authors. Insights filters operate on dashboard data already loaded for the session and **do not trigger live provider crawls**.
+
+Includes:
+
+- Selected-author collaboration metrics
+- Collaboration combinations (chart and table)
+- Collaboration by year
+- Author and institution participation
+- Citation activity
+- Institution network and institution partnerships
+- **Top Journals** with Scopus journal metrics (CiteScore, SJR, SNIP) when Elsevier credentials are configured
+- **Background jobs** for large author selections so expensive Insights calculations can run asynchronously
+
+Open Insights from Analyze Authors via **Analysis**.
+
+## Grant Search and Grant Publications
+
+- Search by **grant number** (OpenAlex and arXiv where supported).
+- View publications associated with a grant.
+- Sort, filter, and paginate grant-linked publication results.
+- Results are **provider-aware** (metadata and coverage vary by source).
+
+## Canonical identity and data model
+
+The backend maintains a local identity layer on top of provider data:
+
+- **Canonical authors and works** — stable internal records used for analysis, persistence, and cross-session continuity.
+- **Provider records** — per-provider author/work identifiers (OpenAlex, ORCID, arXiv, etc.) attached to canonical entities.
+- **Exact provider IDs preferred** — merges and lookups favor exact ORCID iDs and provider-native IDs over fuzzy name matching.
+- **ORCID is a strong identity signal** — exact ORCID matches can link ORCID and OpenAlex provider records on the same canonical author.
+- **Never merge solely by normalized name** — ambiguous or conflicting identities remain separate.
+- **Publication-specific affiliations preferred** — when available, per-publication authorship affiliations are preferred over coarse global author metadata.
+
+## Performance architecture
+
+- Provider HTTP calls run **outside** SQLite write transactions.
+- **Caching and rate limiting** reduce duplicate external requests.
+- **Paginated provider retrieval** for interactive Analyze Authors pages.
+- **Background jobs** for expensive Collaboration Insights calculations on large selections.
+- SQLite uses **WAL mode and busy timeout** for safer concurrent access.
+- The first Analyze Authors page can render from the first provider page **without** a full corpus crawl.
 
 ## Requirements
 
@@ -24,57 +199,138 @@ Current data sources: **OpenAlex** and **arXiv**. Some arXiv author and grant ma
 
 Local data is stored in **SQLite**. No separate database server is required.
 
-## Download and run
+## Developer Setup
 
-```bash
-git clone <repository-url>
-cd research-intelligence-tool
-npm run setup
-npm run dev
-```
+1. Clone the repository:
 
-`npm run setup` installs dependencies, creates the Python environment, initializes the SQLite database, and applies migrations.
+   ```bash
+   git clone <repository-url>
+   cd research-intelligence-tool
+   ```
 
-`npm run dev` starts the frontend and backend together in one terminal. Press `Ctrl+C` to stop both.
+2. Create and configure the backend environment file:
+
+   ```bash
+   cp backend/.env.example backend/.env
+   ```
+
+   Edit `backend/.env`. At minimum, set `OPENALEX_API_KEY` for live researcher search. See [Optional environment variables](#optional-environment-variables) below.
+
+3. Install dependencies, create the Python environment, initialize SQLite, and apply migrations:
+
+   ```bash
+   npm run setup
+   ```
+
+4. Start the frontend and backend together:
+
+   ```bash
+   npm run dev
+   ```
+
+   Press `Ctrl+C` to stop both. Vite prints the frontend URL when it starts (typically [http://localhost:5173/](http://localhost:5173/)).
+
+### Optional environment variables
+
+Configured in `backend/.env` (see `backend/.env.example`):
+
+| Variable | Purpose |
+| --- | --- |
+| `OPENALEX_API_KEY` | **Recommended.** Live OpenAlex author/publication search |
+| `ORCID_CLIENT_ID` / `ORCID_CLIENT_SECRET` | Optional OAuth credentials (public ORCID reads use `ORCID_ENABLED` without OAuth) |
+| `ORCID_ENABLED` | Enable ORCID author search (default `true`) |
+| `ARXIV_ENABLED` | Enable arXiv search (default `true`) |
+| `ELSEVIER_API_KEY` | Scopus Serial Title API for journal metrics |
+| `ELSEVIER_INST_TOKEN` | Optional institutional token for off-campus Elsevier access |
+| `DATABASE_URL` | SQLite connection URL (default `sqlite+aiosqlite:///./author_identity.db`) |
+| `AUTHOR_RESOLUTION_ENABLED` | Canonical author resolution during search (default `true`) |
+
+Never commit real credentials. `backend/.env` is gitignored.
 
 ## Open the application
 
-- App: [http://localhost:5173/](http://localhost:5173/)
+- App: [http://localhost:5173/](http://localhost:5173/) (or the URL printed by Vite)
 - API docs: [http://localhost:8000/docs](http://localhost:8000/docs)
 
 ## Basic use
 
 1. Choose **Authors**, **Grants**, or **Works / Publications** from the menu.
-2. Choose a source (OpenAlex or arXiv).
-3. Enter a search.
+2. For authors, **All sources** is selected by default (or choose OpenAlex, ORCID, or arXiv).
+3. Enter a search — author name, ORCID iD, grant number, or publication query.
 4. Select authors or a grant.
-5. Open publication results.
-6. Use filters and analysis tools.
-7. Download CSV when you need a copy of the results.
+5. Open publication results or **Analyze authors**.
+6. Use filters, sorting, Insights, and exclusions as needed.
+7. Download CSV when you need a full export.
 
-## Project folders
+## Testing
 
-| Folder | Description |
+From the repository root (after `npm run setup`):
+
+**Backend tests**
+
+```bash
+node scripts/backend-python.mjs -m pytest -q
+```
+
+Or from `backend/` with the virtualenv activated:
+
+```bash
+cd backend && python -m pytest -q
+```
+
+**Frontend tests**
+
+```bash
+npm --prefix frontend test
+```
+
+**Frontend production build**
+
+```bash
+npm --prefix frontend run build
+```
+
+**Setup script tests** (optional)
+
+```bash
+npm run test:setup
+```
+
+## Project structure
+
+| Path | Description |
 | --- | --- |
-| `frontend/` | React app (Vite) |
-| `backend/` | FastAPI API, SQLite database, and migrations |
+| `frontend/` | React app (Vite, MUI) |
+| `backend/` | FastAPI API, SQLite database, Alembic migrations |
+| `backend/app/api/` | HTTP routes (search, authors, analysis, grants, …) |
+| `backend/app/integrations/openalex/` | OpenAlex client and search helpers |
+| `backend/app/integrations/orcid/` | ORCID client, normalization, search |
+| `backend/app/integrations/arxiv/` | arXiv Atom API client and parser |
+| `backend/app/integrations/elsevier/` | Elsevier / Scopus journal-metrics client |
+| `backend/app/services/author_resolution/` | Canonical author identity resolution |
+| `backend/app/services/analysis/` | Publications analysis, Insights, CSV export |
+| `backend/app/services/search/` | Unified multi-provider search orchestration |
+| `backend/tests/` | Backend pytest suite |
+| `backend/alembic/` | Database migrations |
 | `scripts/` | Setup helpers used by `npm run setup` |
 
 ## Troubleshooting
 
-- **Database / migrations** — rerun `npm run setup:database`. The SQLite file is `backend/author_identity.db`.
+- **Database / migrations** — rerun `npm run setup` or `npm run setup:database`. The SQLite file is `backend/author_identity.db`.
+- **Missing API results** — set `OPENALEX_API_KEY` in `backend/.env` and restart `npm run dev`.
 - **Permission denied creating the database** — make sure you can write to the `backend/` folder.
 - **Port already in use** — stop other apps using ports `5173` (frontend) or `8000` (backend), then run `npm run dev` again.
-- **OpenAlex or arXiv unavailable** — try again later, or switch source if one provider is down.
+- **OpenAlex, ORCID, or arXiv unavailable** — try again later, or switch source if one provider is down.
 - **Empty results** — coverage differs by source; a query may return nothing even when the search is valid.
+- **Journal metrics missing in Insights** — configure `ELSEVIER_API_KEY` (and `ELSEVIER_INST_TOKEN` if required for your access).
 
 ## Current limitations
 
-- Provider metadata can be incomplete.
-- arXiv author matching is not a verified identity.
-- arXiv grant matching is based on metadata text matching.
-- Institutions, ORCIDs, grants, or citation values may be unavailable.
-- The author insights page currently uses demonstration data.
+- Analyze Authors timeline and filter facets reflect the **initial loaded publication sample**, not the full corpus (CSV export can still gather the full filtered set).
+- Collaboration Insights depends on publication data already stored/synced for the selected authors; it does not live-crawl providers when you change filters.
+- ORCID-only authors without a linked publication provider (for example, no OpenAlex match) may not yet have publication coverage.
+- Scopus **author-profile** APIs are not currently relied upon for identity or publications.
+- Scopus **cited-by** / **Research Reach** functionality is **not yet implemented** in the product UI.
 
 ## Usage examples
 
@@ -84,7 +340,7 @@ Publication: Chen, Chi-Fang, Jorge Garza-Vargas, Joel A. Tropp, and Ramon Van Ha
 
 1. Open the application at [http://localhost:5173/](http://localhost:5173/).
 2. Click **Authors** in the left menu.
-3. Next to **Source:**, select **OpenAlex**.
+3. Leave **All sources** selected (or choose **OpenAlex**).
 4. Search for each author in turn:
    - Chi-Fang Chen
    - Jorge Garza-Vargas
@@ -99,8 +355,8 @@ Publication: Chen, Chi-Fang, Jorge Garza-Vargas, Joel A. Tropp, and Ramon Van Ha
 9. On this page you will see:
    - checkboxes for the selected authors at the top
    - filters (**Show filters** / **Hide filters**)
-   - the **Publications over time** chart
-   - the detailed publications table
+   - the **Publications over time** chart (based on loaded publications — see the on-page note)
+   - the detailed publications table with infinite scroll
 10. In the table, useful columns include:
     - **Authors** (the complete author list)
     - **Date**
@@ -110,8 +366,8 @@ Publication: Chen, Chi-Fang, Jorge Garza-Vargas, Joel A. Tropp, and Ramon Van Ha
     - **Source**
 11. Hover an author name in the table to see available author and institution information.
 12. Uncheck some author boxes to compare smaller groups. The chart and table update for the authors that remain checked.
-13. Click **Analysis** to open **Author Collaboration Analysis**. That page shows shared-publication counts, yearly collaboration (**Collaborative publications by year**), multi-author and multi-institution breakdowns, **Institution partnerships**, **Citation activity of selected publications**, and **Top journals / venues**. This page currently uses demonstration data (look for the **Demo data** badge and notice).
-14. Click **Download CSV** to export **all** filtered publications, not only the rows currently visible on screen. The button note says it exports all filtered publications with available author, institution, grant, venue, and source metadata.
+13. Click **Analysis** to open **Collaboration Insights** — shared-publication counts, yearly collaboration, participation breakdowns, institution network/partnerships, citation activity, and Top Journals (with Scopus metrics when configured).
+14. Click **Download CSV** to export **all** filtered publications, not only the rows currently visible on screen.
 
 Note: the exact paper may not appear if OpenAlex has incomplete or delayed indexing for that work.
 
@@ -119,7 +375,7 @@ Note: the exact paper may not appear if OpenAlex has incomplete or delayed index
 
 Publication: Oh, Hyunseok, Viraj Dharod, Carl Padgett, Lillian B. Hughes Wyatt, Jayameenakshi Venkatraman, Shreyas Parthasarathy, Ekaterina Osipova, Ian Hedgepeth, Jeffrey V. Cady, Luca Basso, Yongqiang Wang, Michael Titze, Edward S. Bielejec, Andrew M. Mounce, Dirk Bouwmeester, and Ania C. Bleszynski Jayich, “Spin-Embedded Diamond Optomechanical Resonator With a Mechanical Quality Factor Exceeding One Million,” *Optica* 13, no. 3, 485–490 (2026).
 
-1. Click **Authors** in the left menu and select **OpenAlex** as the source.
+1. Click **Authors** in the left menu and leave **All sources** selected (or choose **OpenAlex**).
 2. Search for several authors from the publication and add matching profiles to **Selected authors**.
 3. Select two or more matching profiles.
 4. Click **Analyze authors**.
@@ -129,17 +385,17 @@ Publication: Oh, Hyunseok, Viraj Dharod, Carl Padgett, Lillian B. Hughes Wyatt, 
    - pairs
    - smaller groups
    - one author only
-7. The **Publications over time** chart and the publications table update for the active author combination.
+7. The **Publications over time** chart and the publications table update for the active author combination (chart/facets reflect loaded publications only).
 8. To filter results:
    - click **Show filters**
-   - set **From year** / **To year**, and choose **Source**, **Journal / Venue**, or **Grant** as needed
+   - set **From year** / **To year**, and choose **Source**, **Journal / Venue**, **Grant**, or **Institution** as needed
    - checkbox selections update draft filters only
    - click **Apply filters** once to refresh the chart and table
 9. Hover an author name in the table for available author and institution details.
 10. A publication may list more than one grant number; available grants appear in the **Grants** column.
-11. Click **Analysis** to open **Author Collaboration Analysis**, where you can explore shared publications for pairs or groups, multi-author papers, multi-institution papers, institution partnerships, yearly collaboration, citation activity, and top journals. This page currently uses demonstration data.
+11. Click **Analysis** for Collaboration Insights on the current author selection and stored publication set.
 12. Click **Download CSV** to export the full filtered publication list.
 
 Note: selecting more authors usually returns fewer common publications, because every checked author must appear in the same publication.
 
-Results always depend on source coverage. A paper or author may be missing, incomplete, or delayed in OpenAlex or arXiv even when the search is correct.
+Results always depend on source coverage. A paper or author may be missing, incomplete, or delayed in OpenAlex, ORCID, or arXiv even when the search is correct.

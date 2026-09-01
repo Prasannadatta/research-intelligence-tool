@@ -27,54 +27,182 @@ const CLOSE_DELAY_MS = 250;
 
 const AuthorInfoPopoverContext = createContext(null);
 
-function formatUpdatedAt(value) {
-  if (!value) {
+function cleanText(value) {
+  if (value == null) {
     return null;
   }
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return null;
-  }
-  return date.toLocaleDateString(undefined, {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-  });
+  const text = String(value).replace(/\s+/g, " ").trim();
+  return text || null;
 }
 
-function formatInstitutionYears(years) {
-  if (!years) {
+function normalizeComparableText(value) {
+  return cleanText(value)?.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim() || "";
+}
+
+function buildPublicationInstitution(author) {
+  if (!author || typeof author !== "object") {
     return null;
   }
-  const from = years.from ?? years.from_;
-  const to = years.to;
-  if (from != null && to != null && from !== to) {
-    return `${from}–${to}`;
+  const institutions = Array.isArray(author.institutions) ? author.institutions : [];
+  const firstInstitution = institutions.find((row) => row);
+  const countries = Array.isArray(author.countries) ? author.countries : [];
+
+  let name = null;
+  let department = cleanText(author.department);
+  let countryCode = cleanText(countries[0]);
+  let source = cleanText(author.affiliationSource || author.affiliation_source);
+
+  if (typeof firstInstitution === "string") {
+    name = cleanText(firstInstitution);
+  } else if (firstInstitution && typeof firstInstitution === "object") {
+    name = cleanText(
+      firstInstitution.name
+        || firstInstitution.display_name
+        || firstInstitution.institution_name,
+    );
+    department = department || cleanText(firstInstitution.department);
+    countryCode = countryCode || cleanText(firstInstitution.country_code || firstInstitution.country);
+    source = source || cleanText(
+      firstInstitution.affiliation_source || firstInstitution.source,
+    );
   }
-  if (from != null) {
-    return String(from);
+
+  if (!name && !department && !countryCode) {
+    return null;
   }
-  if (to != null) {
-    return String(to);
+  return {
+    name,
+    department,
+    country_code: countryCode,
+    source,
+    publicationSpecific: true,
+  };
+}
+
+function getCurrentInstitution(summary) {
+  const institutions = Array.isArray(summary?.institutions) ? summary.institutions : [];
+  return institutions.find((row) => row?.current) || institutions[0] || null;
+}
+
+function formatProvider(value) {
+  const text = cleanText(value);
+  if (!text) {
+    return null;
+  }
+  const labels = {
+    openalex: "OpenAlex",
+    arxiv: "arXiv",
+  };
+  return labels[text.toLowerCase()] || text;
+}
+
+function providerFromAuthor(author) {
+  if (!author || typeof author !== "object") {
+    return null;
+  }
+  if (author.provider) {
+    return formatProvider(author.provider);
+  }
+  if (author.providerIds?.openalex?.length > 0) {
+    return "OpenAlex";
+  }
+  if (author.providerIds?.arxiv?.length > 0) {
+    return "arXiv";
   }
   return null;
 }
 
-function MetricRow({ label, value }) {
+function formatNumberValue(value) {
   if (value == null || value === "") {
-    return null;
+    return "—";
   }
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return "—";
+  }
+  return numeric.toLocaleString();
+}
+
+function formatTextValue(value) {
+  return cleanText(value) || "N/A";
+}
+
+function DetailRow({ label, value, text = false }) {
   return (
-    <Typography variant="body2" color="text.secondary">
-      <Box component="span" sx={{ color: "text.primary", fontWeight: 500 }}>
-        {label}:
-      </Box>{" "}
-      {typeof value === "number" ? value.toLocaleString() : value}
-    </Typography>
+    <Box
+      sx={{
+        display: "grid",
+        gridTemplateColumns: "88px 1fr",
+        columnGap: 1.25,
+        alignItems: "baseline",
+      }}
+    >
+      <Typography variant="body2" color="text.secondary">
+        {label}
+      </Typography>
+      <Typography variant="body2" color="text.primary" sx={{ minWidth: 0, overflowWrap: "anywhere" }}>
+        {text ? formatTextValue(value) : formatNumberValue(value)}
+      </Typography>
+    </Box>
   );
 }
 
-function AuthorSummaryContent({ summary, loading, error, unresolved }) {
+function buildCompactSummary(summary, activeAuthor) {
+  const publicationInstitution = buildPublicationInstitution(activeAuthor);
+  const currentInstitution = getCurrentInstitution(summary);
+  const primaryInstitution = publicationInstitution || currentInstitution;
+  const provider =
+    (Array.isArray(summary?.providers) && summary.providers.length > 0
+      ? summary.providers.map(formatProvider).filter(Boolean).join(", ")
+      : null)
+    || providerFromAuthor(activeAuthor);
+
+  const publicationName = normalizeComparableText(publicationInstitution?.name);
+  const currentName = normalizeComparableText(currentInstitution?.name);
+  const showCurrentInstitution = Boolean(
+    publicationInstitution
+      && currentInstitution?.name
+      && publicationName
+      && currentName
+      && publicationName !== currentName,
+  );
+
+  return {
+    displayName: formatTextValue(summary?.display_name || activeAuthor?.name),
+    institution: formatTextValue(primaryInstitution?.name),
+    department: formatTextValue(primaryInstitution?.department),
+    country: formatTextValue(primaryInstitution?.country_code),
+    currentInstitution: showCurrentInstitution ? currentInstitution.name : null,
+    worksCount: summary?.works_count,
+    citationCount: summary?.citation_count,
+    hIndex: summary?.h_index,
+    orcid: summary?.orcid || activeAuthor?.orcid,
+    provider,
+  };
+}
+
+function CompactAuthorSummary({ summary, activeAuthor }) {
+  const details = buildCompactSummary(summary, activeAuthor);
+
+  return (
+    <Box sx={{ display: "grid", gap: 0.25 }}>
+      <DetailRow label="Author" value={details.displayName} text />
+      <DetailRow label="Institution" value={details.institution} text />
+      <DetailRow label="Department" value={details.department} text />
+      <DetailRow label="Country" value={details.country} text />
+      {details.currentInstitution ? (
+        <DetailRow label="Current" value={details.currentInstitution} text />
+      ) : null}
+      <DetailRow label="Works" value={details.worksCount} />
+      <DetailRow label="Citations" value={details.citationCount} />
+      <DetailRow label="h-index" value={details.hIndex} />
+      <DetailRow label="ORCID" value={details.orcid} text />
+      <DetailRow label="Source" value={details.provider} text />
+    </Box>
+  );
+}
+
+function AuthorSummaryContent({ summary, loading, error, activeAuthor }) {
   if (loading) {
     return (
       <Box sx={{ display: "flex", alignItems: "center", gap: 1.25, py: 0.5 }}>
@@ -94,149 +222,7 @@ function AuthorSummaryContent({ summary, loading, error, unresolved }) {
     );
   }
 
-  if (!summary) {
-    return (
-      <Box sx={{ display: "grid", gap: 0.5 }}>
-        <Typography variant="body2" color="text.secondary">
-          No additional author information available
-        </Typography>
-        {unresolved ? (
-          <Typography variant="caption" color="text.secondary">
-            Metadata matched experimentally from provider records.
-          </Typography>
-        ) : null}
-      </Box>
-    );
-  }
-
-  const institutions = Array.isArray(summary.institutions) ? summary.institutions : [];
-  const currentInstitutions = institutions.filter((row) => row.current);
-  const otherInstitutions = institutions.filter((row) => !row.current);
-  const primaryInstitution = currentInstitutions[0] || institutions[0] || null;
-  const aliases = (summary.aliases || []).filter(
-    (alias) => alias && alias !== summary.display_name,
-  );
-  const topics = summary.topics || [];
-  const providers = summary.providers || [];
-  const updatedAt = formatUpdatedAt(summary.updated_at);
-
-  const hasDetails =
-    primaryInstitution ||
-    otherInstitutions.length > 0 ||
-    aliases.length > 0 ||
-    topics.length > 0 ||
-    summary.orcid ||
-    summary.works_count != null ||
-    summary.citation_count != null ||
-    summary.h_index != null ||
-    providers.length > 0;
-
-  if (!hasDetails) {
-    return (
-      <Box sx={{ display: "grid", gap: 0.5 }}>
-        <Typography variant="body2" color="text.secondary">
-          No additional author information available
-        </Typography>
-        {summary.unresolved || unresolved ? (
-          <Typography variant="caption" color="text.secondary">
-            Metadata matched experimentally from provider records.
-          </Typography>
-        ) : null}
-      </Box>
-    );
-  }
-
-  return (
-    <Box sx={{ display: "grid", gap: 0.75 }}>
-      <Typography variant="subtitle2" fontWeight={600}>
-        {summary.display_name}
-      </Typography>
-
-      {primaryInstitution ? (
-        <Box>
-          <Typography variant="body2" fontWeight={500}>
-            {primaryInstitution.name}
-          </Typography>
-          {primaryInstitution.department ? (
-            <Typography variant="body2" color="text.secondary">
-              {primaryInstitution.department}
-            </Typography>
-          ) : null}
-          {primaryInstitution.country_code ? (
-            <Typography variant="caption" color="text.secondary">
-              {primaryInstitution.country_code}
-            </Typography>
-          ) : null}
-        </Box>
-      ) : null}
-
-      {otherInstitutions.length > 0 ? (
-        <Box>
-          <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 0.25 }}>
-            Also affiliated with:
-          </Typography>
-          {otherInstitutions.map((institution) => {
-            const years = formatInstitutionYears(institution.years);
-            return (
-              <Typography key={`${institution.id || institution.name}-${years || "na"}`} variant="body2">
-                {institution.name}
-                {years ? (
-                  <Typography component="span" variant="body2" color="text.secondary">
-                    {" "}
-                    · {years}
-                  </Typography>
-                ) : null}
-              </Typography>
-            );
-          })}
-        </Box>
-      ) : null}
-
-      {aliases.length > 0 ? (
-        <Typography variant="body2" color="text.secondary">
-          <Box component="span" sx={{ color: "text.primary", fontWeight: 500 }}>
-            Aliases:
-          </Box>{" "}
-          {aliases.join(", ")}
-        </Typography>
-      ) : null}
-
-      {topics.length > 0 ? (
-        <Typography variant="body2" color="text.secondary">
-          <Box component="span" sx={{ color: "text.primary", fontWeight: 500 }}>
-            Topics:
-          </Box>{" "}
-          {topics.join(", ")}
-        </Typography>
-      ) : null}
-
-      <MetricRow label="ORCID" value={summary.orcid} />
-      <MetricRow label="Works" value={summary.works_count} />
-      <MetricRow label="Citations" value={summary.citation_count} />
-      <MetricRow label="h-index" value={summary.h_index} />
-
-      {providers.length > 0 ? (
-        <Typography variant="body2" color="text.secondary">
-          <Box component="span" sx={{ color: "text.primary", fontWeight: 500 }}>
-            Sources:
-          </Box>{" "}
-          {providers.join(", ")}
-        </Typography>
-      ) : null}
-
-      {updatedAt ? (
-        <Typography variant="caption" color="text.secondary">
-          Updated {updatedAt}
-        </Typography>
-      ) : null}
-
-      {summary.unresolved || unresolved ? (
-        <Typography variant="caption" color="text.secondary">
-          Metadata matched experimentally from provider records.
-        </Typography>
-      ) : null}
-    </Box>
-  );
+  return <CompactAuthorSummary summary={summary} activeAuthor={activeAuthor} />;
 }
 
 function useAuthorInfoPopover() {
@@ -529,6 +515,7 @@ export function AuthorInfoPopoverProvider({ children }) {
           loading={loading}
           error={error}
           unresolved={Boolean(activeAuthor?.unresolved)}
+          activeAuthor={activeAuthor}
         />
       </Popover>
     </AuthorInfoPopoverContext.Provider>

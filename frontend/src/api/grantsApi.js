@@ -50,6 +50,7 @@ export function buildGrantPublicationsCacheKey({
   grantNumber,
   provider,
   filtersKey = "",
+  sortKey = "",
   cursor = "*",
   limit = GRANT_PUBLICATIONS_PAGE_SIZE,
 }) {
@@ -62,6 +63,7 @@ export function buildGrantPublicationsCacheKey({
     source,
     normalized,
     filtersKey || "-",
+    sortKey || "-",
     cursorLabel,
     pageCursor,
   ].join(":");
@@ -100,6 +102,8 @@ export async function fetchGrantPublications({
   cursor,
   limit = GRANT_PUBLICATIONS_PAGE_SIZE,
   filters,
+  sortBy,
+  sortDirection,
   signal,
 } = {}) {
   const cleaned = normalizeGrantInput(grantNumber);
@@ -108,6 +112,10 @@ export async function fetchGrantPublications({
     limit,
     cursor: cursor == null || cursor === "" ? undefined : cursor,
   };
+  if (sortBy) {
+    params.sort_by = sortBy;
+    params.sort_direction = sortDirection === "asc" ? "asc" : "desc";
+  }
 
   if (filters && typeof filters === "object" && Object.keys(filters).length > 0) {
     params.filters = JSON.stringify(filters);
@@ -132,7 +140,7 @@ export async function fetchGrantPublications({
     match_type: data.match_type || null,
     items: Array.isArray(data.items) ? data.items : [],
     timeline: data.timeline ?? null,
-    facets: data.facets || { sources: [], venues: [], grants: [], authors: [] },
+    facets: data.facets || { sources: [], institutions: [], venues: [], grants: [], authors: [] },
     pagination: data.pagination || {
       next_cursor: null,
       has_more: false,
@@ -140,6 +148,33 @@ export async function fetchGrantPublications({
     next_cursor: data.pagination?.next_cursor ?? null,
     has_more: Boolean(data.pagination?.has_more),
   };
+}
+
+/**
+ * GET /api/grants/{grant_number}/publications/facets
+ */
+export async function fetchGrantPublicationFacets({
+  grantNumber,
+  provider,
+  filters,
+  signal,
+} = {}) {
+  const cleaned = normalizeGrantInput(grantNumber);
+  const params = {
+    provider: String(provider || "openalex").toLowerCase(),
+  };
+  if (filters && typeof filters === "object" && Object.keys(filters).length > 0) {
+    params.filters = JSON.stringify(filters);
+  }
+  const response = await apiClient.get(
+    `/grants/${encodeURIComponent(cleaned)}/publications/facets`,
+    {
+      params,
+      timeout: 45000,
+      signal,
+    },
+  );
+  return response.data || { sources: [], institutions: [], venues: [], grants: [], authors: [] };
 }
 
 /**

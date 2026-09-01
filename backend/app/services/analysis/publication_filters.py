@@ -17,8 +17,10 @@ _VENUE_WHITESPACE_RE = re.compile(r"\s+")
 FACET_VENUE_LIMIT = 50
 FACET_GRANT_LIMIT = 50
 FACET_AUTHOR_LIMIT = 50
+FACET_INSTITUTION_LIMIT = 50
 
 _AUTHOR_WHITESPACE_RE = re.compile(r"\s+")
+_INSTITUTION_PUNCT_RE = re.compile(r"[^\w\s]+", re.UNICODE)
 
 
 def normalize_venue_key(value: str | None) -> str | None:
@@ -95,6 +97,65 @@ def publication_venue(item: dict[str, Any]) -> str | None:
         if text:
             return text
     return None
+
+
+def normalize_institution_name(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = _INSTITUTION_PUNCT_RE.sub(" ", str(value).strip().lower())
+    text = _VENUE_WHITESPACE_RE.sub(" ", text).strip()
+    return text or None
+
+
+def institution_key(*, provider_id: Any = None, name: Any = None, country: Any = None) -> str | None:
+    provider_text = " ".join(str(provider_id or "").split()).strip()
+    if provider_text:
+        return f"institution:{provider_text.lower()}"
+    name_key = normalize_institution_name(str(name)) if name is not None else None
+    if not name_key:
+        return None
+    country_key = " ".join(str(country or "").split()).strip().lower()
+    return f"name:{name_key}|country:{country_key}"
+
+
+def publication_institutions(item: dict[str, Any]) -> list[dict[str, Any]]:
+    institutions: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    raw_authors = item.get("authors")
+    if not isinstance(raw_authors, list):
+        return institutions
+
+    for author in raw_authors:
+        if not isinstance(author, dict):
+            continue
+        author_countries = author.get("countries") if isinstance(author.get("countries"), list) else []
+        raw_institutions = author.get("institutions")
+        if not isinstance(raw_institutions, list):
+            continue
+        raw_ids = author.get("institution_ids") if isinstance(author.get("institution_ids"), list) else []
+        for index, raw in enumerate(raw_institutions):
+            if isinstance(raw, dict):
+                provider_id = raw.get("id") or raw.get("institution_id") or raw.get("openalex_id")
+                name = raw.get("name") or raw.get("display_name") or raw.get("institution_name")
+                country = raw.get("country_code") or raw.get("country")
+            else:
+                provider_id = raw_ids[index] if index < len(raw_ids) else None
+                name = raw
+                country = author_countries[index] if index < len(author_countries) else None
+            key = institution_key(provider_id=provider_id, name=name, country=country)
+            label = " ".join(str(name or provider_id or "").split()).strip()
+            if not key or not label or key in seen:
+                continue
+            seen.add(key)
+            institutions.append(
+                {
+                    "value": key,
+                    "label": label,
+                    "country": " ".join(str(country or "").split()).strip() or None,
+                    "provider_id": " ".join(str(provider_id or "").split()).strip() or None,
+                }
+            )
+    return institutions
 
 
 def publication_grants(item: dict[str, Any]) -> list[dict[str, str | None]]:
@@ -235,6 +296,17 @@ def normalize_filters(raw: dict[str, Any] | None) -> dict[str, Any]:
             venue_keys.add(key)
             venues.append(key)
 
+    institutions = []
+    institution_keys: set[str] = set()
+    for value in raw.get("institutions") or []:
+        text = " ".join(str(value or "").split()).strip()
+        if not text:
+            continue
+        key = text if ":" in text else institution_key(name=text)
+        if key and key not in institution_keys:
+            institution_keys.add(key)
+            institutions.append(key)
+
     grant_numbers = []
     grant_keys: set[str] = set()
     for value in raw.get("grant_numbers") or []:
@@ -258,6 +330,7 @@ def normalize_filters(raw: dict[str, Any] | None) -> dict[str, Any]:
         "from_year": from_year_int,
         "to_year": to_year_int,
         "sources": sources,
+        "institutions": institutions,
         "venues": venues,
         "grant_numbers": grant_numbers,
         "authors": authors,
@@ -270,11 +343,21 @@ def filters_key(filters: dict[str, Any] | None) -> str:
         f"from:{normalized['from_year'] or ''}",
         f"to:{normalized['to_year'] or ''}",
         "sources:" + ",".join(normalized["sources"]),
+        "institutions:" + ",".join(sorted(normalized["institutions"])),
         "venues:" + ",".join(sorted(normalized["venues"])),
         "grants:" + ",".join(sorted(normalized["grant_numbers"])),
         "authors:" + ",".join(sorted(normalized["authors"])),
     ]
     return "|".join(parts)
+
+
+def filters_key_matches(cursor_key: Any, active_key: str) -> bool:
+    cursor_text = str(cursor_key or "")
+    if cursor_text == active_key:
+        return True
+    # Older pagination cursors predate the institution facet segment.
+    legacy_active_key = active_key.replace("|institutions:", "")
+    return cursor_text == legacy_active_key
 
 
 def item_matches_filters(item: dict[str, Any], filters: dict[str, Any] | None) -> bool:
@@ -296,6 +379,15 @@ def item_matches_filters(item: dict[str, Any], filters: dict[str, Any] | None) -
     if normalized["venues"]:
         venue_key = normalize_venue_key(publication_venue(item))
         if venue_key not in normalized["venues"]:
+            return False
+
+    if normalized["institutions"]:
+        item_institution_keys = {
+            row["value"]
+            for row in publication_institutions(item)
+            if row.get("value")
+        }
+        if not item_institution_keys.intersection(normalized["institutions"]):
             return False
 
     if normalized["grant_numbers"]:
@@ -326,6 +418,7 @@ def apply_publication_filters(
             normalized["from_year"] is not None,
             normalized["to_year"] is not None,
             normalized["sources"],
+            normalized["institutions"],
             normalized["venues"],
             normalized["grant_numbers"],
             normalized["authors"],
@@ -341,8 +434,10 @@ def build_publication_facets(
     venue_limit: int = FACET_VENUE_LIMIT,
     grant_limit: int = FACET_GRANT_LIMIT,
     author_limit: int = FACET_AUTHOR_LIMIT,
+    institution_limit: int = FACET_INSTITUTION_LIMIT,
 ) -> dict[str, Any]:
     source_counts: dict[str, int] = {}
+    institution_counts: dict[str, dict[str, Any]] = {}
     venue_counts: dict[str, dict[str, Any]] = {}
     grant_counts: dict[str, dict[str, Any]] = {}
     author_counts: dict[str, dict[str, Any]] = {}
@@ -350,6 +445,26 @@ def build_publication_facets(
     for item in items:
         for source in publication_sources(item):
             source_counts[source] = source_counts.get(source, 0) + 1
+
+        for institution in publication_institutions(item):
+            key = institution.get("value")
+            if not key:
+                continue
+            bucket = institution_counts.get(key)
+            if bucket is None:
+                institution_counts[key] = {
+                    "value": key,
+                    "label": institution.get("label") or key,
+                    "country": institution.get("country"),
+                    "count": 1,
+                }
+            else:
+                bucket["count"] += 1
+                label = institution.get("label") or ""
+                if len(label) > len(str(bucket.get("label") or "")):
+                    bucket["label"] = label
+                if not bucket.get("country") and institution.get("country"):
+                    bucket["country"] = institution["country"]
 
         venue = publication_venue(item)
         venue_key = normalize_venue_key(venue)
@@ -434,11 +549,85 @@ def build_publication_facets(
         key=lambda row: (-int(row["count"]), str(row["label"]).lower()),
     )[: max(1, author_limit)]
 
+    institutions = sorted(
+        institution_counts.values(),
+        key=lambda row: (-int(row["count"]), str(row["label"]).lower()),
+    )[: max(1, institution_limit)]
+
     return {
         "sources": sources,
+        "institutions": institutions,
         "venues": venues,
         "grants": grants,
         "authors": authors,
+    }
+
+
+def filters_without_facet(filters: dict[str, Any] | None, facet: str) -> dict[str, Any]:
+    normalized = normalize_filters(filters)
+    if facet == "sources":
+        normalized["sources"] = []
+    elif facet == "institutions":
+        normalized["institutions"] = []
+    elif facet == "venues":
+        normalized["venues"] = []
+    elif facet == "grants":
+        normalized["grant_numbers"] = []
+    elif facet == "authors":
+        normalized["authors"] = []
+    return normalized
+
+
+def build_dependent_publication_facets(
+    items: list[dict[str, Any]],
+    filters: dict[str, Any] | None,
+    *,
+    venue_limit: int = FACET_VENUE_LIMIT,
+    grant_limit: int = FACET_GRANT_LIMIT,
+    author_limit: int = FACET_AUTHOR_LIMIT,
+    institution_limit: int = FACET_INSTITUTION_LIMIT,
+) -> dict[str, Any]:
+    source_facets = build_publication_facets(
+        apply_publication_filters(items, filters_without_facet(filters, "sources")),
+        venue_limit=1,
+        grant_limit=1,
+        author_limit=1,
+        institution_limit=1,
+    )["sources"]
+    institution_facets = build_publication_facets(
+        apply_publication_filters(items, filters_without_facet(filters, "institutions")),
+        venue_limit=1,
+        grant_limit=1,
+        author_limit=1,
+        institution_limit=institution_limit,
+    )["institutions"]
+    venue_facets = build_publication_facets(
+        apply_publication_filters(items, filters_without_facet(filters, "venues")),
+        venue_limit=venue_limit,
+        grant_limit=1,
+        author_limit=1,
+        institution_limit=1,
+    )["venues"]
+    grant_facets = build_publication_facets(
+        apply_publication_filters(items, filters_without_facet(filters, "grants")),
+        venue_limit=1,
+        grant_limit=grant_limit,
+        author_limit=1,
+        institution_limit=1,
+    )["grants"]
+    author_facets = build_publication_facets(
+        apply_publication_filters(items, filters_without_facet(filters, "authors")),
+        venue_limit=1,
+        grant_limit=1,
+        author_limit=author_limit,
+        institution_limit=1,
+    )["authors"]
+    return {
+        "sources": source_facets,
+        "institutions": institution_facets,
+        "venues": venue_facets,
+        "grants": grant_facets,
+        "authors": author_facets,
     }
 
 
@@ -448,7 +637,7 @@ def search_venue_facets(
     *,
     limit: int = 20,
 ) -> list[dict[str, Any]]:
-    facets = build_publication_facets(items, venue_limit=10_000, grant_limit=1)
+    facets = build_publication_facets(items, venue_limit=10_000, grant_limit=1, institution_limit=1)
     needle = normalize_venue_key(query) or ""
     if not needle:
         return facets["venues"][:limit]
@@ -467,7 +656,7 @@ def search_grant_facets(
     *,
     limit: int = 20,
 ) -> list[dict[str, Any]]:
-    facets = build_publication_facets(items, venue_limit=1, grant_limit=10_000, author_limit=1)
+    facets = build_publication_facets(items, venue_limit=1, grant_limit=10_000, author_limit=1, institution_limit=1)
     needle = normalize_grant_number(query) or ""
     query_lower = " ".join(str(query or "").split()).lower()
     if not needle and not query_lower:
@@ -492,6 +681,7 @@ def search_author_facets(
         venue_limit=1,
         grant_limit=1,
         author_limit=10_000,
+        institution_limit=1,
     )
     needle = normalize_author_key(query) or ""
     if not needle:

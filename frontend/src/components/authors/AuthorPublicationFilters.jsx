@@ -15,6 +15,7 @@ import {
   searchAuthorPublicationGrants,
   searchAuthorPublicationVenues,
 } from "../../api/analysisApi";
+import { getAnalysisPalette } from "../../theme/analysisPalette";
 import {
   PUBLICATION_FILTER_DEBOUNCE_MS,
   buildAppliedFilterChips,
@@ -25,9 +26,10 @@ import {
 } from "./publicationFilters";
 
 const YEAR_FIELD_SX = {
-  minWidth: 100,
-  maxWidth: 120,
-  flex: "0 0 auto",
+  width: { xs: "calc(50% - 5px)", sm: 110 },
+  minWidth: 0,
+  maxWidth: { xs: "calc(50% - 5px)", sm: 120 },
+  flex: { xs: "1 1 calc(50% - 5px)", sm: "0 1 110px" },
   position: "relative",
 };
 
@@ -35,14 +37,31 @@ const MAX_VISIBLE_TAGS = 1;
 
 const FILTER_WIDTHS = {
   source: { xs: "100%", sm: 232 },
+  institution: { xs: "100%", sm: 340 },
   venue: { xs: "100%", sm: 340 },
   grant: { xs: "100%", sm: 320 },
   authors: { xs: "100%", sm: 320 },
 };
 
 const FILTER_FIELD_SX = {
-  flex: { xs: "1 1 100%", sm: "0 0 auto" },
-  maxWidth: { xs: "100%", sm: "none" },
+  flex: { xs: "1 1 100%", sm: "1 1 240px", md: "1 1 280px" },
+  minWidth: 0,
+  maxWidth: "100%",
+};
+
+const FILTER_ACTIONS_SX = {
+  flex: { xs: "1 1 100%", sm: "0 1 auto" },
+  display: "flex",
+  gap: 1,
+  flexWrap: "wrap",
+  alignItems: "center",
+  justifyContent: { xs: "stretch", sm: "flex-start" },
+  minWidth: 0,
+  "& .MuiButton-root": {
+    flex: { xs: "1 1 0", sm: "0 0 auto" },
+    minWidth: { xs: 0, sm: "auto" },
+    whiteSpace: "nowrap",
+  },
 };
 
 const FILTER_AUTOCOMPLETE_SX = {
@@ -116,8 +135,10 @@ function useDebouncedFacetLookup(lookupFn, context) {
         abortRef.current.abort();
         abortRef.current = null;
       }
+      /* eslint-disable react-hooks/set-state-in-effect -- Lookup state must clear immediately when context/input is no longer searchable. */
       setOptions([]);
       setLoading(false);
+      /* eslint-enable react-hooks/set-state-in-effect */
       return undefined;
     }
 
@@ -187,6 +208,20 @@ function publicationCountLabel(count) {
     return null;
   }
   return `${n} publication${n === 1 ? "" : "s"}`;
+}
+
+function mergeSelectedOptions(options, selected, getKey, buildUnavailable) {
+  const rows = Array.isArray(options) ? [...options] : [];
+  const seen = new Set(rows.map((row) => getKey(row)).filter(Boolean));
+  for (const item of selected || []) {
+    const key = getKey(item);
+    if (!key || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    rows.push(buildUnavailable(item));
+  }
+  return rows;
 }
 
 function renderCheckboxOption(props, option, { selected }, { primary, secondary }) {
@@ -320,6 +355,7 @@ function AuthorPublicationFilters({
   venueSearchFn,
   secondarySearchFn,
   lookupContext,
+  showLoadedSampleHint = false,
 }) {
   const [expanded, setExpanded] = useState(false);
   const isGrantMode = filterMode === "grant";
@@ -341,11 +377,40 @@ function AuthorPublicationFilters({
   }, [facets]);
 
   const selectedSources = useMemo(
-    () =>
-      sourceOptions.filter((option) =>
-        (draftFilters.sources || []).includes(option.value),
-      ),
+    () => (draftFilters.sources || []).map((value) => {
+      const option = sourceOptions.find((row) => row.value === value);
+      return option || { value, label: value, count: 0, unavailable: true };
+    }),
     [draftFilters.sources, sourceOptions],
+  );
+  const sourceOptionsWithSelected = useMemo(
+    () =>
+      mergeSelectedOptions(
+        sourceOptions,
+        selectedSources,
+        (row) => row?.value,
+        (row) => ({ ...row, count: 0, unavailable: true }),
+      ),
+    [sourceOptions, selectedSources],
+  );
+
+  const institutionFacetOptions = useMemo(
+    () => (Array.isArray(facets?.institutions) ? facets.institutions : []),
+    [facets],
+  );
+  const selectedInstitutions = useMemo(
+    () => (Array.isArray(draftFilters.institutions) ? draftFilters.institutions : []),
+    [draftFilters.institutions],
+  );
+  const institutionOptions = useMemo(
+    () =>
+      mergeSelectedOptions(
+        institutionFacetOptions,
+        selectedInstitutions,
+        (row) => row?.value,
+        (row) => ({ ...row, count: 0, unavailable: true }),
+      ),
+    [institutionFacetOptions, selectedInstitutions],
   );
 
   const venueFacetOptions = useMemo(
@@ -377,15 +442,46 @@ function AuthorPublicationFilters({
     resolvedLookupContext,
   );
 
+  const venueFacetOptionsWithSelected = useMemo(
+    () =>
+      mergeSelectedOptions(
+        venueFacetOptions,
+        draftFilters.venues || [],
+        (row) => row?.value,
+        (row) => ({ ...row, count: 0, unavailable: true }),
+      ),
+    [draftFilters.venues, venueFacetOptions],
+  );
+  const grantFacetOptionsWithSelected = useMemo(
+    () =>
+      mergeSelectedOptions(
+        grantFacetOptions,
+        draftFilters.grants || [],
+        (row) => row?.grant_number,
+        (row) => ({ ...row, publication_count: 0, count: 0, unavailable: true }),
+      ),
+    [draftFilters.grants, grantFacetOptions],
+  );
+  const authorFacetOptionsWithSelected = useMemo(
+    () =>
+      mergeSelectedOptions(
+        authorFacetOptions,
+        draftFilters.authors || [],
+        (row) => row?.value,
+        (row) => ({ ...row, count: 0, unavailable: true }),
+      ),
+    [authorFacetOptions, draftFilters.authors],
+  );
+
   const venueOptions = venueLookup.inputValue.trim()
     ? venueLookup.options
-    : venueFacetOptions;
+    : venueFacetOptionsWithSelected;
   const grantOptions = secondaryLookup.inputValue.trim()
     ? secondaryLookup.options
-    : grantFacetOptions;
+    : grantFacetOptionsWithSelected;
   const authorOptions = secondaryLookup.inputValue.trim()
     ? secondaryLookup.options
-    : authorFacetOptions;
+    : authorFacetOptionsWithSelected;
 
   const validation = useMemo(
     () => validatePublicationFilters(draftFilters),
@@ -450,6 +546,17 @@ function AuthorPublicationFilters({
               size="small"
               label={chip.label}
               onDelete={disabled || applying ? undefined : () => onRemoveChip(chip)}
+              sx={(theme) => {
+                const palette = getAnalysisPalette(theme);
+                return {
+                  bgcolor: palette.navySoft,
+                  color: palette.navy,
+                  fontWeight: 600,
+                  "& .MuiChip-deleteIcon": {
+                    color: palette.navy,
+                  },
+                };
+              }}
             />
           ))}
         </Stack>
@@ -461,6 +568,17 @@ function AuthorPublicationFilters({
           {expanded ? "Hide filters" : "Show filters"}
         </Button>
       </Stack>
+      {showLoadedSampleHint && !isGrantMode ? (
+        <Typography
+          variant="caption"
+          color="text.secondary"
+          sx={{ display: "block", mb: expanded ? 1 : 0 }}
+          data-testid="publication-filter-sample-hint"
+        >
+          Filter options and counts are from currently loaded publications, not the full
+          corpus.
+        </Typography>
+      ) : null}
 
       <Collapse in={expanded} timeout="auto" unmountOnExit={false}>
         <Stack
@@ -470,6 +588,9 @@ function AuthorPublicationFilters({
           spacing={1.25}
           sx={{
             alignItems: "center",
+            width: "100%",
+            minWidth: 0,
+            overflow: "hidden",
           }}
         >
           <TextField
@@ -524,7 +645,7 @@ function AuthorPublicationFilters({
           <CheckboxFilterAutocomplete
             label="Source"
             placeholder="Select sources"
-            options={sourceOptions}
+            options={sourceOptionsWithSelected}
             value={selectedSources}
             disabled={disabled || sourceOptions.length === 0}
             getOptionLabel={(option) => option?.label || ""}
@@ -536,6 +657,28 @@ function AuthorPublicationFilters({
               updateDraft({ sources: next.map((row) => row.value) })
             }
             sx={{ width: FILTER_WIDTHS.source }}
+          />
+
+          <CheckboxFilterAutocomplete
+            label="Institution"
+            placeholder="Select institutions"
+            options={institutionOptions}
+            value={selectedInstitutions}
+            disabled={disabled}
+            getOptionLabel={(option) => option?.label || ""}
+            isOptionEqualToValue={(option, selected) => option?.value === selected?.value}
+            getTagLabel={(option) => option?.label || option?.value || ""}
+            getOptionPrimary={(option) => option?.label || option?.value || ""}
+            getOptionSecondary={(option) => {
+              const countText = publicationCountLabel(option?.count);
+              const country = option?.country ? String(option.country).trim() : "";
+              if (country && countText) {
+                return `${country} · ${countText}`;
+              }
+              return countText || country || null;
+            }}
+            onChange={(next) => updateDraft({ institutions: next })}
+            sx={{ width: FILTER_WIDTHS.institution }}
           />
 
           <CheckboxFilterAutocomplete
@@ -605,24 +748,26 @@ function AuthorPublicationFilters({
             />
           )}
 
-          <Button
-            size="small"
-            variant="contained"
-            disableElevation
-            disabled={!canApply}
-            onClick={handleApply}
-            sx={{ textTransform: "none", flexShrink: 0 }}
-          >
-            {applying ? "Applying…" : "Apply filters"}
-          </Button>
-          <Button
-            size="small"
-            disabled={disabled || applying}
-            onClick={handleReset}
-            sx={{ textTransform: "none", flexShrink: 0 }}
-          >
-            Reset
-          </Button>
+          <Box sx={FILTER_ACTIONS_SX}>
+            <Button
+              size="small"
+              variant="contained"
+              disableElevation
+              disabled={!canApply}
+              onClick={handleApply}
+              sx={{ textTransform: "none" }}
+            >
+              {applying ? "Applying…" : "Apply filters"}
+            </Button>
+            <Button
+              size="small"
+              disabled={disabled || applying}
+              onClick={handleReset}
+              sx={{ textTransform: "none" }}
+            >
+              Reset
+            </Button>
+          </Box>
         </Stack>
       </Collapse>
     </Box>

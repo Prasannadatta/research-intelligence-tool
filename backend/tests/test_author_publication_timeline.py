@@ -144,7 +144,7 @@ def test_build_timeline_exposes_matching_and_dated_totals():
     assert sum(row["count"] for row in timeline["items"]) == 1
 
 
-def test_single_author_endpoint_includes_full_timeline_not_only_first_page(monkeypatch):
+def test_single_author_endpoint_timeline_uses_fetched_page_only(monkeypatch):
     monkeypatch.setenv("ARXIV_ENABLED", "false")
     get_settings.cache_clear()
     page_one = [
@@ -213,10 +213,11 @@ def test_single_author_endpoint_includes_full_timeline_not_only_first_page(monke
     assert len(body["items"]) == 1
     assert body["timeline"] is not None
     assert body["timeline"]["interval"] == "month"
-    assert body["timeline"]["total_dated_publications"] == 2
-    assert body["timeline"]["total_matching_publications"] == 2
-    assert sum(row["count"] for row in body["timeline"]["items"]) == 2
-    assert mock_oa.await_count >= 2
+    assert body["timeline"]["total_dated_publications"] == 1
+    assert body["timeline"]["total_matching_publications"] == 1
+    assert sum(row["count"] for row in body["timeline"]["items"]) == 1
+    assert body["pagination"]["has_more"] is True
+    assert mock_oa.await_count == 1
 
 
 def test_multi_author_timeline_uses_common_publications_only(monkeypatch):

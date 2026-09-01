@@ -85,4 +85,38 @@ describe("AuthorPublicationTrendChart", () => {
     renderChart({ error: "Could not load publication timeline." });
     expect(screen.getByText("Could not load publication timeline.")).toBeInTheDocument();
   });
+
+  it("describes a page-local sample when the provider total is known", () => {
+    renderChart({
+      pageLocal: true,
+      providerTotalCount: 1037,
+      timeline: {
+        interval: "year",
+        total_dated_publications: 20,
+        total_matching_publications: 20,
+        items: [{ period: "2021", label: "2021", count: 20 }],
+      },
+    });
+    expect(
+      screen.getByText("Timeline based on 20 of 1,037 publications"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("20 of 20 publications have usable date metadata"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("falls back when the provider total is unavailable", () => {
+    renderChart({
+      pageLocal: true,
+      timeline: {
+        interval: "year",
+        total_dated_publications: 20,
+        total_matching_publications: 20,
+        items: [{ period: "2021", label: "2021", count: 20 }],
+      },
+    });
+    expect(
+      screen.getByText("Based on the first 20 loaded publications"),
+    ).toBeInTheDocument();
+  });
 });

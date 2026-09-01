@@ -7,6 +7,9 @@ import GrantPublicationsPage, {
   clearGrantPublicationsPageCache,
 } from "./GrantPublicationsPage";
 import * as grantsApi from "../../api/grantsApi";
+import * as authorSummaryApi from "../../api/authorSummaryApi";
+import * as savedSearchesApi from "../../features/savedSearches/savedSearchesApi";
+import { clearAuthorSummaryCache } from "../authors/authorSummaryCache";
 
 vi.mock("react-apexcharts", () => ({
   default: () => <div data-testid="apex-chart-mock" />,
@@ -19,7 +22,21 @@ const BASE_RESPONSE = {
     {
       id: "g1",
       title: "Grant Paper",
-      authors: [{ name: "Ada Lovelace" }],
+      authors: [
+        {
+          name: "Ada Lovelace",
+          canonical_author_id: "aaaaaaaa-1111-4111-8111-111111111111",
+          provider_ids: { openalex: ["A1234567890"], orcid: [], arxiv: [] },
+          institutions: [
+            {
+              name: "Analytical Engine Institute",
+              department: "Department of Mathematics",
+              country_code: "GB",
+            },
+          ],
+          countries: ["GB"],
+        },
+      ],
       publication_year: 2022,
     },
   ],
@@ -75,13 +92,16 @@ function renderPage(path = "/grants/R01GM123456?provider=openalex") {
 describe("GrantPublicationsPage filters", () => {
   beforeEach(() => {
     clearGrantPublicationsPageCache();
+    clearAuthorSummaryCache();
     vi.stubGlobal("IntersectionObserver", IntersectionObserverStub);
     vi.spyOn(grantsApi, "fetchGrantPublications").mockResolvedValue(BASE_RESPONSE);
+    vi.spyOn(savedSearchesApi, "saveSavedSearch").mockResolvedValue({ id: "saved-grant" });
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
     clearGrantPublicationsPageCache();
+    clearAuthorSummaryCache();
   });
 
   it("does not refetch when draft year filters change until Apply", async () => {
@@ -95,6 +115,32 @@ describe("GrantPublicationsPage filters", () => {
 
     expect(grantsApi.fetchGrantPublications).toHaveBeenCalledTimes(1);
     expect(screen.getByRole("button", { name: "Apply filters" })).toBeEnabled();
+  });
+
+  it("saves the current grant search definition", async () => {
+    renderPage();
+    await waitFor(() => expect(grantsApi.fetchGrantPublications).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole("button", { name: "Save search" }));
+
+    await waitFor(() => {
+      expect(savedSearchesApi.saveSavedSearch).toHaveBeenCalledWith(
+        expect.objectContaining({
+          search_type: "grant",
+          payload: {
+            grant_number: "R01GM123456",
+            provider: "openalex",
+            filters: {},
+          },
+          metadata: expect.objectContaining({
+            funder_name: "NIH",
+            verified: true,
+            match_type: "exact",
+          }),
+        }),
+      );
+    });
+    expect(await screen.findByText("Saved")).toBeInTheDocument();
   });
 
   it("applies filters with exactly one refresh including filters", async () => {
@@ -118,6 +164,33 @@ describe("GrantPublicationsPage filters", () => {
       to_year: 2024,
     });
     expect(screen.getByText("2020–2024")).toBeInTheDocument();
+  });
+
+  it("sorts grant publications and preserves filter context", async () => {
+    renderPage();
+    await waitFor(() => expect(grantsApi.fetchGrantPublications).toHaveBeenCalledTimes(1));
+    expect(grantsApi.fetchGrantPublications.mock.calls[0][0]).toMatchObject({
+      sortBy: "year",
+      sortDirection: "desc",
+      cursor: null,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Show filters" }));
+    fireEvent.change(screen.getByLabelText("From year"), { target: { value: "2020" } });
+    fireEvent.click(screen.getByRole("button", { name: "Apply filters" }));
+    await waitFor(() => expect(grantsApi.fetchGrantPublications).toHaveBeenCalledTimes(2));
+
+    fireEvent.click(screen.getByRole("button", { name: /Citations/i }));
+    await waitFor(() => expect(grantsApi.fetchGrantPublications).toHaveBeenCalledTimes(3));
+
+    expect(grantsApi.fetchGrantPublications.mock.calls[2][0]).toMatchObject({
+      grantNumber: "R01GM123456",
+      provider: "openalex",
+      filters: { from_year: 2020 },
+      sortBy: "citations",
+      sortDirection: "asc",
+      cursor: null,
+    });
   });
 
   it("resets filters with one unfiltered refresh", async () => {
@@ -163,6 +236,46 @@ describe("GrantPublicationsPage filters", () => {
     fireEvent.click(screen.getByRole("button", { name: "Show filters" }));
     expect(screen.getByLabelText("Authors")).toBeInTheDocument();
     expect(screen.queryByLabelText("Grant")).not.toBeInTheDocument();
+  });
+
+  it("uses the shared author popover in the grant publications table", async () => {
+    vi.spyOn(authorSummaryApi, "fetchAuthorSummaryByCanonicalId").mockResolvedValue({
+      id: "aaaaaaaa-1111-4111-8111-111111111111",
+      display_name: "Ada Lovelace",
+      aliases: [],
+      institutions: [
+        {
+          name: "Analytical Engine Institute",
+          department: "Department of Mathematics",
+          country_code: "GB",
+          current: true,
+        },
+      ],
+      works_count: 12,
+      citation_count: 340,
+      h_index: 7,
+      orcid: null,
+      providers: ["openalex"],
+    });
+
+    renderPage();
+    const authorButton = await screen.findByRole("button", {
+      name: "View profile for Ada Lovelace",
+    });
+    fireEvent.mouseEnter(authorButton);
+
+    await waitFor(() => {
+      expect(screen.getByText("Analytical Engine Institute")).toBeInTheDocument();
+    });
+    expect(screen.getByText("Department")).toBeInTheDocument();
+    expect(screen.getByText("Department of Mathematics")).toBeInTheDocument();
+    expect(screen.getByText("Country")).toBeInTheDocument();
+    expect(screen.getByText("GB")).toBeInTheDocument();
+    expect(screen.getByText("12")).toBeInTheDocument();
+    expect(screen.getByText("340")).toBeInTheDocument();
+    expect(screen.getByText("7")).toBeInTheDocument();
+    expect(screen.getByText("N/A")).toBeInTheDocument();
+    expect(screen.getByText("OpenAlex")).toBeInTheDocument();
   });
 
   it("exports CSV with applied filters and route grant number", async () => {

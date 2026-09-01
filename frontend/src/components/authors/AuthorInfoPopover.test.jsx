@@ -39,10 +39,12 @@ const SUMMARY = {
     {
       name: "University of California, Berkeley",
       department: "Department of Biology",
+      country_code: "US",
       current: true,
       sources: ["openalex"],
     },
   ],
+  orcid: "0000-0002-1234-5678",
   works_count: 84,
   citation_count: 1520,
   h_index: 19,
@@ -124,7 +126,19 @@ describe("AuthorInfoPopover", () => {
     renderWithProvider(<AuthorNameLink author={AUTHOR} name="Jane Doe" />);
     await openAuthorPopover();
 
+    expect(screen.getAllByText("Jane Doe").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText("Author")).toBeInTheDocument();
+    expect(screen.getByText("Institution")).toBeInTheDocument();
     expect(screen.getByText("University of California, Berkeley")).toBeInTheDocument();
+    expect(screen.getByText("Department")).toBeInTheDocument();
+    expect(screen.getByText("Department of Biology")).toBeInTheDocument();
+    expect(screen.getByText("Country")).toBeInTheDocument();
+    expect(screen.getByText("US")).toBeInTheDocument();
+    expect(screen.getByText("84")).toBeInTheDocument();
+    expect(screen.getByText("1,520")).toBeInTheDocument();
+    expect(screen.getByText("19")).toBeInTheDocument();
+    expect(screen.getByText("0000-0002-1234-5678")).toBeInTheDocument();
+    expect(screen.getByText("OpenAlex")).toBeInTheDocument();
     expect(authorSummaryApi.fetchAuthorSummaryByCanonicalId).toHaveBeenCalledTimes(1);
   });
 
@@ -136,7 +150,7 @@ describe("AuthorInfoPopover", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(OPEN_DELAY);
     });
-    await waitFor(() => expect(screen.getByText("Genomics")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("84")).toBeInTheDocument());
 
     fireEvent.mouseEnter(button);
     fireEvent.mouseEnter(button);
@@ -144,7 +158,7 @@ describe("AuthorInfoPopover", () => {
       await vi.advanceTimersByTimeAsync(OPEN_DELAY * 2);
     });
 
-    expect(screen.getByText("Genomics")).toBeInTheDocument();
+    expect(screen.getByText("84")).toBeInTheDocument();
     expect(authorSummaryApi.fetchAuthorSummaryByCanonicalId).toHaveBeenCalledTimes(1);
   });
 
@@ -158,7 +172,7 @@ describe("AuthorInfoPopover", () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByText("Genomics")).toBeInTheDocument();
+      expect(screen.getByText("84")).toBeInTheDocument();
     });
     expect(authorSummaryApi.fetchAuthorSummaryByCanonicalId).toHaveBeenCalledTimes(1);
   });
@@ -180,7 +194,7 @@ describe("AuthorInfoPopover", () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByText("Genomics")).toBeInTheDocument();
+      expect(screen.getByText("84")).toBeInTheDocument();
     });
   });
 
@@ -190,15 +204,15 @@ describe("AuthorInfoPopover", () => {
 
     await openAuthorPopover(button);
     fireEvent.mouseLeave(button);
-    fireEvent.mouseEnter(screen.getByText("Genomics"));
+    fireEvent.mouseEnter(screen.getByText("84"));
 
-    expect(screen.getByText("Genomics")).toBeInTheDocument();
+    expect(screen.getByText("84")).toBeInTheDocument();
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(CLOSE_DELAY + 50);
     });
 
-    expect(screen.getByText("Genomics")).toBeInTheDocument();
+    expect(screen.getByText("84")).toBeInTheDocument();
   });
 
   it("closes once after leaving both trigger and popover", async () => {
@@ -207,14 +221,14 @@ describe("AuthorInfoPopover", () => {
 
     await openAuthorPopover(button);
     fireEvent.mouseLeave(button);
-    fireEvent.mouseLeave(screen.getByText("Genomics"));
+    fireEvent.mouseLeave(screen.getByText("84"));
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(CLOSE_DELAY + 20);
     });
 
     await waitFor(() => {
-      expect(screen.queryByText("Genomics")).not.toBeInTheDocument();
+      expect(screen.queryByText("84")).not.toBeInTheDocument();
     });
   });
 
@@ -235,7 +249,7 @@ describe("AuthorInfoPopover", () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByText("Genomics")).toBeInTheDocument();
+      expect(screen.getByText("84")).toBeInTheDocument();
     });
     expect(screen.getByRole("presentation")).toBeInTheDocument();
   });
@@ -249,13 +263,13 @@ describe("AuthorInfoPopover", () => {
       await vi.advanceTimersByTimeAsync(OPEN_DELAY);
     });
 
-    await waitFor(() => expect(screen.getByText("Genomics")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("84")).toBeInTheDocument());
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(500);
     });
 
-    expect(screen.getByText("Genomics")).toBeInTheDocument();
+    expect(screen.getByText("84")).toBeInTheDocument();
   });
 
   it("reuses cached metadata for repeated hovers", async () => {
@@ -263,7 +277,7 @@ describe("AuthorInfoPopover", () => {
     const button = getAuthorButton();
 
     await openAuthorPopover(button);
-    expect(screen.getByText("Genomics")).toBeInTheDocument();
+    expect(screen.getByText("84")).toBeInTheDocument();
 
     fireEvent.mouseLeave(button);
     await act(async () => {
@@ -275,7 +289,7 @@ describe("AuthorInfoPopover", () => {
       await vi.advanceTimersByTimeAsync(OPEN_DELAY);
     });
 
-    expect(await screen.findByText("Genomics")).toBeInTheDocument();
+    expect(await screen.findByText("84")).toBeInTheDocument();
     expect(authorSummaryApi.fetchAuthorSummaryByCanonicalId).toHaveBeenCalledTimes(1);
   });
 
@@ -309,7 +323,8 @@ describe("AuthorInfoPopover", () => {
       screen.getByRole("button", { name: "Author details for Name Only Author" }),
     );
 
-    expect(screen.getByText("No additional author information available")).toBeInTheDocument();
+    expect(screen.getAllByText("Name Only Author").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText("N/A").length).toBeGreaterThan(0);
     expect(authorSummaryApi.fetchAuthorSummaryByCanonicalId).not.toHaveBeenCalled();
     expect(warnSpy).toHaveBeenCalled();
 
@@ -332,13 +347,13 @@ describe("AuthorInfoPopover", () => {
       await vi.advanceTimersByTimeAsync(OPEN_DELAY);
     });
 
-    await waitFor(() => expect(screen.getByText("Genomics")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("84")).toBeInTheDocument());
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(1000);
     });
 
-    expect(screen.getByText("Genomics")).toBeInTheDocument();
+    expect(screen.getByText("84")).toBeInTheDocument();
     expect(screen.getByRole("presentation")).toBeInTheDocument();
   });
 });
@@ -408,6 +423,84 @@ describe("AuthorPublicationsTable author popovers", () => {
       expect.any(Object),
     );
     expect(authorSummaryApi.fetchAuthorSummaryByCanonicalId).toHaveBeenCalledTimes(1);
+  });
+
+  it("prefers paper-specific affiliation metadata in table popovers", async () => {
+    vi.mocked(authorSummaryApi.fetchAuthorSummaryByCanonicalId).mockResolvedValue({
+      id: "auth-a",
+      display_name: "Alice Alpha",
+      aliases: [],
+      institutions: [
+        {
+          id: "career",
+          name: "Career University",
+          current: true,
+          country_code: "US",
+        },
+      ],
+      topics: [],
+      providers: ["openalex"],
+    });
+
+    render(
+      <ThemeProvider theme={theme}>
+        <MemoryRouter>
+          <AuthorInfoPopoverProvider>
+            <AuthorPublicationsTable
+              works={[
+                {
+                  id: "work-1",
+                  title: "Example",
+                  authors: [
+                    {
+                      name: "Alice Alpha",
+                      canonical_author_id: "auth-a",
+                      provider_ids: { openalex: ["A9999999999"], orcid: [], arxiv: [] },
+                      institutions: [
+                        {
+                          name: "Paper University",
+                          country_code: "CA",
+                          department: "School of Information",
+                          affiliation_source: "structured_authorship",
+                        },
+                      ],
+                      countries: ["CA"],
+                      department: "School of Information",
+                      affiliation_source: "structured_authorship",
+                    },
+                  ],
+                  analysis_match: { verified: true, method: "x" },
+                },
+              ]}
+              loading={false}
+              loadingMore={false}
+              error={null}
+              mode="single_author"
+              sentinelRef={{ current: null }}
+              emptyCopy={{ heading: "No publications found", body: "Nothing here." }}
+              initialEmpty={false}
+            />
+          </AuthorInfoPopoverProvider>
+        </MemoryRouter>
+      </ThemeProvider>,
+    );
+
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "View profile for Alice Alpha" }));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(OPEN_DELAY);
+    });
+
+    await waitFor(() => {
+      expect(screen.getAllByText("Alice Alpha").length).toBeGreaterThanOrEqual(2);
+    });
+    expect(screen.getByText("Paper University")).toBeInTheDocument();
+    expect(screen.getByText("School of Information")).toBeInTheDocument();
+    expect(screen.getByText("CA")).toBeInTheDocument();
+    expect(screen.getByText("Current")).toBeInTheDocument();
+    expect(screen.getByText("Career University")).toBeInTheDocument();
+    expect(screen.getAllByText("—").length).toBeGreaterThanOrEqual(3);
+    expect(screen.getByText("N/A")).toBeInTheDocument();
+    expect(screen.getByText("OpenAlex")).toBeInTheDocument();
   });
 
   it("stays stable when table props rerender while popover is open", async () => {

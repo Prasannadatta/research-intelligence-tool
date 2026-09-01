@@ -277,6 +277,34 @@ def test_publication_affiliations_override_profile_institutions():
     assert "Career University" not in row["Author Affiliations"]
 
 
+def test_publication_departments_are_exported_from_authorship_metadata():
+    row = publication_item_to_row_dict(
+        {
+            "title": "Departments",
+            "authors": [
+                {
+                    "name": "Jane Doe",
+                    "institutions": [
+                        {
+                            "name": "Paper University",
+                            "department": "Department of Computer Science",
+                        }
+                    ],
+                    "department": "Department of Computer Science",
+                }
+            ],
+            "providers": ["openalex"],
+            "url": "https://example.com",
+            "journal": "Nature",
+            "publication_date": "2024-01-01",
+            "grants": [],
+        },
+    )
+
+    assert row["Author Affiliations"] == "Paper University"
+    assert row["Author Departments"] == "Department of Computer Science"
+
+
 def test_canonical_profile_affiliation_fallback():
     authors = [
         {

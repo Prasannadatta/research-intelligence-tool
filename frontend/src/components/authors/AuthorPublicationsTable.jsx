@@ -3,6 +3,7 @@ import { Link as RouterLink } from "react-router-dom";
 import {
   Box,
   ButtonBase,
+  Checkbox,
   Chip,
   IconButton,
   Link,
@@ -14,9 +15,11 @@ import {
   TableContainer,
   TableHead,
   TableRow,
+  TableSortLabel,
   Tooltip,
   Typography,
 } from "@mui/material";
+import { getAnalysisPalette } from "../../theme/analysisPalette";
 import ArticleOutlinedIcon from "@mui/icons-material/ArticleOutlined";
 import LinkIcon from "@mui/icons-material/Link";
 import OpenInNewIcon from "@mui/icons-material/OpenInNew";
@@ -34,6 +37,11 @@ import {
   getWorkVenue,
 } from "./authorPublicationHelpers";
 import { AuthorNameLink } from "./AuthorInfoPopover";
+import {
+  PUBLICATION_SORT_FIELDS,
+  nextPublicationSort,
+  normalizePublicationSort,
+} from "./publicationSorting";
 
 export const COLUMN_COUNT = 8;
 
@@ -205,7 +213,9 @@ function GrantsCell({ work, searchedGrantNumber = null, grantProvider = "openale
               height: 22,
               fontSize: "0.7rem",
               borderColor: isMatched ? undefined : "divider",
-              bgcolor: isMatched ? undefined : "action.hover",
+              bgcolor: isMatched
+                ? (theme) => getAnalysisPalette(theme).navy
+                : "action.hover",
               maxWidth: "100%",
               "& .MuiChip-label": {
                 overflow: "hidden",
@@ -357,14 +367,65 @@ function LinksCell({ work }) {
   );
 }
 
-function PublicationRow({ work, searchedGrantNumber = null, grantProvider = "openalex" }) {
+function PublicationRow({
+  work,
+  searchedGrantNumber = null,
+  grantProvider = "openalex",
+  selectable = false,
+  selected = false,
+  excluded = false,
+  onToggleSelected,
+}) {
   const venue = getWorkVenue(work);
   const date = getWorkDate(work);
+  const workId = getWorkId(work);
 
   return (
-    <TableRow sx={{ "&:last-child td": { borderBottom: 0 } }}>
+    <TableRow
+      data-testid={`publication-row-${workId || work.title}`}
+      sx={(theme) => {
+        const accents = getAnalysisPalette(theme);
+        return {
+        "&:last-child td": { borderBottom: 0 },
+          bgcolor: excluded ? accents.amberSoft : "inherit",
+        };
+      }}
+    >
+      {selectable ? (
+        <TableCell sx={{ ...bodyCellSx, width: 48, px: 1 }}>
+          <Checkbox
+            size="small"
+            checked={selected}
+            disabled={!workId}
+            onChange={() => onToggleSelected?.(workId)}
+            slotProps={{
+              input: {
+                "aria-label": `Select ${work?.title || "publication"}`,
+                "data-testid": `publication-select-${workId}`,
+              },
+            }}
+          />
+        </TableCell>
+      ) : null}
       <TableCell sx={{ ...bodyCellSx, minWidth: 220, maxWidth: 360 }}>
         <TitleCell work={work} />
+        {excluded ? (
+          <Chip
+            label="Excluded from Insights"
+            size="small"
+            sx={(theme) => {
+              const accents = getAnalysisPalette(theme);
+              return {
+                mt: 0.75,
+                height: 22,
+                fontSize: "0.7rem",
+                bgcolor: accents.amberSoft,
+                color: theme.palette.mode === "dark" ? accents.amber : "text.secondary",
+                fontWeight: 600,
+              };
+            }}
+          />
+        ) : null}
       </TableCell>
       <TableCell
         sx={{
@@ -417,10 +478,10 @@ function PublicationRow({ work, searchedGrantNumber = null, grantProvider = "ope
   );
 }
 
-function SkeletonRows() {
+function SkeletonRows({ columnCount = COLUMN_COUNT }) {
   return Array.from({ length: SKELETON_ROW_COUNT }, (_, index) => (
     <TableRow key={`skeleton-${index}`}>
-      {Array.from({ length: COLUMN_COUNT }, (__, cellIndex) => (
+      {Array.from({ length: columnCount }, (__, cellIndex) => (
         <TableCell key={cellIndex} sx={bodyCellSx}>
           <Skeleton variant="text" width={cellIndex === 0 ? "90%" : "70%"} />
         </TableCell>
@@ -429,15 +490,26 @@ function SkeletonRows() {
   ));
 }
 
-function StatusRow({ children }) {
+function StatusRow({ children, colSpan = COLUMN_COUNT }) {
   return (
     <TableRow>
-      <TableCell colSpan={COLUMN_COUNT} sx={{ ...bodyCellSx, py: 4, textAlign: "center" }}>
+      <TableCell colSpan={colSpan} sx={{ ...bodyCellSx, py: 4, textAlign: "center" }}>
         {children}
       </TableCell>
     </TableRow>
   );
 }
+
+const SORTABLE_HEADERS = [
+  { label: "Title", sortBy: PUBLICATION_SORT_FIELDS.TITLE },
+  { label: "Authors", sortBy: PUBLICATION_SORT_FIELDS.AUTHOR_COUNT },
+  { label: "Year", sortBy: PUBLICATION_SORT_FIELDS.YEAR },
+  { label: "Journal / Venue", sortBy: PUBLICATION_SORT_FIELDS.VENUE },
+  { label: "Citations", sortBy: PUBLICATION_SORT_FIELDS.CITATIONS },
+  { label: "Grants" },
+  { label: "Source" },
+  { label: "Links" },
+];
 
 function AuthorPublicationsTable({
   works,
@@ -450,8 +522,21 @@ function AuthorPublicationsTable({
   initialEmpty,
   searchedGrantNumber = null,
   grantProvider = "openalex",
+  selectedWorkIds = new Set(),
+  excludedWorkIds = new Set(),
+  onToggleSelected,
+  onToggleVisible,
+  sort,
+  onSortChange,
 }) {
   const showEmpty = !loading && !error && (initialEmpty || works.length === 0);
+  const selectable = Boolean(onToggleSelected);
+  const visibleWorkIds = works.map((work) => getWorkId(work)).filter(Boolean);
+  const visibleSelectedCount = visibleWorkIds.filter((id) => selectedWorkIds.has(id)).length;
+  const allVisibleSelected = visibleWorkIds.length > 0 && visibleSelectedCount === visibleWorkIds.length;
+  const someVisibleSelected = visibleSelectedCount > 0 && !allVisibleSelected;
+  const colSpan = COLUMN_COUNT + (selectable ? 1 : 0);
+  const normalizedSort = normalizePublicationSort(sort);
 
   return (
     <Paper
@@ -469,27 +554,51 @@ function AuthorPublicationsTable({
         <Table sx={{ minWidth: 1100 }} aria-label="Author publications">
           <TableHead>
             <TableRow>
-              {[
-                "Title",
-                "Authors",
-                "Date",
-                "Journal / Venue",
-                "Citations",
-                "Grants",
-                "Source",
-                "Links",
-              ].map((label) => (
+              {selectable ? (
+                <TableCell sx={{ ...headerCellSx, width: 48, px: 1 }}>
+                  <Checkbox
+                    size="small"
+                    checked={allVisibleSelected}
+                    indeterminate={someVisibleSelected}
+                    disabled={visibleWorkIds.length === 0}
+                    onChange={() => onToggleVisible?.(visibleWorkIds, !allVisibleSelected)}
+                    slotProps={{
+                      input: {
+                        "aria-label": "Select visible publications",
+                        "data-testid": "publication-select-visible",
+                      },
+                    }}
+                  />
+                </TableCell>
+              ) : null}
+              {SORTABLE_HEADERS.map(({ label, sortBy }) => (
                 <TableCell key={label} sx={headerCellSx}>
-                  {label}
+                  {sortBy && onSortChange ? (
+                    <TableSortLabel
+                      active={normalizedSort.sortBy === sortBy}
+                      direction={
+                        normalizedSort.sortBy === sortBy
+                          ? normalizedSort.sortDirection
+                          : "asc"
+                      }
+                      onClick={() =>
+                        onSortChange(nextPublicationSort(normalizedSort, sortBy))
+                      }
+                    >
+                      {label}
+                    </TableSortLabel>
+                  ) : (
+                    label
+                  )}
                 </TableCell>
               ))}
             </TableRow>
           </TableHead>
           <TableBody>
-            {loading ? <SkeletonRows /> : null}
+            {loading ? <SkeletonRows columnCount={colSpan} /> : null}
 
             {!loading && error ? (
-              <StatusRow>
+              <StatusRow colSpan={colSpan}>
                 <Typography color="error" variant="body2">
                   {typeof error === "string" ? error : "Publication analysis failed."}
                 </Typography>
@@ -497,7 +606,7 @@ function AuthorPublicationsTable({
             ) : null}
 
             {!loading && !error && showEmpty ? (
-              <StatusRow>
+              <StatusRow colSpan={colSpan}>
                 <Box sx={{ maxWidth: 480, mx: "auto" }}>
                   <Typography variant="subtitle1" fontWeight={600} sx={{ mb: 0.75 }}>
                     {emptyCopy?.heading ||
@@ -520,13 +629,17 @@ function AuthorPublicationsTable({
                     work={work}
                     searchedGrantNumber={searchedGrantNumber}
                     grantProvider={grantProvider}
+                    selectable={selectable}
+                    selected={selectedWorkIds.has(getWorkId(work))}
+                    excluded={excludedWorkIds.has(getWorkId(work))}
+                    onToggleSelected={onToggleSelected}
                   />
                 ))
               : null}
 
             {!loading && !error && works.length > 0 ? (
               <TableRow ref={sentinelRef} data-testid="publications-scroll-sentinel">
-                <TableCell colSpan={COLUMN_COUNT} sx={{ p: 0, border: 0 }}>
+                <TableCell colSpan={colSpan} sx={{ p: 0, border: 0 }}>
                   <Box sx={{ minHeight: 16, py: loadingMore ? 1.25 : 0, textAlign: "center" }}>
                     {loadingMore ? (
                       <Typography variant="body2" color="text.secondary">

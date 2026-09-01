@@ -45,20 +45,52 @@ def _institution_keys(institutions: list[Any]) -> set[str]:
     return keys
 
 
+def normalize_work_id(value: Any, *, id_type: str | None = None) -> str | None:
+    """Normalize work identifiers so DOI overlap matches across providers."""
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    kind = (id_type or "").strip().lower()
+    if text.startswith("https://doi.org/"):
+        text = text[len("https://doi.org/") :]
+        kind = "doi"
+    elif text.startswith("http://doi.org/"):
+        text = text[len("http://doi.org/") :]
+        kind = "doi"
+    elif text.startswith("doi:"):
+        text = text[4:]
+        kind = "doi"
+    if kind == "doi" or (text.startswith("10.") and "/" in text):
+        return f"doi:{text}"
+    return text
+
+
+def expand_work_id_keys(value: Any, *, id_type: str | None = None) -> list[str]:
+    canonical = normalize_work_id(value, id_type=id_type)
+    if not canonical:
+        return []
+    keys = {canonical, str(value).strip().lower()}
+    if canonical.startswith("doi:"):
+        keys.add(canonical[4:])
+    return [key for key in keys if key]
+
+
 def _work_ids(works: list[Any]) -> set[str]:
     ids: set[str] = set()
     for work in works or []:
         if isinstance(work, dict) and work.get("id"):
-            ids.add(str(work["id"]).lower())
+            ids.update(expand_work_id_keys(work.get("id"), id_type=work.get("id_type")))
             continue
-        # AuthorWork ORM rows expose both UUID `id` and string `work_id`.
         work_id = getattr(work, "work_id", None)
+        work_type = getattr(work, "work_id_type", None)
         if work_id:
-            ids.add(str(work_id).lower())
+            ids.update(expand_work_id_keys(work_id, id_type=work_type))
             continue
         ref_id = getattr(work, "id", None)
         if ref_id:
-            ids.add(str(ref_id).lower())
+            ids.update(expand_work_id_keys(ref_id, id_type=work_type))
     return ids
 
 
@@ -90,6 +122,8 @@ def score_candidate_pair(
             },
         )
 
+    same_orcid = bool(left_orcid and right_orcid and left_orcid == right_orcid)
+
     name_score = 0.0
     left_name = getattr(left, "normalized_name", None) or normalize_author_name(
         getattr(left, "display_name", "")
@@ -107,6 +141,8 @@ def score_candidate_pair(
         ):
             name_score = 22.0
             reasoning["signals"].append("compatible_name_format")
+        elif same_orcid:
+            reasoning["signals"].append("name_mismatch_ignored_same_orcid")
         else:
             reasoning["signals"].append("incompatible_name")
             return MatchScore(
@@ -153,8 +189,8 @@ def score_candidate_pair(
         reasoning["signals"].append("shared_coauthors")
 
     orcid_bonus = 0.0
-    if left_orcid and right_orcid and left_orcid == right_orcid:
-        orcid_bonus = 60.0
+    if same_orcid:
+        orcid_bonus = 70.0
         reasoning["signals"].append("same_orcid")
 
     same_provider_record = 0.0
@@ -181,7 +217,7 @@ def score_candidate_pair(
     # Safety: name + institution alone cannot auto-merge.
     strong_evidence = bool(
         shared_works
-        or (left_orcid and right_orcid and left_orcid == right_orcid)
+        or same_orcid
         or same_provider_record
         or shared_co
     )

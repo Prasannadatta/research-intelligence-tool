@@ -15,11 +15,13 @@ from app.schemas.grants import (
     GrantSuggestionsResponse,
     parse_filters_query,
 )
+from app.schemas.analysis import PublicationFacets
 from app.services.analysis.publication_csv_export import (
     prepare_grant_publication_export,
     stream_publication_csv,
 )
 from app.services.grants import (
+    build_grant_publication_facets,
     GrantPublicationsError,
     GrantSuggestionsError,
     list_grant_publications,
@@ -28,7 +30,10 @@ from app.services.grants import (
     suggest_grant_numbers,
 )
 
-router = APIRouter(prefix="/api/grants", tags=["grants"])
+router = APIRouter(
+    prefix="/api/grants",
+    tags=["grants"]
+)
 
 
 async def _optional_db_session():
@@ -62,6 +67,36 @@ async def grant_suggestions(
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
     return GrantSuggestionsResponse.model_validate(result)
+
+
+@router.get(
+    "/{grant_number}/publications/facets",
+    response_model=PublicationFacets,
+)
+async def grant_publication_facets(
+    grant_number: str = Path(..., min_length=1),
+    provider: str = Query(..., description="openalex or arxiv"),
+    filters: str | None = Query(
+        None,
+        description="JSON object with from_year, to_year, sources, institutions, venues, authors",
+    ),
+    session: AsyncSession | None = Depends(_optional_db_session),
+) -> PublicationFacets:
+    try:
+        parsed_filters = parse_filters_query(filters)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    try:
+        result = await build_grant_publication_facets(
+            session,
+            grant_number=grant_number,
+            provider=provider,
+            filters=parsed_filters,
+        )
+    except GrantPublicationsError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    return PublicationFacets.model_validate(result)
 
 
 @router.get(
@@ -150,6 +185,11 @@ async def grant_publications(
     provider: str = Query(..., description="openalex or arxiv"),
     cursor: str | None = Query(None),
     limit: int = Query(20, ge=1, le=20),
+    sort_by: str | None = Query(
+        None,
+        pattern="^(year|citations|title|venue|author_count)$",
+    ),
+    sort_direction: str = Query("desc", pattern="^(asc|desc)$"),
     filters: str | None = Query(
         None,
         description="JSON object with from_year, to_year, sources, venues, authors",
@@ -169,6 +209,8 @@ async def grant_publications(
             limit=limit,
             cursor=cursor,
             filters=parsed_filters,
+            sort_by=sort_by,
+            sort_direction=sort_direction,
         )
     except GrantPublicationsError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc

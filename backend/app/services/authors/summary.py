@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -417,7 +418,15 @@ async def lookup_canonical_ids_for_openalex_authors(
         )
         .options(selectinload(ProviderAuthorRecord.canonical_author))
     )
-    rows = (await session.execute(stmt)).scalars().all()
+    try:
+        rows = (await session.execute(stmt)).scalars().all()
+    except SQLAlchemyError:
+        logger.warning(
+            "OpenAlex author canonical lookup skipped because identity tables are unavailable",
+            exc_info=True,
+        )
+        await session.rollback()
+        return {}
 
     mapping: dict[str, dict[str, Any]] = {}
     for row in rows:

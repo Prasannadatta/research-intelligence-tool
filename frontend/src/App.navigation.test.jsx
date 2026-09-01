@@ -5,6 +5,8 @@ import { ThemeProvider, createTheme } from "@mui/material/styles";
 
 import App from "./App";
 import * as searchApi from "./api/searchApi";
+import * as savedSearchesApi from "./features/savedSearches/savedSearchesApi";
+import * as dataUpdaterApi from "./features/dataUpdater/dataUpdaterApi";
 
 const theme = createTheme({ colorSchemes: { light: true, dark: true } });
 
@@ -27,6 +29,8 @@ describe("App sidebar search navigation", () => {
     vi.spyOn(searchApi, "fetchSearchCapabilities").mockResolvedValue(
       searchApi.FALLBACK_CAPABILITIES,
     );
+    vi.spyOn(savedSearchesApi, "fetchSavedSearches").mockResolvedValue([]);
+    vi.spyOn(dataUpdaterApi, "fetchDataUpdaterSavedSearches").mockResolvedValue([]);
   });
 
   afterEach(() => {
@@ -49,6 +53,14 @@ describe("App sidebar search navigation", () => {
     fireEvent.click(screen.getByRole("button", { name: "Authors" }));
     await waitFor(() => {
       expect(getEntitySelect()).toHaveTextContent("Authors");
+    });
+  });
+
+  it("selects All sources on Author Search load", async () => {
+    renderApp("/?entity=authors");
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Search source")).toHaveTextContent("All sources");
     });
   });
 
@@ -115,6 +127,32 @@ describe("App sidebar search navigation", () => {
 
     await waitFor(() => {
       expect(getEntitySelect()).toHaveTextContent("Works");
+    });
+  });
+
+  it("navigates to Saved Searches from the sidebar", async () => {
+    renderApp("/");
+
+    fireEvent.click(screen.getByRole("button", { name: "Saved Searches" }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Saved Searches" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Saved Searches" })).toHaveClass(
+        "Mui-selected",
+      );
+    });
+  });
+
+  it("navigates to Data Updater from the sidebar", async () => {
+    renderApp("/");
+
+    fireEvent.click(screen.getByRole("button", { name: "Data Updater" }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Data Updater" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Data Updater" })).toHaveClass(
+        "Mui-selected",
+      );
     });
   });
 });

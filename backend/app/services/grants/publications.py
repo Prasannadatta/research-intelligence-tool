@@ -17,11 +17,16 @@ from app.integrations.openalex.grant_search import search_publications_for_grant
 from app.services.analysis.author_publications import build_publication_timeline
 from app.services.analysis.publication_filters import (
     apply_publication_filters,
-    build_publication_facets,
+    build_dependent_publication_facets,
     filters_key as build_filters_key,
+    filters_key_matches,
     normalize_filters,
     search_author_facets,
     search_venue_facets,
+)
+from app.services.analysis.publication_sorting import (
+    publication_sort_key,
+    sort_publications,
 )
 from app.services.analysis.work_authors import enrich_publication_items_authors
 from app.services.work_persistence.candidate import candidate_from_provider_result
@@ -62,7 +67,7 @@ def _match_meta_for_provider(provider: str) -> dict[str, Any]:
 
 
 def _empty_facets() -> dict[str, Any]:
-    return {"sources": [], "venues": [], "grants": [], "authors": []}
+    return {"sources": [], "institutions": [], "venues": [], "grants": [], "authors": []}
 
 
 def _encode_cursor(payload: dict[str, Any]) -> str:
@@ -414,11 +419,12 @@ async def _canonicalize_items(
     provider: str,
     results: list[dict[str, Any]],
     grant_number: str,
+    persist: bool = True,
 ) -> list[dict[str, Any]]:
     settings = get_settings()
     persistence = (
         WorkPersistenceService(session)
-        if session is not None and settings.work_persistence_enabled
+        if persist and session is not None and settings.work_persistence_enabled
         else None
     )
     items: list[dict[str, Any]] = []
@@ -507,6 +513,7 @@ async def _collect_grant_publications(
     *,
     grant_number: str,
     provider: str,
+    persist: bool = True,
 ) -> dict[str, Any]:
     settings = get_settings()
     if provider == "openalex" and not settings.openalex_configured:
@@ -559,6 +566,7 @@ async def _collect_grant_publications(
         provider=provider,
         results=raw_results,
         grant_number=grant_number,
+        persist=persist,
     )
     return {"items": items, "grant_number": grant_number, "provider": provider}
 
@@ -571,6 +579,8 @@ async def list_grant_publications(
     limit: int = PAGE_SIZE,
     cursor: str | None = None,
     filters: dict[str, Any] | None = None,
+    sort_by: str | None = None,
+    sort_direction: str | None = None,
 ) -> dict[str, Any]:
     provider_key = str(provider or "").strip().lower()
     if provider_key not in SUPPORTED_PROVIDERS:
@@ -595,13 +605,15 @@ async def list_grant_publications(
         session,
         grant_number=display_number,
         provider=provider_key,
+        persist=False,
     )
-    all_items = collected["items"]
+    all_items = await enrich_publication_items_authors(session, collected["items"])
 
     normalized_filters = normalize_filters(filters)
     # Grant page is already scoped to this award — ignore grant_numbers filters.
     normalized_filters["grant_numbers"] = []
     active_filters_key = build_filters_key(normalized_filters)
+    active_sort_key = publication_sort_key(sort_by, sort_direction)
 
     offset = 0
     cursor_payload = _decode_cursor(cursor)
@@ -611,9 +623,14 @@ async def list_grant_publications(
                 "Pagination cursor does not match the selected grant.",
                 status_code=422,
             )
-        if cursor_payload.get("filters_key", "") != active_filters_key:
+        if not filters_key_matches(cursor_payload.get("filters_key", ""), active_filters_key):
             raise GrantPublicationsError(
                 "Pagination cursor does not match the active filters.",
+                status_code=422,
+            )
+        if cursor_payload.get("sort_key", "-") != active_sort_key:
+            raise GrantPublicationsError(
+                "Pagination cursor does not match the active sort.",
                 status_code=422,
             )
         try:
@@ -621,15 +638,19 @@ async def list_grant_publications(
         except (TypeError, ValueError):
             offset = 0
 
-    facets = build_publication_facets(all_items)
+    facets = build_dependent_publication_facets(all_items, normalized_filters)
     filtered_items = apply_publication_filters(all_items, normalized_filters)
     timeline = build_publication_timeline(filtered_items)
+    sorted_items = sort_publications(
+        filtered_items,
+        sort_by=sort_by,
+        sort_direction=sort_direction,
+    )
 
-    page_items = filtered_items[offset : offset + page_limit]
-    page_items = await enrich_publication_items_authors(session, page_items)
+    page_items = sorted_items[offset : offset + page_limit]
 
     next_offset = offset + len(page_items)
-    has_more = next_offset < len(filtered_items)
+    has_more = next_offset < len(sorted_items)
     next_cursor = None
     if has_more:
         next_cursor = _encode_cursor(
@@ -637,6 +658,7 @@ async def list_grant_publications(
                 "v": 1,
                 "grant_key": grant_key,
                 "filters_key": active_filters_key,
+                "sort_key": active_sort_key,
                 "offset": next_offset,
                 "limit": page_limit,
             }
@@ -690,8 +712,10 @@ async def search_grant_publication_venues(
         session,
         grant_number=display_number,
         provider=provider_key,
+        persist=False,
     )
-    return search_venue_facets(collected["items"], query, limit=limit)
+    items = await enrich_publication_items_authors(session, collected["items"])
+    return search_venue_facets(items, query, limit=limit)
 
 
 async def search_grant_publication_authors(
@@ -713,5 +737,31 @@ async def search_grant_publication_authors(
         session,
         grant_number=display_number,
         provider=provider_key,
+        persist=False,
     )
-    return search_author_facets(collected["items"], query, limit=limit)
+    items = await enrich_publication_items_authors(session, collected["items"])
+    return search_author_facets(items, query, limit=limit)
+
+
+async def build_grant_publication_facets(
+    session: AsyncSession | None,
+    *,
+    grant_number: str,
+    provider: str,
+    filters: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    provider_key = str(provider or "").strip().lower()
+    if provider_key not in SUPPORTED_PROVIDERS:
+        raise GrantPublicationsError(
+            "Provider must be openalex or arxiv.",
+            status_code=422,
+        )
+    display_number = decode_grant_number(grant_number)
+    collected = await _collect_grant_publications(
+        session,
+        grant_number=display_number,
+        provider=provider_key,
+        persist=False,
+    )
+    items = await enrich_publication_items_authors(session, collected["items"])
+    return build_dependent_publication_facets(items, filters)

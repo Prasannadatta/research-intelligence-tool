@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.core.issn import collect_issns, compact_issn, format_issn
 from app.integrations.openalex.client import (
     MAX_TOPICS,
     OpenAlexApiError,
@@ -15,6 +16,7 @@ from app.integrations.openalex.client import (
     _require_api_key,
     _short_openalex_id,
 )
+from app.services.work_persistence.affiliations import normalize_affiliation_payload
 
 OPENALEX_AUTHORS_URL = "https://api.openalex.org/authors"
 OPENALEX_WORKS_URL = "https://api.openalex.org/works"
@@ -48,67 +50,46 @@ def _optional_float(value: Any) -> float | None:
         return None
 
 
+def _extract_source_issns(work: dict[str, Any], primary_location: dict[str, Any] | None) -> dict[str, Any]:
+    source = None
+    if isinstance(primary_location, dict) and isinstance(primary_location.get("source"), dict):
+        source = primary_location.get("source")
+    host_venue = work.get("host_venue")
+    if source is None and isinstance(host_venue, dict):
+        source = host_venue
+    issn_l = compact_issn((source or {}).get("issn_l")) if isinstance(source, dict) else None
+    compact_ids = collect_issns(
+        issn_l,
+        (source or {}).get("issn") if isinstance(source, dict) else None,
+        work.get("issn"),
+        work.get("issn_l"),
+        work.get("issns"),
+    )
+    preferred = issn_l or (compact_ids[0] if compact_ids else None)
+    return {
+        "issn": format_issn(preferred),
+        "issn_l": format_issn(issn_l),
+        "issns": [format_issn(value) for value in compact_ids if format_issn(value)],
+    }
+
+
 def _extract_authorship_institutions(
     authorship: dict[str, Any],
-) -> tuple[list[dict[str, Any]], list[str], list[str]]:
-    """Return (institutions, institution_ids, countries) from a work authorship."""
-    institutions: list[dict[str, Any]] = []
-    institution_ids: list[str] = []
-    countries: list[str] = []
-    seen_inst: set[str] = set()
-    seen_country: set[str] = set()
-
-    raw_institutions = authorship.get("institutions")
-    if isinstance(raw_institutions, list):
-        for raw in raw_institutions:
-            if not isinstance(raw, dict):
-                continue
-            inst_id = _short_openalex_id(raw.get("id"))
-            name = _optional_str(raw.get("display_name") or raw.get("name"))
-            country = _optional_str(raw.get("country_code") or raw.get("country"))
-            if not inst_id and not name:
-                continue
-            key = (inst_id or "") + "|" + (name or "").casefold()
-            if key in seen_inst:
-                continue
-            seen_inst.add(key)
-            entry = {
-                "id": inst_id,
-                "name": name,
-                "country_code": country,
-                "type": _optional_str(raw.get("type")),
-            }
-            institutions.append(entry)
-            if inst_id:
-                institution_ids.append(inst_id)
-            if country and country.casefold() not in seen_country:
-                seen_country.add(country.casefold())
-                countries.append(country)
-
-    raw_countries = authorship.get("countries") or authorship.get("countries_distinct_count")
-    if isinstance(raw_countries, list):
-        for value in raw_countries:
-            country = _optional_str(value)
-            if country and country.casefold() not in seen_country:
-                seen_country.add(country.casefold())
-                countries.append(country)
-
-    if not institutions:
-        raw_strings = authorship.get("raw_affiliation_strings")
-        if isinstance(raw_strings, list):
-            for value in raw_strings:
-                name = _optional_str(value)
-                if not name:
-                    continue
-                key = name.casefold()
-                if key in seen_inst:
-                    continue
-                seen_inst.add(key)
-                institutions.append(
-                    {"id": None, "name": name, "country_code": None, "type": None}
-                )
-
-    return institutions, institution_ids, countries
+) -> dict[str, Any]:
+    """Return normalized publication-specific affiliation metadata."""
+    payload = normalize_affiliation_payload(
+        authorship,
+        id_normalizer=_short_openalex_id,
+    )
+    return {
+        "institutions": payload.institutions,
+        "institution_ids": payload.institution_ids,
+        "countries": payload.countries,
+        "department": payload.department,
+        "raw_affiliation_text": payload.raw_affiliation_text,
+        "affiliation_source": payload.affiliation_source,
+        "affiliation_confidence": payload.affiliation_confidence,
+    }
 
 
 def extract_normalized_work_authors(work: dict[str, Any]) -> list[dict[str, Any]]:
@@ -131,9 +112,7 @@ def extract_normalized_work_authors(work: dict[str, Any]) -> list[dict[str, Any]
         if not name and not author_id:
             continue
 
-        institutions, institution_ids, countries = _extract_authorship_institutions(
-            authorship
-        )
+        affiliation = _extract_authorship_institutions(authorship)
         orcid = _normalize_orcid(author.get("orcid") or authorship.get("orcid"))
         position_label = _optional_str(authorship.get("author_position"))
         authors.append(
@@ -144,9 +123,13 @@ def extract_normalized_work_authors(work: dict[str, Any]) -> list[dict[str, Any]
                 "orcid": orcid,
                 "author_position": index,
                 "author_position_label": position_label,
-                "institutions": institutions,
-                "institution_ids": institution_ids,
-                "countries": countries,
+                "institutions": affiliation["institutions"],
+                "institution_ids": affiliation["institution_ids"],
+                "countries": affiliation["countries"],
+                "department": affiliation["department"],
+                "raw_affiliation_text": affiliation["raw_affiliation_text"],
+                "affiliation_source": affiliation["affiliation_source"],
+                "affiliation_confidence": affiliation["affiliation_confidence"],
                 "is_corresponding": bool(authorship.get("is_corresponding")),
                 "provider_ids": {
                     "openalex": [author_id] if author_id else [],
@@ -300,6 +283,7 @@ def normalize_search_work(work: dict[str, Any]) -> dict[str, Any] | None:
 
     is_oa, oa_url, pdf_url = _extract_open_access_urls(work)
     biblio = _extract_biblio(work)
+    source_issns = _extract_source_issns(work, primary_location if isinstance(primary_location, dict) else None)
 
     doi = _optional_str(work.get("doi"))
     if doi and doi.startswith("https://doi.org/"):
@@ -359,6 +343,9 @@ def normalize_search_work(work: dict[str, Any]) -> dict[str, Any] | None:
         "publication_date": _optional_str(work.get("publication_date")),
         "authors": authors,
         "primary_source": primary_source,
+        "issn": source_issns.get("issn"),
+        "issn_l": source_issns.get("issn_l"),
+        "issns": source_issns.get("issns") or [],
         "doi": doi,
         "pmid": pmid,
         "arxiv_id": arxiv_id,
@@ -445,6 +432,72 @@ def _normalize_page(
     return normalized
 
 
+async def search_openalex_authors_by_orcid(
+    orcid: str,
+    *,
+    limit: int = DEFAULT_PAGE_SIZE,
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    """Return OpenAlex author records whose ORCID matches exactly. No name matching."""
+    from app.integrations.orcid.normalize import normalize_orcid_id
+
+    normalized = normalize_orcid_id(orcid)
+    empty = {
+        "query": normalized or (orcid or ""),
+        "entity_type": "authors",
+        "source": "openalex",
+        "search_mode": "orcid",
+        "results": [],
+        "next_cursor": None,
+        "has_more": False,
+    }
+    if not normalized:
+        return empty
+
+    page_size = max(1, min(int(limit or DEFAULT_PAGE_SIZE), MAX_PAGE_SIZE))
+    request_cursor = (cursor or "").strip() or "*"
+    api_key = _require_api_key()
+    params: dict[str, Any] = {
+        "filter": f"orcid:{normalized}",
+        "per_page": page_size,
+        "cursor": request_cursor,
+        "api_key": api_key,
+    }
+    response = await _openalex_get(OPENALEX_AUTHORS_URL, params=params)
+    if response.status_code >= 500:
+        raise OpenAlexApiError("OpenAlex search is temporarily unavailable.")
+    if response.status_code >= 400:
+        raise OpenAlexApiError(
+            "OpenAlex rejected the search request.",
+            status_code=502,
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise OpenAlexApiError("OpenAlex returned an invalid response.") from exc
+    if not isinstance(payload, dict):
+        raise OpenAlexApiError("OpenAlex returned an invalid response.")
+
+    raw_results = payload.get("results")
+    results_list = raw_results if isinstance(raw_results, list) else []
+    matched: list[dict[str, Any]] = []
+    for item in _normalize_page("authors", results_list):
+        if normalize_orcid_id(item.get("orcid")) == normalized:
+            matched.append(item)
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    next_cursor = _optional_str(meta.get("next_cursor"))
+    has_more = bool(next_cursor) and len(matched) > 0
+    return {
+        "query": normalized,
+        "entity_type": "authors",
+        "source": "openalex",
+        "search_mode": "orcid",
+        "results": matched,
+        "next_cursor": next_cursor if has_more else None,
+        "has_more": has_more,
+    }
+
+
 async def unified_openalex_search(
     *,
     query: str | None,
@@ -505,6 +558,17 @@ async def unified_openalex_search(
     cleaned_query = " ".join((query or "").split())
     cleaned_institution = (institution_id or "").strip() or None
     cleaned_topic = (topic_id or "").strip() or None
+
+    if entity_type == "authors":
+        from app.integrations.orcid.normalize import normalize_orcid_id
+
+        orcid_query = normalize_orcid_id(cleaned_query)
+        if orcid_query:
+            return await search_openalex_authors_by_orcid(
+                orcid_query,
+                limit=limit,
+                cursor=cursor,
+            )
 
     if cleaned_institution and not is_valid_institution_id(cleaned_institution):
         raise OpenAlexApiError(

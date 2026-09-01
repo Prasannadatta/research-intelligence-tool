@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import Chart from "react-apexcharts";
 import { Alert, Box, Paper, Skeleton, Typography, useTheme } from "@mui/material";
+import { getAnalysisPalette } from "../../theme/analysisPalette";
 
 const CHART_HEIGHT = 300;
 
@@ -10,7 +11,31 @@ function chartTitleForMode(mode) {
     : "Publications over time";
 }
 
-function AuthorPublicationTrendChart({ timeline, loading, mode, error, title }) {
+export function formatPageLocalTimelineCaption(sampleCount, providerTotalCount) {
+  const sample = Number(sampleCount);
+  if (!Number.isFinite(sample) || sample < 0) {
+    return null;
+  }
+  const sampleLabel = sample.toLocaleString("en-US");
+  if (providerTotalCount == null || providerTotalCount === "") {
+    return `Based on the first ${sampleLabel} loaded publications`;
+  }
+  const total = Number(providerTotalCount);
+  if (!Number.isFinite(total) || total < 0) {
+    return `Based on the first ${sampleLabel} loaded publications`;
+  }
+  return `Timeline based on ${sampleLabel} of ${total.toLocaleString("en-US")} publications`;
+}
+
+function AuthorPublicationTrendChart({
+  timeline,
+  loading,
+  mode,
+  error,
+  title,
+  pageLocal = false,
+  providerTotalCount = null,
+}) {
   const theme = useTheme();
 
   const chartTitle = title || chartTitleForMode(mode);
@@ -20,11 +45,9 @@ function AuthorPublicationTrendChart({ timeline, loading, mode, error, title }) 
     const labels = items.map((item) => item.label);
     const counts = items.map((item) => item.count ?? 0);
 
-    const primary = theme.palette.primary.main;
-    const textPrimary = theme.palette.text.primary;
+    const accents = getAnalysisPalette(theme);
     const textSecondary = theme.palette.text.secondary;
     const divider = theme.palette.divider;
-    const background = theme.palette.background.paper;
 
     const chartOptions = {
       chart: {
@@ -40,7 +63,7 @@ function AuthorPublicationTrendChart({ timeline, loading, mode, error, title }) 
           columnWidth: "62%",
         },
       },
-      colors: [primary],
+      colors: [accents.navy],
       dataLabels: { enabled: false },
       grid: {
         borderColor: divider,
@@ -101,11 +124,19 @@ function AuthorPublicationTrendChart({ timeline, loading, mode, error, title }) 
   const hasTimelineData = Array.isArray(timeline?.items) && timeline.items.length > 0;
   const totalDated = timeline?.total_dated_publications;
   const totalMatching = timeline?.total_matching_publications;
-  const showDateCaption =
+  const pageLocalCaption =
+    pageLocal && hasTimelineData
+      ? formatPageLocalTimelineCaption(totalMatching, providerTotalCount)
+      : null;
+  const dateCaption =
+    !pageLocal &&
     hasTimelineData &&
     typeof totalDated === "number" &&
     typeof totalMatching === "number" &&
-    totalMatching > 0;
+    totalMatching > 0
+      ? `${totalDated} of ${totalMatching} publication${totalMatching === 1 ? "" : "s"} have usable date metadata`
+      : null;
+  const coverageCaption = pageLocalCaption || dateCaption;
 
   return (
     <Paper
@@ -124,10 +155,14 @@ function AuthorPublicationTrendChart({ timeline, loading, mode, error, title }) 
         <Typography variant="subtitle1" fontWeight={600} sx={{ mb: 0.5 }}>
           {chartTitle}
         </Typography>
-        {showDateCaption ? (
-          <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 0.5 }}>
-            {totalDated} of {totalMatching} publication{totalMatching === 1 ? "" : "s"} have
-            usable date metadata
+        {coverageCaption ? (
+          <Typography
+            variant="caption"
+            color="text.secondary"
+            sx={{ display: "block", mb: 0.5 }}
+            data-testid="publication-timeline-caption"
+          >
+            {coverageCaption}
           </Typography>
         ) : null}
         {error ? (

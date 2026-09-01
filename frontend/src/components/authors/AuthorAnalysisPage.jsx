@@ -4,24 +4,27 @@ import {
   Alert,
   Box,
   Button,
-  Checkbox,
-  FormControlLabel,
   Paper,
+  Snackbar,
   Typography,
 } from "@mui/material";
 import ArrowBackRoundedIcon from "@mui/icons-material/ArrowBackRounded";
 import InsightsOutlinedIcon from "@mui/icons-material/InsightsOutlined";
+import BookmarkAddRoundedIcon from "@mui/icons-material/BookmarkAddRounded";
 
 import {
   analysisModeForAuthors,
   buildAuthorPublicationsCacheKey,
   exportAuthorPublicationsCsv,
+  fetchAuthorPublicationFacets,
   fetchAuthorPublications,
   toAnalysisAuthorPayload,
 } from "../../api/analysisApi";
 import AuthorPublicationsTable from "./AuthorPublicationsTable";
+import AuthorIncludedSelector from "./AuthorIncludedSelector";
 import AuthorPublicationTrendChart from "./AuthorPublicationTrendChart";
 import AuthorPublicationFilters from "./AuthorPublicationFilters";
+import usePublicationFacetPreview from "./usePublicationFacetPreview";
 import DownloadCsvButton, { downloadCsvFromResponse } from "./DownloadCsvButton";
 import { AuthorInfoPopoverProvider } from "./AuthorInfoPopover";
 import { publicationsPageCache } from "./authorAnalysisCache";
@@ -45,25 +48,58 @@ import {
   removeFilterChip,
   toPublicationFiltersPayload,
 } from "./publicationFilters";
+import {
+  DEFAULT_PUBLICATION_SORT,
+  normalizePublicationSort,
+  publicationSortKey,
+} from "./publicationSorting";
+import { getWorkDate, getWorkId } from "./authorPublicationHelpers";
+import PublicationExclusionManager from "../../features/authorAnalysis/components/PublicationExclusionManager";
+import { saveSavedSearch } from "../../features/savedSearches/savedSearchesApi";
+import { analysisPageLayoutSx } from "../../layout/pageLayout";
 
 const PAGE_SIZE = 20;
+
+function asProviderTotalCount(value) {
+  if (value == null || value === "") {
+    return null;
+  }
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : null;
+}
 const EMPTY_FILTERS_KEY = publicationFiltersKey(emptyPublicationFilters());
 
-const pageLayoutSx = {
-  width: "100%",
-  maxWidth: "none",
-  px: { xs: 2, sm: 3, md: 6 },
-  py: 3,
-  boxSizing: "border-box",
-  textAlign: "left",
-};
+function filtersDraftFromPayload(filters) {
+  const empty = emptyPublicationFilters();
+  return {
+    ...empty,
+    fromYear: filters?.from_year != null ? String(filters.from_year) : "",
+    toYear: filters?.to_year != null ? String(filters.to_year) : "",
+    sources: Array.isArray(filters?.sources) ? [...filters.sources] : [],
+    institutions: Array.isArray(filters?.institutions)
+      ? filters.institutions.map((value) => ({ value, label: value }))
+      : [],
+    venues: Array.isArray(filters?.venues)
+      ? filters.venues.map((value) => ({ value, label: value }))
+      : [],
+    grants: Array.isArray(filters?.grant_numbers)
+      ? filters.grant_numbers.map((value) => ({
+          grant_number: value,
+          publication_count: null,
+        }))
+      : [],
+    authors: [],
+  };
+}
+
+const pageLayoutSx = analysisPageLayoutSx;
 
 function AuthorAnalysisPage() {
   const navigate = useNavigate();
   const location = useLocation();
 
   const originalAuthors = useMemo(() => {
-    const fromState = location.state?.authors;
+    const fromState = location.state?.originalAuthors || location.state?.authors;
     if (Array.isArray(fromState) && fromState.length > 0) {
       return fromState
         .map((item) => toAnalysisAuthorPayload(item) || item)
@@ -84,15 +120,29 @@ function AuthorAnalysisPage() {
   );
 
   const [activeAuthorIds, setActiveAuthorIds] = useState(() =>
-    getInitialActiveAuthorIds(originalAuthors),
+    getInitialActiveAuthorIds(location.state?.activeAuthors || originalAuthors),
+  );
+  const [excludedWorkIds, setExcludedWorkIds] = useState(
+    () => new Set(Array.isArray(location.state?.excludedWorkIds) ? location.state.excludedWorkIds : []),
+  );
+  const [selectedTableWorkIds, setSelectedTableWorkIds] = useState(() => new Set());
+  const [excludedWorksById, setExcludedWorksById] = useState(
+    () => location.state?.excludedWorksById || {},
   );
 
   const skipDebounceRef = useRef(true);
 
   useEffect(() => {
     skipDebounceRef.current = true;
-    setActiveAuthorIds(getInitialActiveAuthorIds(originalAuthors));
-  }, [originalAuthors]);
+    /* eslint-disable react-hooks/set-state-in-effect -- Router state is the source of truth when returning from Insights. */
+    setActiveAuthorIds(getInitialActiveAuthorIds(location.state?.activeAuthors || originalAuthors));
+    setExcludedWorkIds(
+      new Set(Array.isArray(location.state?.excludedWorkIds) ? location.state.excludedWorkIds : []),
+    );
+    setExcludedWorksById(location.state?.excludedWorksById || {});
+    setSelectedTableWorkIds(new Set());
+    /* eslint-enable react-hooks/set-state-in-effect */
+  }, [location.state?.activeAuthors, location.state?.excludedWorkIds, location.state?.excludedWorksById, originalAuthors]);
 
   const activeAuthors = useMemo(
     () => getActiveAuthors(originalAuthors, activeAuthorIds),
@@ -113,8 +163,13 @@ function AuthorAnalysisPage() {
     [activeAuthorIds],
   );
 
-  const [draftFilters, setDraftFilters] = useState(emptyPublicationFilters);
-  const [appliedFilters, setAppliedFilters] = useState(emptyPublicationFilters);
+  const [draftFilters, setDraftFilters] = useState(() =>
+    filtersDraftFromPayload(location.state?.filters),
+  );
+  const [appliedFilters, setAppliedFilters] = useState(() =>
+    filtersDraftFromPayload(location.state?.filters),
+  );
+  const [publicationSort, setPublicationSort] = useState(DEFAULT_PUBLICATION_SORT);
   const [facets, setFacets] = useState(emptyFacets);
 
   const appliedFiltersKey = useMemo(
@@ -125,10 +180,15 @@ function AuthorAnalysisPage() {
     () => toPublicationFiltersPayload(appliedFilters),
     [appliedFilters],
   );
+  const sortKey = useMemo(
+    () => publicationSortKey(publicationSort),
+    [publicationSort],
+  );
 
   const [items, setItems] = useState([]);
   const [timeline, setTimeline] = useState(null);
   const [timelineError, setTimelineError] = useState(null);
+  const [providerTotalCount, setProviderTotalCount] = useState(null);
   const [nextCursor, setNextCursor] = useState(null);
   const [hasMore, setHasMore] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -138,6 +198,11 @@ function AuthorAnalysisPage() {
   const [unsupportedReason, setUnsupportedReason] = useState(null);
   const [initialEmpty, setInitialEmpty] = useState(false);
   const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
+  const [saveStatus, setSaveStatus] = useState({
+    saving: false,
+    message: null,
+    severity: "success",
+  });
 
   const requestIdRef = useRef(0);
   const resetAbortRef = useRef(null);
@@ -145,7 +210,9 @@ function AuthorAnalysisPage() {
   const loadMoreInFlightRef = useRef(false);
   const applyInFlightRef = useRef(false);
   const selectionKeyRef = useRef(selectionKey);
-  const requestKeyRef = useRef(`${selectionKey}::${appliedFiltersKey}`);
+  const sortRef = useRef(publicationSort);
+  const sortKeyRef = useRef(sortKey);
+  const requestKeyRef = useRef(`${selectionKey}::${appliedFiltersKey}::${sortKey}`);
   const filtersPayloadRef = useRef(appliedFiltersPayload);
   const appliedFiltersKeyRef = useRef(appliedFiltersKey);
   const appliedFiltersRef = useRef(appliedFilters);
@@ -161,11 +228,14 @@ function AuthorAnalysisPage() {
     error: null,
   });
 
+  /* eslint-disable react-hooks/refs -- This page keeps request guards in refs so async pagination callbacks see the latest state. */
   selectionKeyRef.current = selectionKey;
+  sortRef.current = publicationSort;
+  sortKeyRef.current = sortKey;
   appliedFiltersKeyRef.current = appliedFiltersKey;
   appliedFiltersRef.current = appliedFilters;
   filtersPayloadRef.current = appliedFiltersPayload;
-  requestKeyRef.current = `${selectionKey}::${appliedFiltersKey}`;
+  requestKeyRef.current = `${selectionKey}::${appliedFiltersKey}::${sortKey}`;
   paginationStateRef.current = {
     hasMore,
     nextCursor,
@@ -174,6 +244,7 @@ function AuthorAnalysisPage() {
     unsupported,
     error,
   };
+  /* eslint-enable react-hooks/refs */
 
   const markLoadedOnce = useCallback((value) => {
     hasLoadedOnceRef.current = value;
@@ -186,7 +257,7 @@ function AuthorAnalysisPage() {
     if (hasActivePublicationFilters(appliedFilters)) {
       return {
         heading: "No publications match these filters",
-        body: "Try adjusting the year range, source, venue, or grant filters.",
+        body: "Try adjusting the year range, source, institution, venue, or grant filters.",
       };
     }
     return base;
@@ -196,6 +267,8 @@ function AuthorAnalysisPage() {
     async ({
       filtersOverride,
       filtersKeyOverride,
+      sortOverride,
+      sortKeyOverride,
       preserveExisting: preserveExistingOption,
       forceRefresh = false,
     } = {}) => {
@@ -204,6 +277,7 @@ function AuthorAnalysisPage() {
         setTimeline(null);
         setTimelineError(null);
         setFacets(emptyFacets());
+        setProviderTotalCount(null);
         setNextCursor(null);
         setHasMore(false);
         setLoadingMore(false);
@@ -239,10 +313,19 @@ function AuthorAnalysisPage() {
         filtersKeyOverride !== undefined
           ? filtersKeyOverride
           : appliedFiltersKeyRef.current;
-      const fetchRequestKey = `${selectionKeyRef.current}::${filtersKeyForCache}`;
+      const sortForRequest = normalizePublicationSort(
+        sortOverride !== undefined ? sortOverride : sortRef.current,
+      );
+      const sortKeyForCache =
+        sortKeyOverride !== undefined
+          ? sortKeyOverride
+          : publicationSortKey(sortForRequest);
+      const fetchRequestKey = `${selectionKeyRef.current}::${filtersKeyForCache}::${sortKeyForCache}`;
 
       filtersPayloadRef.current = filtersForRequest;
       appliedFiltersKeyRef.current = filtersKeyForCache;
+      sortRef.current = sortForRequest;
+      sortKeyRef.current = sortKeyForCache;
       requestKeyRef.current = fetchRequestKey;
 
       const preserveExisting =
@@ -255,6 +338,7 @@ function AuthorAnalysisPage() {
         canonicalAuthorIds: authorIds,
         providerRecordsKey: recordsKey,
         filtersKey: filtersKeyForCache,
+        sortKey: sortKeyForCache,
         cursor: "*",
         limit: PAGE_SIZE,
       });
@@ -272,6 +356,7 @@ function AuthorAnalysisPage() {
         setTimeline(cached.timeline ?? null);
         setTimelineError(null);
         setFacets(cached.facets || emptyFacets());
+        setProviderTotalCount(asProviderTotalCount(cached.provider_total_count));
         setNextCursor(cached.next_cursor ?? null);
         setHasMore(Boolean(cached.has_more));
         setUnsupported(Boolean(cached.unsupported));
@@ -297,6 +382,7 @@ function AuthorAnalysisPage() {
       if (!preserveExisting) {
         setItems([]);
         setTimeline(null);
+        setProviderTotalCount(null);
       }
       setNextCursor(null);
       setHasMore(false);
@@ -307,6 +393,8 @@ function AuthorAnalysisPage() {
           authors: activeAuthors,
           originalAuthorIds,
           filters: filtersForRequest,
+          sortBy: sortForRequest.sortBy,
+          sortDirection: sortForRequest.sortDirection,
           limit: PAGE_SIZE,
           cursor: null,
           signal: controller.signal,
@@ -328,6 +416,7 @@ function AuthorAnalysisPage() {
           items: pageItems,
           timeline: response.timeline ?? null,
           facets: response.facets || emptyFacets(),
+          provider_total_count: asProviderTotalCount(response.provider_total_count),
           next_cursor: response.next_cursor,
           has_more: response.has_more,
           unsupported: response.unsupported,
@@ -338,6 +427,7 @@ function AuthorAnalysisPage() {
         setTimeline(response.timeline ?? null);
         setTimelineError(null);
         setFacets(response.facets || emptyFacets());
+        setProviderTotalCount(asProviderTotalCount(response.provider_total_count));
         setNextCursor(response.next_cursor);
         setHasMore(Boolean(response.has_more));
         setUnsupported(Boolean(response.unsupported));
@@ -361,6 +451,7 @@ function AuthorAnalysisPage() {
         if (!preserveExisting) {
           setItems([]);
           setTimeline(null);
+          setProviderTotalCount(null);
         }
         setTimelineError(null);
         setHasMore(false);
@@ -413,6 +504,7 @@ function AuthorAnalysisPage() {
       canonicalAuthorIds: authorIds,
       providerRecordsKey: recordsKey,
       filtersKey: appliedFiltersKeyRef.current,
+      sortKey: sortKeyRef.current,
       cursor: pageCursor,
       limit: PAGE_SIZE,
     });
@@ -443,6 +535,8 @@ function AuthorAnalysisPage() {
         authors: activeAuthors,
         originalAuthorIds,
         filters: filtersPayloadRef.current,
+        sortBy: sortRef.current.sortBy,
+        sortDirection: sortRef.current.sortDirection,
         limit: PAGE_SIZE,
         cursor: pageCursor,
         signal: controller.signal,
@@ -494,10 +588,12 @@ function AuthorAnalysisPage() {
   }, [activeAuthors, authorIds, mode, originalAuthorIds, recordsKey]);
 
   const loadMoreRef = useRef(loadMore);
+  /* eslint-disable react-hooks/refs -- IntersectionObserver callbacks call the latest pagination functions. */
   loadMoreRef.current = loadMore;
 
   const resetAndLoadRef = useRef(resetAndLoad);
   resetAndLoadRef.current = resetAndLoad;
+  /* eslint-enable react-hooks/refs */
 
   const handleExportCsv = useCallback(async () => {
     const response = await exportAuthorPublicationsCsv({
@@ -510,23 +606,47 @@ function AuthorAnalysisPage() {
     );
   }, [activeAuthors, appliedFiltersPayload]);
 
+  const fetchFacetPreview = useCallback(
+    ({ filters, signal }) =>
+      fetchAuthorPublicationFacets({
+        authors: activeAuthors,
+        filters,
+        signal,
+      }),
+    [activeAuthors],
+  );
+
+  usePublicationFacetPreview({
+    enabled: hasLoadedOnce && !unsupported && activeAuthors.length > 0,
+    requestKey: `${selectionKey}::${recordsKey}`,
+    draftFilters,
+    fetchFacets: fetchFacetPreview,
+    onFacets: setFacets,
+  });
+
   // Author selection drives the main fetch. Draft filter edits never fetch here.
   useEffect(() => {
-    const emptyFilters = emptyPublicationFilters();
-    setDraftFilters(emptyFilters);
-    setAppliedFilters(emptyFilters);
+    const startingFilters =
+      !hasLoadedOnceRef.current && location.state?.filters
+        ? filtersDraftFromPayload(location.state.filters)
+        : emptyPublicationFilters();
+    setDraftFilters(startingFilters);
+    setAppliedFilters(startingFilters);
     setFacets(emptyFacets());
 
-    const emptyPayload = toPublicationFiltersPayload(emptyFilters);
-    filtersPayloadRef.current = emptyPayload;
-    appliedFiltersKeyRef.current = EMPTY_FILTERS_KEY;
-    appliedFiltersRef.current = emptyFilters;
-    requestKeyRef.current = `${selectionKey}::${EMPTY_FILTERS_KEY}`;
+    const startingPayload = toPublicationFiltersPayload(startingFilters);
+    const startingFiltersKey = publicationFiltersKey(startingFilters);
+    filtersPayloadRef.current = startingPayload;
+    appliedFiltersKeyRef.current = startingFiltersKey;
+    appliedFiltersRef.current = startingFilters;
+    requestKeyRef.current = `${selectionKey}::${startingFiltersKey}::${sortKeyRef.current}`;
 
     const runFetch = () => {
       resetAndLoadRef.current({
-        filtersOverride: emptyPayload,
-        filtersKeyOverride: EMPTY_FILTERS_KEY,
+        filtersOverride: startingPayload,
+        filtersKeyOverride: startingFiltersKey,
+        sortOverride: sortRef.current,
+        sortKeyOverride: sortKeyRef.current,
       });
     };
 
@@ -547,7 +667,7 @@ function AuthorAnalysisPage() {
       }
       loadMoreInFlightRef.current = false;
     };
-  }, [selectionKey]);
+  }, [location.state?.filters, selectionKey]);
 
   const handleApplyFilters = useCallback(
     (nextFilters) => {
@@ -563,10 +683,12 @@ function AuthorAnalysisPage() {
       const key = publicationFiltersKey(cloned);
       filtersPayloadRef.current = payload;
       appliedFiltersKeyRef.current = key;
-      requestKeyRef.current = `${selectionKeyRef.current}::${key}`;
+      requestKeyRef.current = `${selectionKeyRef.current}::${key}::${sortKeyRef.current}`;
       resetAndLoad({
         filtersOverride: payload,
         filtersKeyOverride: key,
+        sortOverride: sortRef.current,
+        sortKeyOverride: sortKeyRef.current,
         preserveExisting: true,
         forceRefresh: true,
       });
@@ -586,10 +708,12 @@ function AuthorAnalysisPage() {
     const payload = toPublicationFiltersPayload(empty);
     filtersPayloadRef.current = payload;
     appliedFiltersKeyRef.current = EMPTY_FILTERS_KEY;
-    requestKeyRef.current = `${selectionKeyRef.current}::${EMPTY_FILTERS_KEY}`;
+    requestKeyRef.current = `${selectionKeyRef.current}::${EMPTY_FILTERS_KEY}::${sortKeyRef.current}`;
     resetAndLoad({
       filtersOverride: payload,
       filtersKeyOverride: EMPTY_FILTERS_KEY,
+      sortOverride: sortRef.current,
+      sortKeyOverride: sortKeyRef.current,
       preserveExisting: true,
       forceRefresh: true,
     });
@@ -610,11 +734,169 @@ function AuthorAnalysisPage() {
       const key = publicationFiltersKey(cloned);
       filtersPayloadRef.current = payload;
       appliedFiltersKeyRef.current = key;
-      requestKeyRef.current = `${selectionKeyRef.current}::${key}`;
+      requestKeyRef.current = `${selectionKeyRef.current}::${key}::${sortKeyRef.current}`;
       resetAndLoad({
         filtersOverride: payload,
         filtersKeyOverride: key,
+        sortOverride: sortRef.current,
+        sortKeyOverride: sortKeyRef.current,
         preserveExisting: true,
+        forceRefresh: true,
+      });
+    },
+    [resetAndLoad],
+  );
+
+  const excludedWorkIdList = useMemo(
+    () => [...excludedWorkIds].filter(Boolean).sort(),
+    [excludedWorkIds],
+  );
+
+  const handleSaveSearch = useCallback(async () => {
+    if (saveStatus.saving || originalAuthors.length === 0) {
+      return;
+    }
+    setSaveStatus({ saving: true, message: null, severity: "success" });
+    try {
+      const authorsToSave = activeAuthors.length > 0 ? activeAuthors : originalAuthors;
+      const activeIdsToSave = authorsToSave
+        .map((author) => author.canonical_author_id)
+        .filter(Boolean);
+      const providerContext = {
+        providers: [
+          ...new Set(
+            authorsToSave
+              .map((author) => String(author.provider || "").toLowerCase())
+              .filter(Boolean),
+          ),
+        ],
+        mode,
+      };
+      await saveSavedSearch({
+        search_type: "authors",
+        payload: {
+          authors: authorsToSave.map((author) => ({
+            canonical_author_id: author.canonical_author_id,
+            display_name: author.display_name,
+            provider: author.provider,
+            provider_author_id: author.provider_author_id,
+          })),
+          active_author_ids: activeIdsToSave,
+          filters: appliedFiltersPayload,
+          excluded_work_ids: excludedWorkIdList,
+          provider_context: providerContext,
+        },
+        applied_filters: appliedFiltersPayload,
+        provider_context: providerContext,
+        excluded_work_ids: excludedWorkIdList,
+        metadata: {
+          author_count: authorsToSave.length,
+          active_author_count: authorsToSave.length,
+        },
+      });
+      setSaveStatus({ saving: false, message: "Saved", severity: "success" });
+    } catch (err) {
+      setSaveStatus({
+        saving: false,
+        message: err?.response?.data?.detail || "Could not save search.",
+        severity: "error",
+      });
+    }
+  }, [
+    activeAuthors,
+    appliedFiltersPayload,
+    excludedWorkIdList,
+    mode,
+    originalAuthors,
+    saveStatus.saving,
+  ]);
+
+  const selectedTableWorkIdList = useMemo(
+    () => [...selectedTableWorkIds].filter(Boolean).sort(),
+    [selectedTableWorkIds],
+  );
+
+  const handleTogglePublicationSelected = useCallback((workId) => {
+    if (!workId) {
+      return;
+    }
+    setSelectedTableWorkIds((current) => {
+      const next = new Set(current);
+      if (next.has(workId)) {
+        next.delete(workId);
+      } else {
+        next.add(workId);
+      }
+      return next;
+    });
+  }, []);
+
+  const handleToggleVisiblePublications = useCallback((visibleIds, checked) => {
+    setSelectedTableWorkIds((current) => {
+      const next = new Set(current);
+      for (const id of visibleIds || []) {
+        if (checked) {
+          next.add(id);
+        } else {
+          next.delete(id);
+        }
+      }
+      return next;
+    });
+  }, []);
+
+  const handleExcludeSelected = useCallback(() => {
+    if (selectedTableWorkIds.size === 0) {
+      return;
+    }
+    setExcludedWorkIds((current) => {
+      const next = new Set(current);
+      selectedTableWorkIds.forEach((id) => next.add(id));
+      return next;
+    });
+    setExcludedWorksById((current) => {
+      const next = { ...current };
+      for (const item of items) {
+        const id = getWorkId(item);
+        if (id && selectedTableWorkIds.has(id)) {
+          next[id] = {
+            title: item.title,
+            publication_year: getWorkDate(item),
+          };
+        }
+      }
+      return next;
+    });
+    setSelectedTableWorkIds(new Set());
+  }, [items, selectedTableWorkIds]);
+
+  const handleRestoreExcluded = useCallback((workId) => {
+    setExcludedWorkIds((current) => {
+      const next = new Set(current);
+      next.delete(workId);
+      return next;
+    });
+  }, []);
+
+  const handleRestoreAllExcluded = useCallback(() => {
+    setExcludedWorkIds(new Set());
+  }, []);
+
+  const handleSortChange = useCallback(
+    (nextSort) => {
+      const normalized = normalizePublicationSort(nextSort);
+      const nextSortKey = publicationSortKey(normalized);
+      setPublicationSort(normalized);
+      sortRef.current = normalized;
+      sortKeyRef.current = nextSortKey;
+      requestKeyRef.current = `${selectionKeyRef.current}::${appliedFiltersKeyRef.current}::${nextSortKey}`;
+      setSelectedTableWorkIds(new Set());
+      resetAndLoad({
+        filtersOverride: filtersPayloadRef.current,
+        filtersKeyOverride: appliedFiltersKeyRef.current,
+        sortOverride: normalized,
+        sortKeyOverride: nextSortKey,
+        preserveExisting: false,
         forceRefresh: true,
       });
     },
@@ -660,12 +942,15 @@ function AuthorAnalysisPage() {
   };
 
   const handleOpenInsights = () => {
+    const authorsForInsights = activeAuthors.length > 0 ? activeAuthors : originalAuthors;
     navigate("/analyze/authors/insights", {
       state: {
-        authors: activeAuthors.length > 0 ? activeAuthors : originalAuthors,
-        authorNames: (activeAuthors.length > 0 ? activeAuthors : originalAuthors).map(
-          (author) => author.display_name,
-        ),
+        originalAuthors,
+        activeAuthors: authorsForInsights,
+        authors: authorsForInsights,
+        excludedWorkIds: excludedWorkIdList,
+        excludedWorksById,
+        filters: filtersPayloadRef.current,
       },
     });
   };
@@ -673,49 +958,12 @@ function AuthorAnalysisPage() {
   const showFilters = originalAuthors.length > 0;
 
   const authorFilterSection = showFilters ? (
-    <Box sx={{ mb: 2.5 }}>
-      <Box
-        sx={{
-          display: "flex",
-          flexWrap: "wrap",
-          gap: { xs: 0.5, sm: 1 },
-          alignItems: "center",
-        }}
-      >
-        {originalAuthors.map((author) => {
-          const authorId = author.canonical_author_id;
-          const checked = activeAuthorIds.has(authorId);
-          const disabled = isAuthorCheckboxDisabled(activeAuthorIds, authorId);
-          return (
-            <FormControlLabel
-              key={authorId}
-              control={
-                <Checkbox
-                  size="small"
-                  checked={checked}
-                  disabled={disabled}
-                  onChange={() => handleToggleAuthor(authorId)}
-                  inputProps={{ "aria-label": author.display_name }}
-                  sx={{ py: 0.25 }}
-                />
-              }
-              label={
-                <Typography variant="body2" sx={{ lineHeight: 1.4 }}>
-                  {author.display_name}
-                </Typography>
-              }
-              sx={{
-                m: 0,
-                mr: 1,
-                "& .MuiFormControlLabel-label": {
-                  color: checked ? "text.primary" : "text.secondary",
-                },
-              }}
-            />
-          );
-        })}
-      </Box>
-    </Box>
+    <AuthorIncludedSelector
+      authors={originalAuthors}
+      activeAuthorIds={activeAuthorIds}
+      onToggleAuthor={handleToggleAuthor}
+      getDisabled={(authorId) => isAuthorCheckboxDisabled(activeAuthorIds, authorId)}
+    />
   ) : null;
 
   if (originalAuthors.length === 0) {
@@ -738,50 +986,104 @@ function AuthorAnalysisPage() {
   return (
     <AuthorInfoPopoverProvider>
       <Box sx={pageLayoutSx}>
-        <Button
-          startIcon={<ArrowBackRoundedIcon />}
-          onClick={handleBack}
-          sx={{
-            textTransform: "none",
-            color: "text.secondary",
-            mb: 2.5,
-            px: 0.5,
-            "&:hover": { bgcolor: "action.hover", color: "text.primary" },
-          }}
-        >
-          Return to author search
-        </Button>
-
         <Box
           sx={{
             display: "flex",
-            alignItems: { xs: "stretch", sm: "center" },
+            alignItems: { xs: "flex-start", md: "center" },
             justifyContent: "space-between",
-            flexDirection: { xs: "column", sm: "row" },
-            gap: 1.5,
+            flexDirection: { xs: "column", md: "row" },
+            gap: { xs: 1, md: 2 },
             mb: 1.5,
           }}
         >
-          <Typography variant="h4" component="h1" fontWeight={600}>
+          <Typography
+            variant="h4"
+            component="h1"
+            fontWeight={700}
+            sx={{ minWidth: 0, flex: "1 1 auto", wordBreak: "break-word" }}
+          >
             {title}
           </Typography>
-          <Button
-            variant="outlined"
-            startIcon={<InsightsOutlinedIcon />}
-            onClick={handleOpenInsights}
-            data-testid="open-author-insights"
+          <Box
             sx={{
-              textTransform: "none",
-              borderRadius: 999,
-              alignSelf: { xs: "flex-start", sm: "center" },
+              display: "flex",
+              flexWrap: "wrap",
+              alignItems: "center",
+              justifyContent: { xs: "flex-start", md: "flex-end" },
+              gap: 1.5,
               flexShrink: 0,
+              alignSelf: { xs: "flex-start", md: "center" },
             }}
           >
-            Analysis
-          </Button>
+            <Button
+              startIcon={<ArrowBackRoundedIcon />}
+              onClick={handleBack}
+              sx={{
+                textTransform: "none",
+                color: "text.secondary",
+                px: 0.5,
+                whiteSpace: "nowrap",
+                "&:hover": { bgcolor: "action.hover", color: "text.primary" },
+              }}
+            >
+              Back to author selection
+            </Button>
+            <Button
+              variant="outlined"
+              startIcon={<InsightsOutlinedIcon />}
+              onClick={handleOpenInsights}
+              data-testid="open-author-insights"
+              sx={{
+                textTransform: "none",
+                borderRadius: 999,
+                flexShrink: 0,
+                whiteSpace: "nowrap",
+              }}
+            >
+              Insight
+            </Button>
+          </Box>
         </Box>
 
         {authorFilterSection}
+
+        {selectedTableWorkIdList.length > 0 ? (
+          <Paper
+            elevation={0}
+            data-testid="publication-selection-actions"
+            sx={{
+              mb: 2,
+              p: 1.25,
+              border: "1px solid",
+              borderColor: "divider",
+              borderRadius: "12px",
+              display: "flex",
+              alignItems: "center",
+              gap: 1,
+              flexWrap: "wrap",
+            }}
+          >
+            <Typography variant="body2" fontWeight={600}>
+              {selectedTableWorkIdList.length} selected
+            </Typography>
+            <Button
+              size="small"
+              variant="contained"
+              disableElevation
+              onClick={handleExcludeSelected}
+              sx={{ textTransform: "none", borderRadius: 999 }}
+            >
+              Exclude from Insights
+            </Button>
+          </Paper>
+        ) : null}
+
+        <PublicationExclusionManager
+          excludedWorkIds={excludedWorkIdList}
+          excludedWorksById={excludedWorksById}
+          onRestore={handleRestoreExcluded}
+          onRestoreAll={handleRestoreAllExcluded}
+        />
 
         {!unsupported ? (
           <AuthorPublicationFilters
@@ -793,6 +1095,7 @@ function AuthorAnalysisPage() {
             onReset={handleResetFilters}
             onRemoveChip={handleRemoveChip}
             facets={facets}
+            showLoadedSampleHint
             disabled={unsupported || activeAuthors.length === 0}
             applying={loading && hasLoadedOnce}
           />
@@ -804,6 +1107,8 @@ function AuthorAnalysisPage() {
             loading={loading}
             mode={mode}
             error={timelineError}
+            pageLocal
+            providerTotalCount={providerTotalCount}
           />
         ) : null}
 
@@ -855,6 +1160,12 @@ function AuthorAnalysisPage() {
             sentinelRef={sentinelRef}
             emptyCopy={emptyCopy}
             initialEmpty={initialEmpty}
+            selectedWorkIds={selectedTableWorkIds}
+            excludedWorkIds={excludedWorkIds}
+            onToggleSelected={handleTogglePublicationSelected}
+            onToggleVisible={handleToggleVisiblePublications}
+            sort={publicationSort}
+            onSortChange={handleSortChange}
           />
         ) : null}
 
@@ -870,6 +1181,40 @@ function AuthorAnalysisPage() {
             onExport={handleExportCsv}
           />
         ) : null}
+
+        {!unsupported ? (
+          <Box sx={{ mt: 1, mb: 1 }}>
+            <Button
+              size="small"
+              variant="outlined"
+              color="inherit"
+              startIcon={<BookmarkAddRoundedIcon fontSize="small" />}
+              onClick={handleSaveSearch}
+              disabled={saveStatus.saving || originalAuthors.length === 0}
+              sx={{ textTransform: "none" }}
+            >
+              {saveStatus.saving ? "Saving..." : "Save search"}
+            </Button>
+          </Box>
+        ) : null}
+
+        <Snackbar
+          open={Boolean(saveStatus.message)}
+          autoHideDuration={3000}
+          onClose={() =>
+            setSaveStatus((current) => ({ ...current, message: null }))
+          }
+        >
+          <Alert
+            severity={saveStatus.severity}
+            variant="filled"
+            onClose={() =>
+              setSaveStatus((current) => ({ ...current, message: null }))
+            }
+          >
+            {saveStatus.message}
+          </Alert>
+        </Snackbar>
       </Box>
     </AuthorInfoPopoverProvider>
   );

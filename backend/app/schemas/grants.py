@@ -51,16 +51,25 @@ class GrantWorkAuthor(BaseModel):
         default_factory=GrantWorkAuthorProviderIds
     )
     unresolved: bool = False
+    institutions: list[dict[str, Any]] = Field(default_factory=list)
+    institution_ids: list[str] = Field(default_factory=list)
+    countries: list[str] = Field(default_factory=list)
+    department: str | None = None
+    raw_affiliation_text: str | None = None
+    affiliation_source: str | None = None
+    affiliation_confidence: float | None = None
+    provider: str | None = None
 
 
 class GrantPublicationFilters(BaseModel):
     from_year: int | None = Field(None, ge=1000, le=2100)
     to_year: int | None = Field(None, ge=1000, le=2100)
     sources: list[str] = Field(default_factory=list)
+    institutions: list[str] = Field(default_factory=list)
     venues: list[str] = Field(default_factory=list)
     authors: list[str] = Field(default_factory=list)
 
-    @field_validator("sources", "venues", "authors", mode="before")
+    @field_validator("sources", "institutions", "venues", "authors", mode="before")
     @classmethod
     def _coerce_list(cls, value: Any) -> list[str]:
         if value is None:
@@ -120,6 +129,10 @@ class GrantPublicationsResponse(BaseModel):
     pagination: GrantPublicationsPagination = Field(
         default_factory=GrantPublicationsPagination
     )
+
+
+PublicationSortBy = Literal["year", "citations", "title", "venue", "author_count"]
+PublicationSortDirection = Literal["asc", "desc"]
 
 
 class GrantPublicationFacetSearchResponse(BaseModel):

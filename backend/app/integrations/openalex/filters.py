@@ -123,6 +123,30 @@ async def _search_filter_entities(
     return normalized
 
 
+async def get_institution_display_name(institution_id: str) -> str | None:
+    """Best-effort OpenAlex institution name for ORCID affiliation hints."""
+    openalex_id = _short_openalex_id(institution_id)
+    if not openalex_id or not is_valid_institution_id(openalex_id):
+        return None
+    try:
+        api_key = _require_api_key()
+    except OpenAlexApiError:
+        return None
+    try:
+        response = await _openalex_get(
+            f"{OPENALEX_INSTITUTIONS_URL}/{openalex_id}",
+            params={"api_key": api_key},
+        )
+        if response.status_code >= 400:
+            return None
+        payload = response.json()
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return _optional_str(payload.get("display_name"))
+
+
 async def search_institutions(query: str, limit: int = 10) -> list[dict]:
     return await _search_filter_entities(
         url=OPENALEX_INSTITUTIONS_URL,

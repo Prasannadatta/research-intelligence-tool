@@ -7,6 +7,7 @@ import calendar
 import json
 import logging
 import re
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -27,11 +28,16 @@ from app.integrations.openalex.client import (
 from app.services.author_resolution.repository import AuthorIdentityRepository
 from app.services.analysis.publication_filters import (
     apply_publication_filters,
-    build_publication_facets,
+    build_dependent_publication_facets,
     filters_key as build_filters_key,
+    filters_key_matches,
     normalize_filters,
     search_grant_facets,
     search_venue_facets,
+)
+from app.services.analysis.publication_sorting import (
+    publication_sort_key,
+    sort_publications,
 )
 from app.services.analysis.work_authors import enrich_publication_items_authors
 from app.services.work_persistence.candidate import candidate_from_provider_result
@@ -41,6 +47,23 @@ from app.services.work_persistence.service import WorkPersistenceService
 logger = logging.getLogger(__name__)
 
 METHOD_PROVIDER_IDS = "provider_author_ids"
+
+
+def _stage_ms(started: float) -> float:
+    return round((time.perf_counter() - started) * 1000, 1)
+
+
+def _log_stage(rid: str, stage: str, started: float, **fields: Any) -> None:
+    extras = " ".join(f"{key}={value}" for key, value in fields.items())
+    logger.info(
+        "analysis_timing req=%s stage=%s ms=%s %s",
+        rid,
+        stage,
+        _stage_ms(started),
+        extras,
+    )
+
+
 METHOD_METADATA_NAMES = "metadata_author_name_match"
 
 
@@ -145,15 +168,10 @@ async def _resolve_author(
                 elif record.provider == "arxiv":
                     add_arxiv_name(record.display_name, record.provider_author_id)
 
-    # Always incorporate the request provider identity (stable IDs preferred).
+    # Only query arXiv when the author has an arXiv provider identity.
     if provider == "openalex":
         add_openalex(provider_author_id)
     elif provider == "arxiv":
-        add_arxiv_name(display_name, provider_author_id)
-    elif not loaded:
-        add_arxiv_name(display_name, provider_author_id)
-
-    if display_name and not arxiv_names and provider != "openalex":
         add_arxiv_name(display_name, provider_author_id)
 
     seen_keys: set[str] = set()
@@ -479,111 +497,210 @@ def build_publication_timeline(
     }
 
 
-async def _fetch_all_publications_for_timeline(
+def _provider_has_more(page: dict[str, Any]) -> bool:
+    return bool(page.get("has_more") and page.get("next_cursor"))
+
+
+def _provider_total_count(page: dict[str, Any] | None) -> int | None:
+    if not isinstance(page, dict):
+        return None
+    raw = page.get("count")
+    if isinstance(raw, bool) or raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+async def _fetch_one_provider_page(
+    *,
+    persistence: WorkPersistenceService | None,
+    provider: str,
+    fetch_page,
+    cursor: str | None,
+    analysis_match: dict[str, Any],
+    seen_ids: set[str],
+    request_id: str,
+    page_index: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    page = await fetch_page(cursor)
+    results = [row for row in list(page.get("results") or []) if isinstance(row, dict)]
+    logger.info(
+        "analysis_req=%s provider=%s page=%s results=%s has_more=%s",
+        request_id,
+        provider,
+        page_index,
+        len(results),
+        bool(page.get("has_more")),
+    )
+    items = await _canonicalize_page(
+        persistence,
+        provider=provider,
+        results=results,
+        analysis_match=analysis_match,
+        seen_ids=seen_ids,
+    )
+    return items, page
+
+
+async def _fetch_publication_pages(
     *,
     persistence: WorkPersistenceService | None,
     can_openalex: bool,
     can_arxiv: bool,
     fetch_openalex,
     fetch_arxiv,
+    collect_all: bool = False,
+    stage: str | None = None,
+    oa_cursor: str | None = None,
+    arxiv_cursor: str | None = None,
     request_id: str | None = None,
-) -> list[dict[str, Any]]:
-    """Collect every matching publication across provider pages for timeline aggregation.
+) -> dict[str, Any]:
+    """Fetch live publications. Default: one provider page. Export may collect all.
 
-    Provider HTTP is completed before any persistence writes so SQLite transactions
-    are not held open across network waits.
+    Provider HTTP finishes before persistence writes so SQLite transactions are
+    not held across network waits.
     """
     rid = request_id or "-"
-    provider_pages: list[tuple[str, list[dict[str, Any]], dict[str, Any]]] = []
-
-    if can_openalex:
-        oa_cursor: str | None = "*"
-        page_index = 0
-        while oa_cursor is not None:
-            oa_page = await fetch_openalex(
-                oa_cursor if oa_cursor not in (None, "") else "*"
-            )
-            page_index += 1
-            results = [row for row in list(oa_page.get("results") or []) if isinstance(row, dict)]
-            logger.info(
-                "analysis_req=%s provider=openalex page=%s results=%s has_more=%s",
-                rid,
-                page_index,
-                len(results),
-                bool(oa_page.get("has_more")),
-            )
-            provider_pages.append(
-                (
-                    "openalex",
-                    results,
-                    _analysis_match(verified=True, method=METHOD_PROVIDER_IDS),
-                )
-            )
-            if oa_page.get("has_more") and oa_page.get("next_cursor"):
-                oa_cursor = oa_page.get("next_cursor")
-            else:
-                oa_cursor = None
-
-    if can_arxiv:
-        try:
-            arxiv_cursor: str | None = None
-            page_index = 0
-            while True:
-                arxiv_page = await fetch_arxiv(arxiv_cursor)
-                page_index += 1
-                results = [
-                    row
-                    for row in list(arxiv_page.get("results") or [])
-                    if isinstance(row, dict)
-                ]
-                logger.info(
-                    "analysis_req=%s provider=arxiv page=%s results=%s has_more=%s",
-                    rid,
-                    page_index,
-                    len(results),
-                    bool(arxiv_page.get("has_more")),
-                )
-                provider_pages.append(
-                    (
-                        "arxiv",
-                        results,
-                        _analysis_match(
-                            verified=False, method=METHOD_METADATA_NAMES
-                        ),
-                    )
-                )
-                if arxiv_page.get("has_more") and arxiv_page.get("next_cursor"):
-                    arxiv_cursor = arxiv_page.get("next_cursor")
-                else:
-                    break
-        except ArxivApiError:
-            if not provider_pages:
-                raise
-            logger.warning(
-                "analysis_req=%s Skipping arXiv timeline pages after provider error",
-                rid,
-            )
-
     seen_ids: set[str] = set()
     all_items: list[dict[str, Any]] = []
-    for provider, results, analysis_match in provider_pages:
-        page_items = await _canonicalize_page(
-            persistence,
-            provider=provider,
-            results=results,
-            analysis_match=analysis_match,
-            seen_ids=seen_ids,
-        )
-        all_items.extend(page_items)
+    persist_started = time.perf_counter()
+    current_stage = stage or ("openalex" if can_openalex else "arxiv")
+    current_oa = oa_cursor if oa_cursor not in (None, "") else "*"
+    current_arxiv = arxiv_cursor
+    oa_pages = 0
+    arxiv_pages = 0
+    next_stage = current_stage
+    next_oa_cursor: str | None = None
+    next_arxiv_cursor: str | None = None
+    replay_oa_cursor = current_oa if can_openalex and current_stage == "openalex" else None
+    replay_arxiv_cursor = current_arxiv if current_stage == "arxiv" else None
+    provider_has_more = False
+    provider_total_count: int | None = None
 
-    logger.info(
-        "analysis_req=%s timeline_collect done pages=%s items=%s persist=%s",
+    async def _openalex_page() -> tuple[list[dict[str, Any]], bool, str | None]:
+        nonlocal oa_pages, provider_total_count
+        oa_pages += 1
+        items, page = await _fetch_one_provider_page(
+            persistence=persistence,
+            provider="openalex",
+            fetch_page=fetch_openalex,
+            cursor=current_oa,
+            analysis_match=_analysis_match(verified=True, method=METHOD_PROVIDER_IDS),
+            seen_ids=seen_ids,
+            request_id=rid,
+            page_index=oa_pages,
+        )
+        if provider_total_count is None:
+            provider_total_count = _provider_total_count(page)
+        has_more = _provider_has_more(page)
+        return items, has_more, page.get("next_cursor") if has_more else None
+
+    async def _arxiv_page() -> tuple[list[dict[str, Any]], bool, str | None]:
+        nonlocal arxiv_pages
+        arxiv_pages += 1
+        items, page = await _fetch_one_provider_page(
+            persistence=persistence,
+            provider="arxiv",
+            fetch_page=fetch_arxiv,
+            cursor=current_arxiv,
+            analysis_match=_analysis_match(verified=False, method=METHOD_METADATA_NAMES),
+            seen_ids=seen_ids,
+            request_id=rid,
+            page_index=arxiv_pages,
+        )
+        has_more = _provider_has_more(page)
+        return items, has_more, page.get("next_cursor") if has_more else None
+
+    oa_started = time.perf_counter()
+    arxiv_started = time.perf_counter()
+    try:
+        if collect_all:
+            if can_openalex:
+                current_oa = "*"
+                while True:
+                    items, has_more, nxt = await _openalex_page()
+                    all_items.extend(items)
+                    if not has_more:
+                        break
+                    current_oa = nxt
+            if can_arxiv:
+                current_arxiv = None
+                while True:
+                    items, has_more, nxt = await _arxiv_page()
+                    all_items.extend(items)
+                    if not has_more:
+                        break
+                    current_arxiv = nxt
+            provider_has_more = False
+            next_stage = "done"
+        elif current_stage == "arxiv" or (can_arxiv and not can_openalex):
+            items, has_more, nxt = await _arxiv_page()
+            all_items.extend(items)
+            provider_has_more = has_more
+            next_arxiv_cursor = nxt
+            next_stage = "arxiv" if has_more else "done"
+        elif can_openalex:
+            items, has_more, nxt = await _openalex_page()
+            all_items.extend(items)
+            if has_more:
+                provider_has_more = True
+                next_oa_cursor = nxt
+                next_stage = "openalex"
+            elif can_arxiv:
+                provider_has_more = True
+                next_stage = "arxiv"
+                next_arxiv_cursor = None
+            else:
+                next_stage = "done"
+        elif can_arxiv:
+            items, has_more, nxt = await _arxiv_page()
+            all_items.extend(items)
+            provider_has_more = has_more
+            next_arxiv_cursor = nxt
+            next_stage = "arxiv" if has_more else "done"
+    except ArxivApiError:
+        if not all_items:
+            raise
+        logger.warning(
+            "analysis_req=%s Skipping arXiv page after provider error",
+            rid,
+        )
+        provider_has_more = False
+        next_stage = "done"
+
+    _log_stage(rid, "openalex_http_pages", oa_started, pages=oa_pages, skipped=int(oa_pages == 0))
+    _log_stage(rid, "arxiv_http_pages", arxiv_started, pages=arxiv_pages, skipped=int(arxiv_pages == 0))
+    _log_stage(
         rid,
-        len(provider_pages),
+        "canonicalize_persist",
+        persist_started,
+        items=len(all_items),
+        persist=bool(persistence),
+        collect_all=collect_all,
+        in_transaction=bool(persistence is not None and persistence.session.in_transaction()),
+    )
+    logger.info(
+        "analysis_req=%s publication_collect done items=%s persist=%s collect_all=%s has_more=%s",
+        rid,
         len(all_items),
         persistence is not None,
+        collect_all,
+        provider_has_more,
     )
-    return all_items
+    return {
+        "items": all_items,
+        "provider_has_more": provider_has_more,
+        "provider_total_count": provider_total_count,
+        "next_stage": next_stage,
+        "next_oa_cursor": next_oa_cursor,
+        "next_arxiv_cursor": next_arxiv_cursor,
+        "replay_oa_cursor": replay_oa_cursor,
+        "replay_arxiv_cursor": replay_arxiv_cursor,
+        "replay_stage": current_stage,
+    }
 
 
 def _sort_verified_first(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -599,7 +716,7 @@ def _sort_verified_first(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _empty_facets() -> dict[str, Any]:
-    return {"sources": [], "venues": [], "grants": [], "authors": []}
+    return {"sources": [], "institutions": [], "venues": [], "grants": [], "authors": []}
 
 
 async def _collect_author_publications(
@@ -608,14 +725,29 @@ async def _collect_author_publications(
     authors: list[dict[str, Any]],
     persist: bool = True,
     request_id: str | None = None,
+    collect_all: bool = False,
+    stage: str | None = None,
+    oa_cursor: str | None = None,
+    arxiv_cursor: str | None = None,
 ) -> dict[str, Any]:
-    """Resolve authors and collect the full deduplicated publication set."""
+    """Resolve authors and collect publications. Default: one live provider page."""
     if not authors:
         raise AuthorAnalysisError("At least one author is required.", status_code=422)
 
     rid = request_id or uuid.uuid4().hex[:12]
+    collect_started = time.perf_counter()
     settings = get_settings()
+    resolve_started = time.perf_counter()
     resolved = [await _resolve_author(session, author) for author in authors]
+    _log_stage(
+        rid,
+        "resolve_authors",
+        resolve_started,
+        authors=len(resolved),
+        persist=persist,
+        oa_ids=sum(len(a.openalex_ids) for a in resolved),
+        arxiv_names=sum(len(a.arxiv_names) for a in resolved),
+    )
     mode = "single_author" if len(resolved) == 1 else "common_publications"
     echo_authors = [
         {
@@ -628,19 +760,31 @@ async def _collect_author_publications(
     ]
 
     all_have_openalex = all(bool(a.openalex_ids) for a in resolved)
-    all_have_names = all(bool(a.display_name or a.arxiv_names) for a in resolved)
+    all_have_arxiv_identity = all(bool(a.arxiv_names) for a in resolved)
     can_openalex = all_have_openalex and settings.openalex_configured
-    can_arxiv = all_have_names and settings.arxiv_configured
+    can_arxiv = all_have_arxiv_identity and settings.arxiv_configured
 
     logger.info(
-        "analysis_req=%s collect start authors=%s mode=%s persist=%s oa=%s arxiv=%s",
+        "analysis_req=%s collect start authors=%s mode=%s persist=%s oa=%s arxiv=%s collect_all=%s",
         rid,
         len(resolved),
         mode,
         persist,
         can_openalex,
         can_arxiv,
+        collect_all,
     )
+
+    empty_fetch = {
+        "provider_has_more": False,
+        "provider_total_count": None,
+        "next_stage": "done",
+        "next_oa_cursor": None,
+        "next_arxiv_cursor": None,
+        "replay_oa_cursor": None,
+        "replay_arxiv_cursor": None,
+        "replay_stage": stage or "openalex",
+    }
 
     if not can_openalex and not can_arxiv:
         return {
@@ -657,6 +801,7 @@ async def _collect_author_publications(
             "can_arxiv": False,
             "persistence": None,
             "request_id": rid,
+            **empty_fetch,
         }
 
     persistence = (
@@ -666,36 +811,43 @@ async def _collect_author_publications(
         and settings.work_persistence_enabled
         else None
     )
-    bulk_page_size = 50
+    page_size = 20
+    provider_calls = {"openalex": 0, "arxiv": 0, "orcid": 0, "scopus": 0}
 
     async def fetch_openalex(page_cursor: str | None) -> dict[str, Any]:
+        provider_calls["openalex"] += 1
         author_id_groups = [
             list(author.openalex_ids) for author in resolved if author.openalex_ids
         ]
         return await search_works_by_author_ids(
             author_id_groups=author_id_groups,
-            limit=bulk_page_size,
+            limit=page_size,
             cursor=page_cursor,
         )
 
     async def fetch_arxiv(page_cursor: str | None) -> dict[str, Any]:
+        provider_calls["arxiv"] += 1
         names = [
             (author.arxiv_names[0] if author.arxiv_names else author.display_name)
             for author in resolved
         ]
         return await search_arxiv_publications_by_authors(
             author_names=names,
-            limit=bulk_page_size,
+            limit=page_size,
             cursor=page_cursor,
         )
 
     try:
-        all_items = await _fetch_all_publications_for_timeline(
+        fetched = await _fetch_publication_pages(
             persistence=persistence,
             can_openalex=can_openalex,
             can_arxiv=can_arxiv,
             fetch_openalex=fetch_openalex,
             fetch_arxiv=fetch_arxiv,
+            collect_all=collect_all,
+            stage=stage,
+            oa_cursor=oa_cursor,
+            arxiv_cursor=arxiv_cursor,
             request_id=rid,
         )
     except OpenAlexApiError as exc:
@@ -703,6 +855,18 @@ async def _collect_author_publications(
     except ArxivApiError as exc:
         raise AuthorAnalysisError(str(exc), status_code=exc.status_code) from exc
 
+    all_items = fetched["items"]
+    _log_stage(
+        rid,
+        "collect_total",
+        collect_started,
+        items=len(all_items),
+        persist=persist,
+        oa=can_openalex,
+        arxiv=can_arxiv,
+        provider_calls=provider_calls,
+        collect_all=collect_all,
+    )
     return {
         "mode": mode,
         "authors": echo_authors,
@@ -716,6 +880,14 @@ async def _collect_author_publications(
         "authors_key": _authors_key([a.canonical_author_id for a in resolved]),
         "records_key": _provider_records_key(resolved),
         "request_id": rid,
+        "provider_has_more": fetched["provider_has_more"],
+        "next_stage": fetched["next_stage"],
+        "next_oa_cursor": fetched["next_oa_cursor"],
+        "next_arxiv_cursor": fetched["next_arxiv_cursor"],
+        "replay_oa_cursor": fetched["replay_oa_cursor"],
+        "replay_arxiv_cursor": fetched["replay_arxiv_cursor"],
+        "replay_stage": fetched["replay_stage"],
+        "provider_total_count": fetched.get("provider_total_count"),
     }
 
 
@@ -726,13 +898,35 @@ async def analyze_author_publications(
     limit: int = 20,
     cursor: str | None = None,
     filters: dict[str, Any] | None = None,
+    sort_by: str | None = None,
+    sort_direction: str | None = None,
     request_id: str | None = None,
 ) -> dict[str, Any]:
+    total_started = time.perf_counter()
+    page_limit = max(1, min(int(limit or 20), 20))
+    cursor_payload = _decode_cursor(cursor)
+    page_offset = 0
+    stage = None
+    oa_cursor = None
+    arxiv_cursor = None
+    if cursor_payload is not None:
+        try:
+            page_offset = max(0, int(cursor_payload.get("page_offset") or cursor_payload.get("offset") or 0))
+        except (TypeError, ValueError):
+            page_offset = 0
+        stage = cursor_payload.get("stage") or None
+        oa_cursor = cursor_payload.get("oa_cursor")
+        arxiv_cursor = cursor_payload.get("arxiv_cursor")
+
     collected = await _collect_author_publications(
         session,
         authors=authors,
         persist=True,
         request_id=request_id,
+        collect_all=False,
+        stage=stage,
+        oa_cursor=oa_cursor,
+        arxiv_cursor=arxiv_cursor,
     )
     rid = collected.get("request_id") or request_id or "-"
     mode = collected["mode"]
@@ -746,16 +940,16 @@ async def analyze_author_publications(
             "timeline": None,
             "facets": _empty_facets(),
             "pagination": {"next_cursor": None, "has_more": False},
+            "provider_total_count": None,
             "unsupported": True,
             "unsupported_reason": collected.get("unsupported_reason"),
         }
 
     normalized_filters = normalize_filters(filters)
     active_filters_key = build_filters_key(normalized_filters)
+    active_sort_key = publication_sort_key(sort_by, sort_direction)
     authors_key = collected["authors_key"]
     records_key = collected["records_key"]
-    page_limit = max(1, min(int(limit or 20), 20))
-    offset = 0
 
     cursor_payload = _decode_cursor(cursor)
     if cursor_payload is not None:
@@ -769,49 +963,92 @@ async def analyze_author_publications(
                 "Pagination cursor does not match the analysis mode.",
                 status_code=422,
             )
-        if cursor_payload.get("filters_key", "") != active_filters_key:
+        if not filters_key_matches(cursor_payload.get("filters_key", ""), active_filters_key):
             raise AuthorAnalysisError(
                 "Pagination cursor does not match the active filters.",
                 status_code=422,
             )
-        try:
-            offset = max(0, int(cursor_payload.get("offset") or 0))
-        except (TypeError, ValueError):
-            offset = 0
+        if cursor_payload.get("sort_key", "-") != active_sort_key:
+            raise AuthorAnalysisError(
+                "Pagination cursor does not match the active sort.",
+                status_code=422,
+            )
 
-    all_items = collected["items"]
-    facets = build_publication_facets(all_items)
+    enrich_started = time.perf_counter()
+    all_items = await enrich_publication_items_authors(session, collected["items"])
+    _log_stage(rid, "enrich_authors", enrich_started, items=len(all_items))
+    facet_started = time.perf_counter()
+    facets = build_dependent_publication_facets(all_items, normalized_filters)
     filtered_items = apply_publication_filters(all_items, normalized_filters)
     timeline = build_publication_timeline(filtered_items)
+    sorted_items = sort_publications(
+        filtered_items,
+        sort_by=sort_by,
+        sort_direction=sort_direction,
+    )
+    _log_stage(
+        rid,
+        "filter_facet_sort",
+        facet_started,
+        collected=len(all_items),
+        filtered=len(filtered_items),
+        page=len(sorted_items[page_offset : page_offset + page_limit]),
+    )
 
-    page_items = filtered_items[offset : offset + page_limit]
-    page_items = await enrich_publication_items_authors(session, page_items)
-
-    next_offset = offset + len(page_items)
-    has_more = next_offset < len(filtered_items)
+    page_items = sorted_items[page_offset : page_offset + page_limit]
+    next_offset = page_offset + len(page_items)
+    remaining_in_page = next_offset < len(sorted_items)
+    provider_has_more = bool(collected.get("provider_has_more"))
+    has_more = remaining_in_page or provider_has_more
     next_cursor = None
     if has_more:
-        next_cursor = _encode_cursor(
-            {
-                "v": 2,
-                "mode": mode,
-                "authors_key": authors_key,
-                "records_key": records_key,
-                "filters_key": active_filters_key,
-                "offset": next_offset,
-                "limit": page_limit,
-            }
-        )
+        if remaining_in_page:
+            next_stage = collected.get("replay_stage") or stage or "openalex"
+            next_oa = collected.get("replay_oa_cursor")
+            next_arxiv = collected.get("replay_arxiv_cursor")
+            encoded_offset = next_offset
+        else:
+            next_stage = collected.get("next_stage") or "done"
+            next_oa = collected.get("next_oa_cursor")
+            next_arxiv = collected.get("next_arxiv_cursor")
+            encoded_offset = 0
+        if next_stage != "done" or remaining_in_page:
+            next_cursor = _encode_cursor(
+                {
+                    "v": 3,
+                    "mode": mode,
+                    "authors_key": authors_key,
+                    "records_key": records_key,
+                    "filters_key": active_filters_key,
+                    "sort_key": active_sort_key,
+                    "stage": next_stage,
+                    "oa_cursor": next_oa,
+                    "arxiv_cursor": next_arxiv,
+                    "page_offset": encoded_offset,
+                    "limit": page_limit,
+                }
+            )
+        else:
+            has_more = False
 
     persistence = collected.get("persistence")
     if persistence is not None and session is not None:
         try:
+            commit_started = time.perf_counter()
             await session.commit()
+            _log_stage(rid, "persistence_commit", commit_started, items=len(all_items))
             logger.info("analysis_req=%s persistence commit ok items=%s", rid, len(all_items))
         except Exception:
             logger.exception("analysis_req=%s Failed to commit analysis work persistence", rid)
             await session.rollback()
 
+    _log_stage(
+        rid,
+        "analyze_total",
+        total_started,
+        returned=len(page_items),
+        has_more=has_more,
+    )
     return {
         "mode": mode,
         "authors": echo_authors,
@@ -822,6 +1059,7 @@ async def analyze_author_publications(
             "next_cursor": next_cursor,
             "has_more": bool(next_cursor),
         },
+        "provider_total_count": collected.get("provider_total_count"),
         "unsupported": False,
         "unsupported_reason": None,
     }
@@ -840,7 +1078,8 @@ async def search_author_publication_venues(
     )
     if collected.get("unsupported"):
         return []
-    return search_venue_facets(collected["items"], query, limit=limit)
+    items = await enrich_publication_items_authors(session, collected["items"])
+    return search_venue_facets(items, query, limit=limit)
 
 
 async def search_author_publication_grants(
@@ -855,4 +1094,38 @@ async def search_author_publication_grants(
     )
     if collected.get("unsupported"):
         return []
-    return search_grant_facets(collected["items"], query, limit=limit)
+    items = await enrich_publication_items_authors(session, collected["items"])
+    return search_grant_facets(items, query, limit=limit)
+
+
+async def build_author_publication_facets(
+    session: AsyncSession | None,
+    *,
+    authors: list[dict[str, Any]],
+    filters: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    started = time.perf_counter()
+    collected = await _collect_author_publications(
+        session,
+        authors=authors,
+        persist=False,
+    )
+    rid = collected.get("request_id") or "-"
+    if collected.get("unsupported"):
+        return {"sources": [], "institutions": [], "venues": [], "grants": [], "authors": []}
+    enrich_started = time.perf_counter()
+    items = await enrich_publication_items_authors(session, collected["items"])
+    _log_stage(rid, "facets_enrich_authors", enrich_started, items=len(items))
+    facets = build_dependent_publication_facets(items, filters)
+    _log_stage(
+        rid,
+        "facets_total",
+        started,
+        items=len(items),
+        sources=len(facets.get("sources") or []),
+        institutions=len(facets.get("institutions") or []),
+        venues=len(facets.get("venues") or []),
+        grants=len(facets.get("grants") or []),
+        authors=len(facets.get("authors") or []),
+    )
+    return facets

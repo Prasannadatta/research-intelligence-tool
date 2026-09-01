@@ -5,8 +5,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes.authors import router as authors_router
 from app.api.routes.analysis import router as analysis_router
+from app.api.routes.data_updater import router as data_updater_router
 from app.api.routes.grants import router as grants_router
 from app.api.routes.researchers import router as researchers_router
+from app.api.routes.saved_searches import router as saved_searches_router
 from app.api.routes.search import router as search_router
 
 
@@ -34,7 +36,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -44,6 +46,8 @@ app.include_router(researchers_router)
 app.include_router(search_router)
 app.include_router(analysis_router)
 app.include_router(grants_router)
+app.include_router(saved_searches_router)
+app.include_router(data_updater_router)
 
 
 @app.get("/api/health")

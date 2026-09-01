@@ -1,18 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
   Alert,
   Box,
   Button,
   CircularProgress,
+  Snackbar,
   Typography,
 } from "@mui/material";
 import ArrowBackRoundedIcon from "@mui/icons-material/ArrowBackRounded";
+import BookmarkAddRoundedIcon from "@mui/icons-material/BookmarkAddRounded";
 
 import {
   GRANT_PUBLICATIONS_PAGE_SIZE,
   buildGrantPublicationsCacheKey,
   exportGrantPublicationsCsv,
+  fetchGrantPublicationFacets,
   fetchGrantPublications,
   normalizeGrantInput,
   searchGrantPublicationAuthors,
@@ -21,6 +24,7 @@ import {
 import AuthorPublicationsTable from "../authors/AuthorPublicationsTable";
 import AuthorPublicationTrendChart from "../authors/AuthorPublicationTrendChart";
 import AuthorPublicationFilters from "../authors/AuthorPublicationFilters";
+import usePublicationFacetPreview from "../authors/usePublicationFacetPreview";
 import DownloadCsvButton, {
   downloadCsvFromResponse,
 } from "../authors/DownloadCsvButton";
@@ -34,27 +38,49 @@ import {
   removeFilterChip,
   toPublicationFiltersPayload,
 } from "../authors/publicationFilters";
+import {
+  DEFAULT_PUBLICATION_SORT,
+  normalizePublicationSort,
+  publicationSortKey,
+} from "../authors/publicationSorting";
+import { analysisPageLayoutSx } from "../../layout/pageLayout";
+import { saveSavedSearch } from "../../features/savedSearches/savedSearchesApi";
 
 const PAGE_SIZE = GRANT_PUBLICATIONS_PAGE_SIZE;
 const EMPTY_FILTERS_KEY = publicationFiltersKey(emptyPublicationFilters());
 
 const publicationsPageCache = new Map();
 
+// eslint-disable-next-line react-refresh/only-export-components -- Tests clear this module-level page cache between route renders.
 export function clearGrantPublicationsPageCache() {
   publicationsPageCache.clear();
 }
 
-const pageLayoutSx = {
-  width: "100%",
-  maxWidth: "none",
-  px: { xs: 2, sm: 3, md: 6 },
-  py: 3,
-  boxSizing: "border-box",
-  textAlign: "left",
-};
+const pageLayoutSx = analysisPageLayoutSx;
+
+function filtersDraftFromPayload(filters) {
+  const empty = emptyPublicationFilters();
+  return {
+    ...empty,
+    fromYear: filters?.from_year != null ? String(filters.from_year) : "",
+    toYear: filters?.to_year != null ? String(filters.to_year) : "",
+    sources: Array.isArray(filters?.sources) ? [...filters.sources] : [],
+    institutions: Array.isArray(filters?.institutions)
+      ? filters.institutions.map((value) => ({ value, label: value }))
+      : [],
+    venues: Array.isArray(filters?.venues)
+      ? filters.venues.map((value) => ({ value, label: value }))
+      : [],
+    grants: [],
+    authors: Array.isArray(filters?.authors)
+      ? filters.authors.map((value) => ({ value, label: value }))
+      : [],
+  };
+}
 
 function GrantPublicationsPage() {
   const navigate = useNavigate();
+  const location = useLocation();
   const { grantNumber: grantNumberParam } = useParams();
   const [searchParams] = useSearchParams();
 
@@ -78,6 +104,7 @@ function GrantPublicationsPage() {
 
   const [draftFilters, setDraftFilters] = useState(emptyPublicationFilters);
   const [appliedFilters, setAppliedFilters] = useState(emptyPublicationFilters);
+  const [publicationSort, setPublicationSort] = useState(DEFAULT_PUBLICATION_SORT);
   const [facets, setFacets] = useState(emptyFacets);
 
   const appliedFiltersKey = useMemo(
@@ -87,6 +114,10 @@ function GrantPublicationsPage() {
   const appliedFiltersPayload = useMemo(
     () => toPublicationFiltersPayload(appliedFilters),
     [appliedFilters],
+  );
+  const sortKey = useMemo(
+    () => publicationSortKey(publicationSort),
+    [publicationSort],
   );
 
   const [items, setItems] = useState([]);
@@ -104,6 +135,11 @@ function GrantPublicationsPage() {
   const [error, setError] = useState(null);
   const [initialEmpty, setInitialEmpty] = useState(false);
   const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
+  const [saveStatus, setSaveStatus] = useState({
+    saving: false,
+    message: null,
+    severity: "success",
+  });
 
   const requestIdRef = useRef(0);
   const resetAbortRef = useRef(null);
@@ -111,7 +147,9 @@ function GrantPublicationsPage() {
   const loadMoreInFlightRef = useRef(false);
   const applyInFlightRef = useRef(false);
   const grantKeyRef = useRef(grantKey);
-  const requestKeyRef = useRef(`${grantKey}::${appliedFiltersKey}`);
+  const sortRef = useRef(publicationSort);
+  const sortKeyRef = useRef(sortKey);
+  const requestKeyRef = useRef(`${grantKey}::${appliedFiltersKey}::${sortKey}`);
   const filtersPayloadRef = useRef(appliedFiltersPayload);
   const appliedFiltersKeyRef = useRef(appliedFiltersKey);
   const appliedFiltersRef = useRef(appliedFilters);
@@ -126,11 +164,14 @@ function GrantPublicationsPage() {
     error: null,
   });
 
+  /* eslint-disable react-hooks/refs -- This page keeps request guards in refs so async pagination callbacks see the latest state. */
   grantKeyRef.current = grantKey;
+  sortRef.current = publicationSort;
+  sortKeyRef.current = sortKey;
   appliedFiltersKeyRef.current = appliedFiltersKey;
   appliedFiltersRef.current = appliedFilters;
   filtersPayloadRef.current = appliedFiltersPayload;
-  requestKeyRef.current = `${grantKey}::${appliedFiltersKey}`;
+  requestKeyRef.current = `${grantKey}::${appliedFiltersKey}::${sortKey}`;
   paginationStateRef.current = {
     hasMore,
     nextCursor,
@@ -138,6 +179,7 @@ function GrantPublicationsPage() {
     loadingMore,
     error,
   };
+  /* eslint-enable react-hooks/refs */
 
   const lookupContext = useMemo(
     () => ({ grantNumber, provider }),
@@ -162,7 +204,7 @@ function GrantPublicationsPage() {
     if (hasActivePublicationFilters(appliedFilters)) {
       return {
         heading: "No publications match these filters",
-        body: "Try adjusting the year range, source, venue, or author filters.",
+        body: "Try adjusting the year range, source, institution, venue, or author filters.",
       };
     }
     return {
@@ -178,6 +220,8 @@ function GrantPublicationsPage() {
     async ({
       filtersOverride,
       filtersKeyOverride,
+      sortOverride,
+      sortKeyOverride,
       preserveExisting: preserveExistingOption,
       forceRefresh = false,
     } = {}) => {
@@ -219,10 +263,19 @@ function GrantPublicationsPage() {
         filtersKeyOverride !== undefined
           ? filtersKeyOverride
           : appliedFiltersKeyRef.current;
-      const fetchRequestKey = `${grantKeyRef.current}::${filtersKeyForCache}`;
+      const sortForRequest = normalizePublicationSort(
+        sortOverride !== undefined ? sortOverride : sortRef.current,
+      );
+      const sortKeyForCache =
+        sortKeyOverride !== undefined
+          ? sortKeyOverride
+          : publicationSortKey(sortForRequest);
+      const fetchRequestKey = `${grantKeyRef.current}::${filtersKeyForCache}::${sortKeyForCache}`;
 
       filtersPayloadRef.current = filtersForRequest;
       appliedFiltersKeyRef.current = filtersKeyForCache;
+      sortRef.current = sortForRequest;
+      sortKeyRef.current = sortKeyForCache;
       requestKeyRef.current = fetchRequestKey;
 
       const preserveExisting =
@@ -234,6 +287,7 @@ function GrantPublicationsPage() {
         grantNumber,
         provider,
         filtersKey: filtersKeyForCache,
+        sortKey: sortKeyForCache,
         cursor: "*",
         limit: PAGE_SIZE,
       });
@@ -281,6 +335,8 @@ function GrantPublicationsPage() {
           grantNumber,
           provider,
           filters: filtersForRequest,
+          sortBy: sortForRequest.sortBy,
+          sortDirection: sortForRequest.sortDirection,
           limit: PAGE_SIZE,
           cursor: null,
           signal: controller.signal,
@@ -382,6 +438,7 @@ function GrantPublicationsPage() {
       grantNumber,
       provider,
       filtersKey: appliedFiltersKeyRef.current,
+      sortKey: sortKeyRef.current,
       cursor: pageCursor,
       limit: PAGE_SIZE,
     });
@@ -412,6 +469,8 @@ function GrantPublicationsPage() {
         grantNumber,
         provider,
         filters: filtersPayloadRef.current,
+        sortBy: sortRef.current.sortBy,
+        sortDirection: sortRef.current.sortDirection,
         limit: PAGE_SIZE,
         cursor: pageCursor,
         signal: controller.signal,
@@ -464,28 +523,37 @@ function GrantPublicationsPage() {
   }, [grantNumber, provider]);
 
   const loadMoreRef = useRef(loadMore);
+  /* eslint-disable react-hooks/refs -- IntersectionObserver callbacks call the latest pagination functions. */
   loadMoreRef.current = loadMore;
 
   const resetAndLoadRef = useRef(resetAndLoad);
   resetAndLoadRef.current = resetAndLoad;
+  /* eslint-enable react-hooks/refs */
 
   // Grant identity drives the main fetch. Draft filter edits never fetch here.
   useEffect(() => {
-    const emptyFilters = emptyPublicationFilters();
-    setDraftFilters(emptyFilters);
-    setAppliedFilters(emptyFilters);
+    const startingFilters = location.state?.filters
+      ? filtersDraftFromPayload(location.state.filters)
+      : emptyPublicationFilters();
+    /* eslint-disable react-hooks/set-state-in-effect -- Grant route changes reset the page-owned filter state. */
+    setDraftFilters(startingFilters);
+    setAppliedFilters(startingFilters);
     setFacets(emptyFacets());
+    /* eslint-enable react-hooks/set-state-in-effect */
 
-    const emptyPayload = toPublicationFiltersPayload(emptyFilters);
-    filtersPayloadRef.current = emptyPayload;
-    appliedFiltersKeyRef.current = EMPTY_FILTERS_KEY;
-    appliedFiltersRef.current = emptyFilters;
-    requestKeyRef.current = `${grantKey}::${EMPTY_FILTERS_KEY}`;
+    const startingPayload = toPublicationFiltersPayload(startingFilters);
+    const startingFiltersKey = publicationFiltersKey(startingFilters);
+    filtersPayloadRef.current = startingPayload;
+    appliedFiltersKeyRef.current = startingFiltersKey;
+    appliedFiltersRef.current = startingFilters;
+    requestKeyRef.current = `${grantKey}::${startingFiltersKey}::${sortKeyRef.current}`;
     markLoadedOnce(false);
 
     resetAndLoadRef.current({
-      filtersOverride: emptyPayload,
-      filtersKeyOverride: EMPTY_FILTERS_KEY,
+      filtersOverride: startingPayload,
+      filtersKeyOverride: startingFiltersKey,
+      sortOverride: sortRef.current,
+      sortKeyOverride: sortKeyRef.current,
     });
 
     return () => {
@@ -497,7 +565,7 @@ function GrantPublicationsPage() {
       }
       loadMoreInFlightRef.current = false;
     };
-  }, [grantKey, markLoadedOnce]);
+  }, [grantKey, location.state?.filters, markLoadedOnce]);
 
   const handleApplyFilters = useCallback(
     (nextFilters) => {
@@ -513,10 +581,12 @@ function GrantPublicationsPage() {
       const key = publicationFiltersKey(cloned);
       filtersPayloadRef.current = payload;
       appliedFiltersKeyRef.current = key;
-      requestKeyRef.current = `${grantKeyRef.current}::${key}`;
+      requestKeyRef.current = `${grantKeyRef.current}::${key}::${sortKeyRef.current}`;
       resetAndLoad({
         filtersOverride: payload,
         filtersKeyOverride: key,
+        sortOverride: sortRef.current,
+        sortKeyOverride: sortKeyRef.current,
         preserveExisting: true,
         forceRefresh: true,
       });
@@ -536,10 +606,12 @@ function GrantPublicationsPage() {
     const payload = toPublicationFiltersPayload(empty);
     filtersPayloadRef.current = payload;
     appliedFiltersKeyRef.current = EMPTY_FILTERS_KEY;
-    requestKeyRef.current = `${grantKeyRef.current}::${EMPTY_FILTERS_KEY}`;
+    requestKeyRef.current = `${grantKeyRef.current}::${EMPTY_FILTERS_KEY}::${sortKeyRef.current}`;
     resetAndLoad({
       filtersOverride: payload,
       filtersKeyOverride: EMPTY_FILTERS_KEY,
+      sortOverride: sortRef.current,
+      sortKeyOverride: sortKeyRef.current,
       preserveExisting: true,
       forceRefresh: true,
     });
@@ -560,10 +632,12 @@ function GrantPublicationsPage() {
       const key = publicationFiltersKey(cloned);
       filtersPayloadRef.current = payload;
       appliedFiltersKeyRef.current = key;
-      requestKeyRef.current = `${grantKeyRef.current}::${key}`;
+      requestKeyRef.current = `${grantKeyRef.current}::${key}::${sortKeyRef.current}`;
       resetAndLoad({
         filtersOverride: payload,
         filtersKeyOverride: key,
+        sortOverride: sortRef.current,
+        sortKeyOverride: sortKeyRef.current,
         preserveExisting: true,
         forceRefresh: true,
       });
@@ -582,6 +656,84 @@ function GrantPublicationsPage() {
       `grant-${grantNumber || "export"}-publications.csv`,
     );
   }, [appliedFiltersPayload, grantNumber, provider]);
+
+  const handleSaveSearch = useCallback(async () => {
+    if (saveStatus.saving || !grantNumber) {
+      return;
+    }
+    setSaveStatus({ saving: true, message: null, severity: "success" });
+    try {
+      await saveSavedSearch({
+        search_type: "grant",
+        payload: {
+          grant_number: grantNumber,
+          provider,
+          filters: appliedFiltersPayload,
+        },
+        applied_filters: appliedFiltersPayload,
+        provider_context: { provider },
+        metadata: {
+          funder_name: meta.funder_name,
+          verified: meta.verified,
+          match_type: meta.match_type,
+        },
+      });
+      setSaveStatus({ saving: false, message: "Saved", severity: "success" });
+    } catch (err) {
+      setSaveStatus({
+        saving: false,
+        message: err?.response?.data?.detail || "Could not save search.",
+        severity: "error",
+      });
+    }
+  }, [
+    appliedFiltersPayload,
+    grantNumber,
+    meta.funder_name,
+    meta.match_type,
+    meta.verified,
+    provider,
+    saveStatus.saving,
+  ]);
+
+  const fetchFacetPreview = useCallback(
+    ({ filters, signal }) =>
+      fetchGrantPublicationFacets({
+        grantNumber,
+        provider,
+        filters,
+        signal,
+      }),
+    [grantNumber, provider],
+  );
+
+  usePublicationFacetPreview({
+    enabled: hasLoadedOnce && Boolean(grantNumber),
+    requestKey: grantKey,
+    draftFilters,
+    fetchFacets: fetchFacetPreview,
+    onFacets: setFacets,
+  });
+
+  const handleSortChange = useCallback(
+    (nextSort) => {
+      const normalized = normalizePublicationSort(nextSort);
+      const nextSortKey = publicationSortKey(normalized);
+      setPublicationSort(normalized);
+      sortRef.current = normalized;
+      sortKeyRef.current = nextSortKey;
+      requestKeyRef.current = `${grantKeyRef.current}::${appliedFiltersKeyRef.current}::${nextSortKey}`;
+      resetAndLoad({
+        filtersOverride: filtersPayloadRef.current,
+        filtersKeyOverride: appliedFiltersKeyRef.current,
+        sortOverride: normalized,
+        sortKeyOverride: nextSortKey,
+        preserveExisting: false,
+        forceRefresh: true,
+      });
+    },
+    [resetAndLoad],
+  );
 
   useEffect(() => {
     const node = sentinelRef.current;
@@ -640,7 +792,7 @@ function GrantPublicationsPage() {
           Return to search
         </Button>
 
-        <Typography variant="h4" component="h1" fontWeight={600} sx={{ mb: 0.75 }}>
+        <Typography variant="h4" component="h1" fontWeight={700} sx={{ mb: 0.75 }}>
           Publications for {grantNumber || "grant"}
         </Typography>
 
@@ -707,6 +859,8 @@ function GrantPublicationsPage() {
           initialEmpty={initialEmpty}
           searchedGrantNumber={grantNumber}
           grantProvider={provider}
+          sort={publicationSort}
+          onSortChange={handleSortChange}
         />
 
         <DownloadCsvButton
@@ -718,6 +872,38 @@ function GrantPublicationsPage() {
           }
           onExport={handleExportCsv}
         />
+
+        <Box sx={{ mt: 1, mb: 1 }}>
+          <Button
+            size="small"
+            variant="outlined"
+            color="inherit"
+            startIcon={<BookmarkAddRoundedIcon fontSize="small" />}
+            onClick={handleSaveSearch}
+            disabled={saveStatus.saving || !grantNumber}
+            sx={{ textTransform: "none" }}
+          >
+            {saveStatus.saving ? "Saving..." : "Save search"}
+          </Button>
+        </Box>
+
+        <Snackbar
+          open={Boolean(saveStatus.message)}
+          autoHideDuration={3000}
+          onClose={() =>
+            setSaveStatus((current) => ({ ...current, message: null }))
+          }
+        >
+          <Alert
+            severity={saveStatus.severity}
+            variant="filled"
+            onClose={() =>
+              setSaveStatus((current) => ({ ...current, message: null }))
+            }
+          >
+            {saveStatus.message}
+          </Alert>
+        </Snackbar>
       </Box>
     </AuthorInfoPopoverProvider>
   );

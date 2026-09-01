@@ -12,10 +12,13 @@ from app.integrations.arxiv.client import reset_arxiv_client_state_for_tests
 from app.main import app
 from app.services.analysis.publication_filters import (
     apply_publication_filters,
+    build_dependent_publication_facets,
     build_publication_facets,
+    institution_key,
     item_matches_filters,
     normalize_grant_number,
     normalize_venue_key,
+    publication_institutions,
 )
 
 client = TestClient(app)
@@ -136,6 +139,117 @@ def test_venue_and_grant_facets_dedupe_with_counts():
 
     grants = {normalize_grant_number(row["grant_number"]): row for row in facets["grants"]}
     assert grants["r01ca123456"]["publication_count"] == 2
+
+
+def test_institution_facets_use_provider_id_then_name_country():
+    items = [
+        {
+            "id": "1",
+            "publication_year": 2021,
+            "authors": [
+                {
+                    "name": "Jane Doe",
+                    "institutions": [
+                        {
+                            "id": "https://openalex.org/I123",
+                            "name": "UC Berkeley",
+                            "country_code": "US",
+                        }
+                    ],
+                }
+            ],
+        },
+        {
+            "id": "2",
+            "publication_year": 2022,
+            "authors": [
+                {
+                    "name": "Ada Lovelace",
+                    "institutions": ["University of California Berkeley"],
+                    "countries": ["US"],
+                }
+            ],
+        },
+    ]
+
+    facets = build_publication_facets(items)
+    institutions = {row["value"]: row for row in facets["institutions"]}
+
+    assert "institution:https://openalex.org/i123" in institutions
+    assert "name:university of california berkeley|country:us" in institutions
+    assert institutions["institution:https://openalex.org/i123"]["label"] == "UC Berkeley"
+
+
+def test_institution_filter_matches_any_authorship_in_publication():
+    selected = institution_key(name="Stanford University", country="US")
+    items = [
+        {
+            "id": "1",
+            "authors": [
+                {
+                    "name": "Jane Doe",
+                    "institutions": ["UC Berkeley"],
+                    "countries": ["US"],
+                },
+                {
+                    "name": "John Doe",
+                    "institutions": ["Stanford University"],
+                    "countries": ["US"],
+                },
+            ],
+        },
+        {
+            "id": "2",
+            "authors": [
+                {
+                    "name": "Grace Hopper",
+                    "institutions": ["Yale University"],
+                    "countries": ["US"],
+                }
+            ],
+        },
+    ]
+
+    assert [row["id"] for row in apply_publication_filters(items, {"institutions": [selected]})] == ["1"]
+    assert publication_institutions(items[0])[1]["value"] == selected
+
+
+def test_dependent_facets_ignore_own_institution_selection():
+    berkeley = institution_key(name="UC Berkeley", country="US")
+    stanford = institution_key(name="Stanford University", country="US")
+    items = [
+        {
+            "id": "1",
+            "publication_year": 2021,
+            "providers": ["openalex"],
+            "journal": "Nature",
+            "authors": [{"institutions": ["UC Berkeley"], "countries": ["US"]}],
+        },
+        {
+            "id": "2",
+            "publication_year": 2022,
+            "providers": ["openalex"],
+            "journal": "Science",
+            "authors": [{"institutions": ["Stanford University"], "countries": ["US"]}],
+        },
+        {
+            "id": "3",
+            "publication_year": 2022,
+            "providers": ["arxiv"],
+            "journal": "Nature",
+            "authors": [{"institutions": ["Stanford University"], "countries": ["US"]}],
+        },
+    ]
+
+    facets = build_dependent_publication_facets(
+        items,
+        {"sources": ["openalex"], "institutions": [berkeley]},
+    )
+    institution_counts = {row["value"]: row["count"] for row in facets["institutions"]}
+    source_counts = {row["value"]: row["count"] for row in facets["sources"]}
+
+    assert institution_counts == {berkeley: 1, stanford: 1}
+    assert source_counts == {"openalex": 1}
 
 
 def test_multi_venue_or_and_grant_or():

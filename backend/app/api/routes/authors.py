@@ -11,7 +11,10 @@ from app.services.authors.summary import (
     get_author_summary_by_openalex_id,
 )
 
-router = APIRouter(prefix="/api/authors", tags=["authors"])
+router = APIRouter(
+    prefix="/api/authors",
+    tags=["authors"]
+)
 
 
 @router.get("/search", response_model=list[AuthorResponse])

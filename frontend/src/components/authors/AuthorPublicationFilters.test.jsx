@@ -182,4 +182,22 @@ describe("AuthorPublicationFilters checkbox multi-select", () => {
     expect(within(listbox).getByText("12 publications · NIH")).toBeInTheDocument();
     expect(within(listbox).getByRole("checkbox")).toBeInTheDocument();
   });
+
+  it("explains that filter options are from loaded results when asked", () => {
+    renderFilters({ showLoadedSampleHint: true });
+    expect(
+      screen.getByText(
+        "Filter options and counts are from currently loaded publications, not the full corpus.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("does not show the loaded-sample hint by default", () => {
+    renderFilters();
+    expect(
+      screen.queryByText(
+        "Filter options and counts are from currently loaded publications, not the full corpus.",
+      ),
+    ).not.toBeInTheDocument();
+  });
 });

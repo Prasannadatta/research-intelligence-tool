@@ -70,14 +70,29 @@ export function normalizeTableAuthor(author) {
     name: String(name).trim(),
     canonicalAuthorId,
     providerIds,
+    institutions: Array.isArray(author?.institutions) ? author.institutions : [],
+    institutionIds: Array.isArray(author?.institution_ids)
+      ? author.institution_ids
+      : Array.isArray(author?.institutionIds)
+        ? author.institutionIds
+        : [],
+    countries: Array.isArray(author?.countries) ? author.countries : [],
+    department: author?.department || null,
+    rawAffiliationText: author?.raw_affiliation_text || author?.rawAffiliationText || null,
+    affiliationSource: author?.affiliation_source || author?.affiliationSource || null,
+    affiliationConfidence: author?.affiliation_confidence ?? author?.affiliationConfidence ?? null,
+    orcid: author?.orcid || providerIds.orcid[0] || null,
+    provider: author?.provider || null,
+    canonicalWorkId: author?.canonical_work_id || author?.canonicalWorkId || null,
     unresolved: Boolean(author?.unresolved ?? (!canonicalAuthorId && !hasStableId)),
   };
 }
 
 export function getWorkAuthors(work) {
   const authors = Array.isArray(work?.authors) ? work.authors : [];
+  const canonicalWorkId = getWorkId(work);
   return authors
-    .map((author) => normalizeTableAuthor(author))
+    .map((author) => normalizeTableAuthor({ ...author, canonical_work_id: canonicalWorkId }))
     .filter((author) => author.name);
 }
 

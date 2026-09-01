@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Path, Query
+from fastapi import APIRouter, Depends, HTTPException, Path, Query
 
 from app.integrations.openalex import (
     OpenAlexApiError,
@@ -12,7 +12,10 @@ from app.schemas.researcher import (
     ResearcherCandidate,
 )
 
-router = APIRouter(prefix="/api/researchers", tags=["researchers"])
+router = APIRouter(
+    prefix="/api/researchers",
+    tags=["researchers"]
+)
 
 
 @router.get("/autocomplete", response_model=list[ResearcherAutocompleteCandidate])

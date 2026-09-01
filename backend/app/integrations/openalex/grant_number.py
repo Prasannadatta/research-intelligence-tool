@@ -46,6 +46,10 @@ def looks_like_grant_number(value: str | None) -> bool:
     text = grant.normalized
     if len(text) < 3:
         return False
+    from app.integrations.orcid.normalize import normalize_orcid_id
+
+    if normalize_orcid_id(value):
+        return False
 
     compact = grant.compact
     if not any(ch.isdigit() for ch in compact):

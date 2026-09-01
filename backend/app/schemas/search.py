@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 EntityType = Literal["authors", "works", "grants"]
 SearchMode = Literal["auto", "keywords", "grant_number"]
-SearchSource = Literal["openalex", "arxiv", "all"]
+SearchSource = Literal["openalex", "arxiv", "orcid", "all"]
 
 
 class SearchInstitution(BaseModel):
@@ -151,7 +151,7 @@ class SearchSourceCapability(BaseModel):
 
 
 class SearchCapabilitiesResponse(BaseModel):
-    default_source: str = "openalex"
+    default_source: str = "all"
     sources: list[SearchSourceCapability] = Field(default_factory=list)
 
 

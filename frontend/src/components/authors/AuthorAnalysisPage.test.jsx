@@ -6,6 +6,7 @@ import { ThemeProvider, createTheme } from "@mui/material/styles";
 import AuthorAnalysisPage from "./AuthorAnalysisPage";
 import { clearPublicationsPageCache } from "./authorAnalysisCache";
 import * as analysisApi from "../../api/analysisApi";
+import * as savedSearchesApi from "../../features/savedSearches/savedSearchesApi";
 import { FILTER_DEBOUNCE_MS } from "./authorAnalysisPageLogic";
 
 vi.mock("react-apexcharts", () => ({
@@ -90,6 +91,7 @@ describe("AuthorAnalysisPage", () => {
       unsupported: false,
       unsupported_reason: null,
     });
+    vi.spyOn(savedSearchesApi, "saveSavedSearch").mockResolvedValue({ id: "saved-1" });
   });
 
   afterEach(() => {
@@ -111,6 +113,63 @@ describe("AuthorAnalysisPage", () => {
     const firstCall = analysisApi.fetchAuthorPublications.mock.calls[0][0];
     expect(firstCall.authors).toHaveLength(2);
     expect(firstCall.originalAuthorIds).toEqual(["c1", "c2"]);
+  });
+
+  it("saves the current author search definition", async () => {
+    renderPage();
+    await waitFor(() => expect(analysisApi.fetchAuthorPublications).toHaveBeenCalled());
+
+    fireEvent.click(screen.getByRole("button", { name: "Save search" }));
+
+    await waitFor(() => {
+      expect(savedSearchesApi.saveSavedSearch).toHaveBeenCalledWith(
+        expect.objectContaining({
+          search_type: "authors",
+          payload: expect.objectContaining({
+            authors: expect.arrayContaining([
+              expect.objectContaining({
+                canonical_author_id: "c1",
+                display_name: "John Smith",
+              }),
+            ]),
+            active_author_ids: ["c1", "c2"],
+            filters: {},
+            excluded_work_ids: [],
+          }),
+        }),
+      );
+    });
+    expect(await screen.findByText("Saved")).toBeInTheDocument();
+  });
+
+  it("saves only currently checked authors when an author is unchecked", async () => {
+    renderPage();
+    await waitFor(() => expect(analysisApi.fetchAuthorPublications).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByLabelText("Jane Doe"));
+    await sleep(FILTER_DEBOUNCE_MS + 50);
+    await waitFor(() =>
+      expect(analysisApi.fetchAuthorPublications.mock.calls.length).toBeGreaterThan(1),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Save search" }));
+
+    await waitFor(() => {
+      expect(savedSearchesApi.saveSavedSearch).toHaveBeenCalled();
+    });
+    const payload = savedSearchesApi.saveSavedSearch.mock.calls.at(-1)[0].payload;
+    expect(payload.authors).toEqual([
+      expect.objectContaining({
+        canonical_author_id: "c1",
+        display_name: "John Smith",
+      }),
+    ]);
+    expect(payload.active_author_ids).toEqual(["c1"]);
+    expect(payload.authors).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ canonical_author_id: "c2" }),
+      ]),
+    );
   });
 
   it("refetches with only active authors when one is unchecked", async () => {
@@ -189,7 +248,10 @@ describe("AuthorAnalysisPage", () => {
     await waitFor(() => {
       expect(screen.getByText("Common publications over time")).toBeInTheDocument();
     });
-    expect(screen.getByTestId("author-publication-trend-chart")).toBeInTheDocument();
+    expect(await screen.findByTestId("author-publication-trend-chart")).toBeInTheDocument();
+    expect(
+      screen.getByText("Based on the first 1 loaded publications"),
+    ).toBeInTheDocument();
   });
 
   it("refreshes chart when checkbox selection changes", async () => {
@@ -263,10 +325,11 @@ describe("AuthorAnalysisPage", () => {
       items: [{ id: "w1", title: "Paper", analysis_match: { verified: true, method: "x" } }],
         timeline: {
           interval: "year",
-          total_dated_publications: 5,
-          total_matching_publications: 5,
-          items: [{ period: "2024", label: "2024", count: 5 }],
+          total_dated_publications: 20,
+          total_matching_publications: 20,
+          items: [{ period: "2024", label: "2024", count: 20 }],
         },
+      provider_total_count: 1037,
       next_cursor: "cursor-2",
       has_more: true,
       unsupported: false,
@@ -275,12 +338,26 @@ describe("AuthorAnalysisPage", () => {
 
     renderPage();
     await waitFor(() => expect(analysisApi.fetchAuthorPublications).toHaveBeenCalledTimes(1));
+    expect(
+      screen.getByText("Timeline based on 20 of 1,037 publications"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Filter options and counts are from currently loaded publications, not the full corpus.",
+      ),
+    ).toBeInTheDocument();
 
     analysisApi.fetchAuthorPublications.mockResolvedValueOnce({
       mode: "common_publications",
       authors: AUTHORS,
       items: [{ id: "w2", title: "Second Paper", analysis_match: { verified: true, method: "x" } }],
-      timeline: null,
+      timeline: {
+        interval: "year",
+        total_dated_publications: 8,
+        total_matching_publications: 8,
+        items: [{ period: "2010", label: "2010", count: 8 }],
+      },
+      provider_total_count: 50,
       next_cursor: null,
       has_more: false,
       unsupported: false,
@@ -299,6 +376,12 @@ describe("AuthorAnalysisPage", () => {
       screen.getByTestId("apex-chart-mock").getAttribute("data-categories"),
     );
     expect(categories).toEqual(["2024"]);
+    expect(
+      screen.getByText("Timeline based on 20 of 1,037 publications"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Timeline based on 8 of 50 publications")).not.toBeInTheDocument();
+    expect(await screen.findByText("Second Paper")).toBeInTheDocument();
+    expect(screen.getByText("Paper")).toBeInTheDocument();
   });
 
   it("keeps chart visible when the table is empty", async () => {
@@ -322,7 +405,7 @@ describe("AuthorAnalysisPage", () => {
     await waitFor(() => {
       expect(screen.getByText("Common publications over time")).toBeInTheDocument();
     });
-    expect(screen.getByTestId("author-publication-trend-chart")).toBeInTheDocument();
+    expect(await screen.findByTestId("author-publication-trend-chart")).toBeInTheDocument();
     expect(screen.getByText(/No common publications found/i)).toBeInTheDocument();
   });
 

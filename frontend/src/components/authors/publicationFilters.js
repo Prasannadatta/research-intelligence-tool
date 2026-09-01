@@ -9,6 +9,7 @@ export function emptyPublicationFilters() {
     fromYear: "",
     toYear: "",
     sources: [],
+    institutions: [],
     venues: [],
     grants: [],
     authors: [],
@@ -21,6 +22,9 @@ export function clonePublicationFilters(filters) {
     fromYear: source.fromYear ?? "",
     toYear: source.toYear ?? "",
     sources: Array.isArray(source.sources) ? [...source.sources] : [],
+    institutions: Array.isArray(source.institutions)
+      ? source.institutions.map((row) => ({ ...row }))
+      : [],
     venues: Array.isArray(source.venues) ? source.venues.map((row) => ({ ...row })) : [],
     grants: Array.isArray(source.grants) ? source.grants.map((row) => ({ ...row })) : [],
     authors: Array.isArray(source.authors) ? source.authors.map((row) => ({ ...row })) : [],
@@ -112,6 +116,16 @@ export function toPublicationFiltersPayload(filters) {
         .map((value) => String(value || "").trim())
         .filter(Boolean)
     : [];
+  const institutions = Array.isArray(filters?.institutions)
+    ? [
+        ...new Set(
+          filters.institutions
+            .map((row) => row?.value || row)
+            .map((value) => String(value || "").trim())
+            .filter(Boolean),
+        ),
+      ]
+    : [];
   const grantNumbers = Array.isArray(filters?.grants)
     ? filters.grants
         .map((row) => row?.grant_number || row)
@@ -139,6 +153,9 @@ export function toPublicationFiltersPayload(filters) {
   if (sources.length > 0) {
     payload.sources = sources;
   }
+  if (institutions.length > 0) {
+    payload.institutions = institutions;
+  }
   if (venues.length > 0) {
     payload.venues = venues;
   }
@@ -157,6 +174,7 @@ export function publicationFiltersKey(filters) {
     `from:${payload.from_year ?? ""}`,
     `to:${payload.to_year ?? ""}`,
     `sources:${(payload.sources || []).join(",")}`,
+    `institutions:${(payload.institutions || []).slice().sort().join("|")}`,
     `venues:${(payload.venues || []).slice().sort().join("|")}`,
     `grants:${(payload.grant_numbers || []).slice().sort().join("|")}`,
     `authors:${(payload.authors || []).slice().sort().join("|")}`,
@@ -174,6 +192,7 @@ export function countActivePublicationFilters(filters) {
     count += 1;
   }
   count += (payload.sources || []).length;
+  count += (payload.institutions || []).length;
   count += (payload.venues || []).length;
   count += (payload.grant_numbers || []).length;
   count += (payload.authors || []).length;
@@ -220,6 +239,15 @@ export function buildAppliedFilterChips(filters, sourceOptions = []) {
     });
   }
 
+  for (const institution of filters?.institutions || []) {
+    chips.push({
+      id: `institution:${institution.value}`,
+      kind: "institution",
+      value: institution.value,
+      label: institution.label || institution.value,
+    });
+  }
+
   for (const grant of filters?.grants || []) {
     chips.push({
       id: `grant:${grant.grant_number}`,
@@ -255,6 +283,10 @@ export function removeFilterChip(filters, chip) {
     next.sources = next.sources.filter((value) => value !== chip.value);
     return next;
   }
+  if (chip.kind === "institution") {
+    next.institutions = next.institutions.filter((row) => row.value !== chip.value);
+    return next;
+  }
   if (chip.kind === "venue") {
     next.venues = next.venues.filter((row) => row.value !== chip.value);
     return next;
@@ -272,6 +304,7 @@ export function removeFilterChip(filters, chip) {
 export function emptyFacets() {
   return {
     sources: [],
+    institutions: [],
     venues: [],
     grants: [],
     authors: [],

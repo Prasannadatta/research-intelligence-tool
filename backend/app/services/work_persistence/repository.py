@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.db.models import (
+    AuthorWork,
     CanonicalWork,
     ProviderAuthorRecord,
     ProviderSearchCache,
@@ -21,6 +22,16 @@ from app.db.models import (
     WorkGrantMatch,
 )
 from app.services.work_persistence.candidate import WorkCandidate
+from app.services.work_persistence.affiliations import normalize_affiliation_payload
+
+
+def _canonical_provider_author_id(provider: str, provider_author_id: Any) -> str | None:
+    text = str(provider_author_id or "").strip()
+    if not text:
+        return None
+    if provider == "openalex":
+        text = text.rstrip("/").split("/")[-1]
+    return text or None
 
 
 def _authorships_from_raw_metadata(
@@ -55,6 +66,7 @@ def _authorships_from_raw_metadata(
             continue
         if not isinstance(author, dict):
             continue
+        affiliation = normalize_affiliation_payload(author)
         name = " ".join(
             str(
                 author.get("display_name")
@@ -75,23 +87,16 @@ def _authorships_from_raw_metadata(
             orcids = provider_ids.get("orcid") or []
             if not orcid and orcids:
                 orcid = str(orcids[0]).strip() or None
-        institutions = author.get("institutions")
-        if not isinstance(institutions, list):
-            institutions = []
-        institution_ids = author.get("institution_ids")
-        if not isinstance(institution_ids, list):
-            institution_ids = [
-                str(row.get("id")).strip()
-                for row in institutions
-                if isinstance(row, dict) and row.get("id")
-            ]
-        countries = author.get("countries")
-        if not isinstance(countries, list):
-            countries = [
-                str(row.get("country_code")).strip()
-                for row in institutions
-                if isinstance(row, dict) and row.get("country_code")
-            ]
+        institutions = affiliation.institutions
+        institution_ids = affiliation.institution_ids
+        countries = affiliation.countries
+        raw_author_metadata = dict(author)
+        if affiliation.department:
+            raw_author_metadata["department"] = affiliation.department
+        if affiliation.raw_affiliation_text:
+            raw_author_metadata["raw_affiliation_text"] = affiliation.raw_affiliation_text
+        raw_author_metadata["affiliation_source"] = affiliation.affiliation_source
+        raw_author_metadata["affiliation_confidence"] = affiliation.affiliation_confidence
         position = author.get("author_position")
         try:
             author_position = int(position) if position is not None else index
@@ -109,7 +114,7 @@ def _authorships_from_raw_metadata(
                 "institutions": institutions,
                 "institution_ids": institution_ids,
                 "countries": countries,
-                "raw_metadata": author,
+                "raw_metadata": raw_author_metadata,
             }
         )
     return rows
@@ -235,9 +240,15 @@ class WorkPersistenceRepository:
         *,
         canonical_work_id: uuid.UUID,
         provider: str,
+        provider_work_id: str,
         raw_metadata: dict[str, Any] | None,
     ) -> list[WorkAuthorship]:
-        """Replace persisted authorships for one provider snapshot of a work."""
+        """Replace persisted authorships for one provider snapshot of a work.
+
+        `work_authorships.canonical_author_id` is authoritative for canonical
+        author-work membership. `author_works` is maintained here as a derived
+        provider-work index for existing author-identity overlap code.
+        """
         authorship_rows = _authorships_from_raw_metadata(
             raw_metadata, provider=provider
         )
@@ -259,21 +270,25 @@ class WorkPersistenceRepository:
         if existing:
             await self.session.flush()
 
-        openalex_ids = sorted(
+        provider_author_ids = sorted(
             {
-                str(row["provider_author_id"])
+                author_id
                 for row in authorship_rows
-                if row.get("provider_author_id") and provider == "openalex"
+                if (
+                    author_id := _canonical_provider_author_id(
+                        provider, row.get("provider_author_id")
+                    )
+                )
             }
         )
-        canonical_by_openalex: dict[str, uuid.UUID] = {}
-        if openalex_ids:
+        provider_record_by_author_id: dict[str, ProviderAuthorRecord] = {}
+        if provider_author_ids:
             provider_records = (
                 (
                     await self.session.execute(
                         select(ProviderAuthorRecord).where(
-                            ProviderAuthorRecord.provider == "openalex",
-                            ProviderAuthorRecord.provider_author_id.in_(openalex_ids),
+                            ProviderAuthorRecord.provider == provider,
+                            ProviderAuthorRecord.provider_author_id.in_(provider_author_ids),
                         )
                     )
                 )
@@ -281,17 +296,21 @@ class WorkPersistenceRepository:
                 .all()
             )
             for record in provider_records:
-                if record.canonical_author_id is not None:
-                    canonical_by_openalex[record.provider_author_id] = (
-                        record.canonical_author_id
-                    )
+                provider_record_by_author_id[record.provider_author_id] = record
 
         created: list[WorkAuthorship] = []
         for row in authorship_rows:
-            provider_author_id = row.get("provider_author_id")
+            provider_author_id = _canonical_provider_author_id(
+                provider, row.get("provider_author_id")
+            )
+            provider_record = (
+                provider_record_by_author_id.get(provider_author_id)
+                if provider_author_id
+                else None
+            )
             canonical_author_id = None
-            if provider == "openalex" and provider_author_id:
-                canonical_author_id = canonical_by_openalex.get(str(provider_author_id))
+            if provider_record is not None:
+                canonical_author_id = provider_record.canonical_author_id
             authorship = WorkAuthorship(
                 id=uuid.uuid4(),
                 canonical_work_id=canonical_work_id,
@@ -308,9 +327,57 @@ class WorkPersistenceRepository:
             )
             self.session.add(authorship)
             created.append(authorship)
+            if provider_record is not None:
+                await self.ensure_author_work(
+                    provider_record_id=provider_record.id,
+                    provider_work_id=provider_work_id,
+                    provider=provider,
+                    title=raw_metadata.get("title") if isinstance(raw_metadata, dict) else None,
+                    publication_year=(
+                        raw_metadata.get("publication_year")
+                        if isinstance(raw_metadata, dict)
+                        else None
+                    ),
+                )
         if created:
             await self.session.flush()
         return created
+
+    async def ensure_author_work(
+        self,
+        *,
+        provider_record_id: uuid.UUID,
+        provider_work_id: str,
+        provider: str,
+        title: str | None = None,
+        publication_year: int | None = None,
+    ) -> tuple[AuthorWork, bool]:
+        existing = (
+            await self.session.execute(
+                select(AuthorWork).where(
+                    AuthorWork.provider_author_record_id == provider_record_id,
+                    AuthorWork.work_id == provider_work_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            if title and not existing.title:
+                existing.title = title
+            if publication_year and existing.publication_year is None:
+                existing.publication_year = publication_year
+            return existing, False
+
+        row = AuthorWork(
+            id=uuid.uuid4(),
+            provider_author_record_id=provider_record_id,
+            work_id=provider_work_id,
+            work_id_type=provider,
+            title=title,
+            publication_year=publication_year,
+        )
+        self.session.add(row)
+        await self.session.flush()
+        return row, True
 
     async def upsert_grant_match(
         self,

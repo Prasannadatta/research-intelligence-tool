@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import get_settings
+from app.integrations import rate_limited_http
 from app.integrations.arxiv import client as arxiv_client
 from app.integrations.arxiv.client import (
     build_arxiv_cursor,
@@ -51,6 +52,21 @@ def _reset_arxiv_state(monkeypatch):
     # Keep provider-routing tests independent of works persistence / L2 cache.
     monkeypatch.setenv("WORK_PERSISTENCE_ENABLED", "false")
     monkeypatch.setenv("PROVIDER_SEARCH_CACHE_ENABLED", "false")
+    monkeypatch.setenv("AUTHOR_RESOLUTION_ENABLED", "false")
+
+    async def _empty_orcid(**_kwargs):
+        return {
+            "query": "",
+            "source": "orcid",
+            "results": [],
+            "num_found": 0,
+            "has_more": False,
+        }
+
+    monkeypatch.setattr(
+        "app.services.search.orcid_provider.search_orcid_authors",
+        _empty_orcid,
+    )
     reset_arxiv_client_state_for_tests()
     get_settings.cache_clear()
     yield
@@ -58,11 +74,11 @@ def _reset_arxiv_state(monkeypatch):
     get_settings.cache_clear()
 
 
-def test_capabilities_include_openalex_arxiv_and_disabled_all():
+def test_capabilities_include_openalex_arxiv_and_enabled_all():
     response = client.get("/api/search/capabilities")
     assert response.status_code == 200
     payload = response.json()
-    assert payload["default_source"] == "openalex"
+    assert payload["default_source"] == "all"
     by_id = {item["id"]: item for item in payload["sources"]}
     assert by_id["openalex"]["enabled"] is True
     assert set(by_id["openalex"]["supported_entity_types"]) == {
@@ -77,8 +93,15 @@ def test_capabilities_include_openalex_arxiv_and_disabled_all():
         "grants",
     }
     assert "authors" in by_id["arxiv"]["experimental_entity_types"]
-    assert by_id["all"]["enabled"] is False
-    assert by_id["all"]["supported_entity_types"] == []
+    assert by_id["orcid"]["enabled"] is True
+    assert by_id["orcid"]["supported_entity_types"] == ["authors"]
+    assert by_id["all"]["enabled"] is True
+    assert by_id["all"]["label"] == "All sources"
+    assert set(by_id["all"]["supported_entity_types"]) == {
+        "authors",
+        "works",
+        "grants",
+    }
 
 
 def test_openalex_authors_works_grants_remain_routable():
@@ -274,7 +297,7 @@ def test_provider_registry_routes_only_selected_provider():
     from app.services.search.providers import PROVIDERS
     from app.services.search.search_service import run_search
 
-    assert set(PROVIDERS) == {"openalex", "arxiv"}
+    assert set(PROVIDERS) == {"openalex", "arxiv", "orcid"}
 
     async def run():
         with patch.object(
@@ -306,13 +329,57 @@ def test_provider_registry_routes_only_selected_provider():
     asyncio.run(run())
 
 
-def test_all_source_rejected():
-    response = client.get(
-        "/api/search",
-        params={"query": "quantum", "entity_type": "works", "source": "all"},
-    )
-    assert response.status_code == 400
-    assert "not available" in response.json()["detail"].lower()
+def test_all_source_combines_openalex_and_arxiv_works():
+    with (
+        patch(
+            "app.services.search.openalex_provider.unified_openalex_search",
+            new_callable=AsyncMock,
+            return_value={
+                "query": "quantum",
+                "entity_type": "works",
+                "source": "openalex",
+                "results": [
+                    {
+                        "result_id": "openalex:W1",
+                        "result_type": "work",
+                        "title": "OpenAlex paper",
+                        "source": "openalex",
+                    }
+                ],
+                "next_cursor": None,
+                "has_more": False,
+            },
+        ),
+        patch(
+            "app.services.search.arxiv_provider.search_arxiv_works",
+            new_callable=AsyncMock,
+            return_value={
+                "query": "quantum",
+                "entity_type": "works",
+                "source": "arxiv",
+                "results": [
+                    {
+                        "result_id": "arxiv:2401.12345",
+                        "result_type": "work",
+                        "title": "arXiv paper",
+                        "source": "arxiv",
+                    }
+                ],
+                "next_cursor": None,
+                "has_more": False,
+            },
+        ),
+    ):
+        response = client.get(
+            "/api/search",
+            params={"query": "quantum", "entity_type": "works", "source": "all"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["source"] == "all"
+    sources = [row["source"] for row in payload["results"]]
+    assert sources == ["openalex", "arxiv"]
 
 
 def test_arxiv_pagination_tokens():
@@ -378,8 +445,11 @@ def test_arxiv_pages_are_cached():
     assert calls["count"] == 1
 
 
-def test_arxiv_rate_control_serializes_uncached_requests():
+def test_arxiv_rate_control_serializes_uncached_requests(monkeypatch):
     events: list[str] = []
+    monkeypatch.setenv("ARXIV_RATE_LIMIT_MIN_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("ARXIV_RATE_LIMIT_CONCURRENCY", "1")
+    get_settings.cache_clear()
 
     class FakeResponse:
         status_code = 200
@@ -402,23 +472,22 @@ def test_arxiv_rate_control_serializes_uncached_requests():
             return FakeResponse()
 
     async def run_parallel():
+        await rate_limited_http.reset_provider_limiters_for_tests()
         reset_arxiv_client_state_for_tests()
-        with patch.object(arxiv_client, "httpx") as mock_httpx:
-            mock_httpx.AsyncClient = FakeClient
-            mock_httpx.TimeoutException = Exception
-            mock_httpx.HTTPError = Exception
-            with patch.object(arxiv_client, "MIN_REQUEST_INTERVAL_SECONDS", 0):
-                await asyncio.gather(
-                    arxiv_client.search_arxiv_works(query="alpha beta"),
-                    arxiv_client.search_arxiv_works(query="gamma delta"),
-                )
+        monkeypatch.setattr(rate_limited_http.httpx, "AsyncClient", FakeClient)
+        await asyncio.gather(
+            arxiv_client.search_arxiv_works(query="alpha beta"),
+            arxiv_client.search_arxiv_works(query="gamma delta"),
+        )
 
     asyncio.run(run_parallel())
     assert events == ["start", "end", "start", "end"]
 
 
-def test_openalex_not_delayed_by_arxiv_limiter():
+def test_openalex_not_delayed_by_arxiv_limiter(monkeypatch):
     order: list[str] = []
+    monkeypatch.setenv("ARXIV_RATE_LIMIT_MIN_INTERVAL_SECONDS", "0")
+    get_settings.cache_clear()
 
     class FakeResponse:
         status_code = 200
@@ -452,33 +521,30 @@ def test_openalex_not_delayed_by_arxiv_limiter():
         }
 
     async def run():
+        await rate_limited_http.reset_provider_limiters_for_tests()
         reset_arxiv_client_state_for_tests()
-        with patch.object(arxiv_client, "httpx") as mock_httpx:
-            mock_httpx.AsyncClient = FakeClient
-            mock_httpx.TimeoutException = Exception
-            mock_httpx.HTTPError = Exception
-            with patch.object(arxiv_client, "MIN_REQUEST_INTERVAL_SECONDS", 0):
-                with patch(
-                    "app.services.search.openalex_provider.unified_openalex_search",
-                    side_effect=openalex_search,
-                ):
-                    from app.services.search.search_service import run_search
+        monkeypatch.setattr(rate_limited_http.httpx, "AsyncClient", FakeClient)
+        with patch(
+            "app.services.search.openalex_provider.unified_openalex_search",
+            side_effect=openalex_search,
+        ):
+            from app.services.search.search_service import run_search
 
-                    arxiv_task = asyncio.create_task(
-                        run_search(
-                            query="quantum computing",
-                            entity_type="works",
-                            source="arxiv",
-                        )
-                    )
-                    await asyncio.sleep(0.01)
-                    openalex_result = await run_search(
-                        query="quantum",
-                        entity_type="works",
-                        source="openalex",
-                    )
-                    await arxiv_task
-                    return openalex_result
+            arxiv_task = asyncio.create_task(
+                run_search(
+                    query="quantum computing",
+                    entity_type="works",
+                    source="arxiv",
+                )
+            )
+            await asyncio.sleep(0.01)
+            openalex_result = await run_search(
+                query="quantum",
+                entity_type="works",
+                source="openalex",
+            )
+            await arxiv_task
+            return openalex_result
 
     result = asyncio.run(run())
     assert result["source"] == "openalex"
@@ -488,8 +554,8 @@ def test_openalex_not_delayed_by_arxiv_limiter():
 
 def test_capabilities_helper_matches_endpoint():
     payload = get_search_capabilities()
-    assert payload["default_source"] == "openalex"
-    assert any(item["id"] == "all" and item["enabled"] is False for item in payload["sources"])
+    assert payload["default_source"] == "all"
+    assert any(item["id"] == "all" and item["enabled"] is True for item in payload["sources"])
 
 
 def test_normalize_work_rejects_missing_title():

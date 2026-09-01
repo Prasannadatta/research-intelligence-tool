@@ -2,12 +2,7 @@ import { FormControl, MenuItem, Select, Tooltip, Typography, Box } from "@mui/ma
 
 import { SEARCH_SOURCES, isSourceCompatible } from "../../api/searchApi";
 
-const ALL_TOOLTIP = "Combined source search is not available yet.";
-
 function optionDisabledReason(source, entityType) {
-  if (source.id === SEARCH_SOURCES.ALL) {
-    return ALL_TOOLTIP;
-  }
   if (!source.enabled) {
     return "This source is not available.";
   }
@@ -44,7 +39,7 @@ function SourceSelector({
       </Typography>
       <FormControl size="small" variant="standard" disabled={disabled}>
         <Select
-          value={value || SEARCH_SOURCES.OPENALEX}
+          value={value || SEARCH_SOURCES.ALL}
           onChange={(event) => onChange?.(event.target.value)}
           disableUnderline
           inputProps={{ "aria-label": "Search source" }}

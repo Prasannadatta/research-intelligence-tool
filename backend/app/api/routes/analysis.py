@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -11,15 +12,32 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db_session
 from app.schemas.analysis import (
+    AuthorPublicationFacetsRequest,
+    AuthorInsightsJobResponse,
+    AuthorInsightsPublicationsRequest,
+    AuthorInsightsPublicationsResponse,
+    AuthorInsightsRequest,
+    AuthorInsightsResponse,
     AuthorPublicationFacetSearchRequest,
     AuthorPublicationsExportRequest,
     AuthorPublicationsRequest,
     AuthorPublicationsResponse,
     PublicationGrantFacet,
     PublicationVenueFacet,
+    PublicationFacets,
 )
 from app.services.analysis import AuthorAnalysisError, analyze_author_publications
+from app.services.analysis.author_insights import (
+    AuthorInsightsService,
+    log_insights_timing,
+)
+from app.services.analysis.insights_jobs import (
+    InsightsJobService,
+    enqueue_insights_job,
+    serialize_analysis_job,
+)
 from app.services.analysis.author_publications import (
+    build_author_publication_facets,
     search_author_publication_grants,
     search_author_publication_venues,
 )
@@ -43,6 +61,7 @@ async def author_publications_analysis(
     session: AsyncSession = Depends(get_db_session),
 ) -> AuthorPublicationsResponse:
     request_id = uuid.uuid4().hex[:12]
+    started = time.perf_counter()
     logger.info(
         "analysis_req=%s POST /authors/publications authors=%s cursor=%s filters=%s",
         request_id,
@@ -57,9 +76,16 @@ async def author_publications_analysis(
             limit=body.limit,
             cursor=body.cursor,
             filters=body.filters.model_dump() if body.filters else None,
+            sort_by=body.sort_by,
+            sort_direction=body.sort_direction,
             request_id=request_id,
         )
     except AuthorAnalysisError as exc:
+        logger.info(
+            "analysis_timing req=%s stage=route_publications ms=%s status=error",
+            request_id,
+            round((time.perf_counter() - started) * 1000, 1),
+        )
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
     # Persist distinct combinations on successful first-page responses only.
@@ -82,7 +108,132 @@ async def author_publications_analysis(
     if await request.is_disconnected():
         logger.info("analysis_req=%s client disconnected before response", request_id)
 
+    logger.info(
+        "analysis_timing req=%s stage=route_publications ms=%s status=ok returned=%s",
+        request_id,
+        round((time.perf_counter() - started) * 1000, 1),
+        len(result.get("items") or []),
+    )
     return AuthorPublicationsResponse.model_validate(result)
+
+
+@router.post(
+    "/authors/publications/facets",
+    response_model=PublicationFacets,
+)
+async def author_publication_facets(
+    body: AuthorPublicationFacetsRequest,
+    session: AsyncSession = Depends(get_db_session),
+) -> PublicationFacets:
+    started = time.perf_counter()
+    logger.info(
+        "analysis_timing req=facets stage=route_facets_start authors=%s",
+        len(body.authors),
+    )
+    try:
+        result = await build_author_publication_facets(
+            session,
+            authors=[author.model_dump() for author in body.authors],
+            filters=body.filters.model_dump() if body.filters else None,
+        )
+    except AuthorAnalysisError as exc:
+        logger.info(
+            "analysis_timing req=facets stage=route_facets ms=%s status=error",
+            round((time.perf_counter() - started) * 1000, 1),
+        )
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    logger.info(
+        "analysis_timing req=facets stage=route_facets ms=%s status=ok",
+        round((time.perf_counter() - started) * 1000, 1),
+    )
+    return PublicationFacets.model_validate(result)
+
+
+@router.post(
+    "/authors/insights",
+    response_model=AuthorInsightsResponse,
+)
+async def author_insights_dashboard(
+    body: AuthorInsightsRequest,
+    session: AsyncSession = Depends(get_db_session),
+) -> AuthorInsightsResponse:
+    request_started = time.perf_counter()
+    author_payloads = [author.model_dump() for author in body.authors]
+    try:
+        result = await AuthorInsightsService(session).build_dashboard(
+            authors=author_payloads,
+            filters=body.filters.model_dump() if body.filters else None,
+            excluded_work_ids=body.excluded_work_ids,
+        )
+    except AuthorAnalysisError as exc:
+        log_insights_timing(
+            "total_request",
+            request_started,
+            author_count=len(author_payloads),
+            status="error",
+        )
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    log_insights_timing(
+        "total_request",
+        request_started,
+        author_count=len(author_payloads),
+        work_count=result.get("metrics", {}).get("total_unique_publications"),
+        status="ok",
+    )
+    return AuthorInsightsResponse.model_validate(result)
+
+
+@router.post(
+    "/authors/insights/jobs",
+    response_model=AuthorInsightsJobResponse,
+)
+async def create_author_insights_job(
+    body: AuthorInsightsRequest,
+    session: AsyncSession = Depends(get_db_session),
+) -> AuthorInsightsJobResponse:
+    payload = {
+        "authors": [author.model_dump() for author in body.authors],
+        "filters": body.filters.model_dump() if body.filters else None,
+        "excluded_work_ids": body.excluded_work_ids,
+    }
+    job = await enqueue_insights_job(session, payload)
+    return AuthorInsightsJobResponse.model_validate(job)
+
+
+@router.get(
+    "/authors/insights/jobs/{job_id}",
+    response_model=AuthorInsightsJobResponse,
+)
+async def get_author_insights_job(
+    job_id: uuid.UUID,
+    session: AsyncSession = Depends(get_db_session),
+) -> AuthorInsightsJobResponse:
+    job = await InsightsJobService(session).get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Insights job not found.")
+    return AuthorInsightsJobResponse.model_validate(serialize_analysis_job(job))
+
+
+@router.post(
+    "/authors/insights/publications",
+    response_model=AuthorInsightsPublicationsResponse,
+)
+async def author_insights_publications(
+    body: AuthorInsightsPublicationsRequest,
+    session: AsyncSession = Depends(get_db_session),
+) -> AuthorInsightsPublicationsResponse:
+    try:
+        result = await AuthorInsightsService(session).build_combination_publications(
+            authors=[author.model_dump() for author in body.authors],
+            combination_id=body.combination_id,
+            filters=body.filters.model_dump() if body.filters else None,
+            excluded_work_ids=body.excluded_work_ids,
+            cursor=body.cursor,
+            limit=body.limit,
+        )
+    except AuthorAnalysisError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    return AuthorInsightsPublicationsResponse.model_validate(result)
 
 
 @router.post("/authors/publications/export")

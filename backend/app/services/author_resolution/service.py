@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,13 +12,18 @@ from app.db.models import CanonicalAuthor, ProviderAuthorRecord
 from app.services.author_resolution.candidate import (
     AuthorCandidate,
     candidate_from_provider_result,
+    linked_openalex_id_from_orcid_metadata,
 )
 from app.services.author_resolution.repository import AuthorIdentityRepository
+from app.integrations.orcid.normalize import normalize_orcid_id
 from app.services.author_resolution.scoring import (
     DECISION_AUTO_MERGE,
     DECISION_POSSIBLE_DUPLICATE,
     score_candidate_pair,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def serialize_canonical_author(canonical: CanonicalAuthor) -> dict[str, Any]:
@@ -33,28 +39,93 @@ def serialize_canonical_author(canonical: CanonicalAuthor) -> dict[str, Any]:
     )
     aliases = [name for name in aliases if name != canonical.preferred_name]
 
+    openalex_records = [
+        record for record in canonical.provider_records if record.provider == "openalex"
+    ]
+    orcid_records = [
+        record for record in canonical.provider_records if record.provider == "orcid"
+    ]
+    other_records = [
+        record
+        for record in canonical.provider_records
+        if record.provider not in {"openalex", "orcid"}
+    ]
+
     institutions: list[dict[str, Any]] = []
     seen_inst: set[str] = set()
+
+    def add_institution(*, institution_id: str | None, name: str | None, country_code: str | None) -> None:
+        key = (institution_id or "") + "|" + (name or "").strip().lower()
+        if not institution_id and not name:
+            return
+        if key in seen_inst:
+            return
+        seen_inst.add(key)
+        institutions.append(
+            {
+                "id": institution_id,
+                "name": name,
+                "country_code": country_code,
+            }
+        )
+
+    # Prefer paper/OpenAlex affiliations; ORCID employments fill gaps only.
+    for record in (*openalex_records, *other_records, *orcid_records):
+        for inst in record.institutions:
+            add_institution(
+                institution_id=inst.institution_id,
+                name=inst.display_name,
+                country_code=inst.country_code,
+            )
+
+    employments: list[dict[str, Any]] = []
+    external_ids: list[dict[str, Any]] = []
+    orcid_works: list[dict[str, Any]] = []
+    seen_ext: set[str] = set()
+    seen_doi: set[str] = set()
+    for record in orcid_records:
+        metadata = record.raw_metadata if isinstance(record.raw_metadata, dict) else {}
+        for emp in metadata.get("employments") or []:
+            if isinstance(emp, dict):
+                employments.append(emp)
+        for ext in metadata.get("external_ids") or []:
+            if not isinstance(ext, dict):
+                continue
+            key = f"{ext.get('type')}|{ext.get('value')}"
+            if key in seen_ext:
+                continue
+            seen_ext.add(key)
+            external_ids.append(ext)
+        for work in record.works:
+            work_id = work.work_id
+            if not work_id or work_id in seen_doi:
+                continue
+            seen_doi.add(work_id)
+            orcid_works.append(
+                {
+                    "id": work_id,
+                    "id_type": work.work_id_type,
+                    "title": work.title,
+                    "publication_year": work.publication_year,
+                }
+            )
+
     works_count = 0
     for record in canonical.provider_records:
         if record.works_count is not None:
             works_count = max(works_count, int(record.works_count))
-        for inst in record.institutions:
-            key = (inst.institution_id or "") + "|" + (inst.normalized_name or "")
-            if key in seen_inst:
-                continue
-            seen_inst.add(key)
-            institutions.append(
-                {
-                    "id": inst.institution_id,
-                    "name": inst.display_name,
-                    "country_code": inst.country_code,
-                }
-            )
 
     confidence = 1.0 if canonical.resolution_status == "merged" else 0.7
     if canonical.resolution_status == "unresolved":
         confidence = 0.5
+
+    source = None
+    if openalex_records:
+        source = "openalex"
+    elif orcid_records:
+        source = "orcid"
+    elif canonical.provider_records:
+        source = canonical.provider_records[0].provider
 
     return {
         "id": str(canonical.id),
@@ -64,6 +135,9 @@ def serialize_canonical_author(canonical: CanonicalAuthor) -> dict[str, Any]:
         "aliases": aliases,
         "institutions": institutions,
         "primary_institution": institutions[0] if institutions else None,
+        "employments": employments,
+        "external_ids": external_ids,
+        "works": orcid_works,
         "works_count": works_count or None,
         "source_records": [
             {
@@ -76,16 +150,11 @@ def serialize_canonical_author(canonical: CanonicalAuthor) -> dict[str, Any]:
             "status": canonical.resolution_status,
             "confidence": confidence,
         },
-        "source": (
-            canonical.provider_records[0].provider
-            if canonical.provider_records
-            else None
-        ),
+        "source": source,
         "openalex_id": next(
             (
                 record.provider_author_id
-                for record in canonical.provider_records
-                if record.provider == "openalex"
+                for record in openalex_records
             ),
             None,
         ),
@@ -118,6 +187,59 @@ class AuthorResolutionService:
             else settings.author_possible_duplicate_threshold
         )
 
+    async def _attach_linked_openalex_from_search(
+        self,
+        candidate: AuthorCandidate,
+        canonical: CanonicalAuthor,
+    ) -> CanonicalAuthor:
+        """Persist a pre-linked OpenAlex provider record from ORCID search metadata."""
+        if candidate.provider != "orcid":
+            return canonical
+
+        openalex_id = linked_openalex_id_from_orcid_metadata(
+            orcid=candidate.orcid,
+            raw_metadata=candidate.raw_metadata,
+        )
+        if not openalex_id:
+            return canonical
+
+        openalex_candidate = AuthorCandidate(
+            provider="openalex",
+            provider_author_id=openalex_id,
+            display_name=candidate.display_name,
+            aliases=list(candidate.aliases),
+            institutions=list(candidate.institutions),
+            works=list(candidate.works),
+            topics=list(candidate.topics),
+            orcid=candidate.orcid,
+            works_count=candidate.works_count,
+            raw_metadata=candidate.raw_metadata,
+        )
+        openalex_record = await self.repo.upsert_provider_record(openalex_candidate)
+        if openalex_record.canonical_author_id:
+            if openalex_record.canonical_author_id == canonical.id:
+                refreshed = await self.repo.load_canonical(canonical.id)
+                return refreshed or canonical
+            linked_orcid = normalize_orcid_id(openalex_record.orcid)
+            candidate_orcid = normalize_orcid_id(candidate.orcid)
+            if linked_orcid and candidate_orcid and linked_orcid != candidate_orcid:
+                return canonical
+            return canonical
+
+        await self.repo.attach_record_to_canonical(openalex_record, canonical)
+        refreshed = await self.repo.load_canonical(canonical.id)
+        return refreshed or canonical
+
+    async def _complete_resolution(
+        self,
+        candidate: AuthorCandidate,
+        canonical: CanonicalAuthor,
+        *,
+        created_new: bool,
+    ) -> tuple[dict[str, Any], bool]:
+        canonical = await self._attach_linked_openalex_from_search(candidate, canonical)
+        return serialize_canonical_author(canonical), created_new
+
     async def resolve_candidate(
         self,
         candidate: AuthorCandidate,
@@ -132,7 +254,7 @@ class AuthorResolutionService:
 
         if record.canonical_author_id:
             canonical = await self._maybe_merge_with_blockers(candidate, record)
-            return serialize_canonical_author(canonical), False
+            return await self._complete_resolution(candidate, canonical, created_new=False)
 
         blockers = await self.repo.find_blocking_candidates(
             candidate,
@@ -191,9 +313,9 @@ class AuthorResolutionService:
             )
             canonical = await self.repo.load_canonical(canonical.id)
             assert canonical is not None
-            return serialize_canonical_author(canonical), created_new
+            return await self._complete_resolution(candidate, canonical, created_new=created_new)
 
-        status = "resolved" if candidate.provider == "openalex" else "unresolved"
+        status = "resolved" if candidate.provider in {"openalex", "orcid"} else "unresolved"
         canonical = await self.repo.create_canonical_author(
             preferred_name=candidate.display_name,
             normalized_name=candidate.normalized_name,
@@ -205,7 +327,7 @@ class AuthorResolutionService:
         await self.repo.attach_record_to_canonical(record, canonical)
         canonical = await self.repo.load_canonical(canonical.id)
         assert canonical is not None
-        return serialize_canonical_author(canonical), True
+        return await self._complete_resolution(candidate, canonical, created_new=True)
 
     async def _maybe_merge_with_blockers(
         self,
@@ -291,7 +413,16 @@ async def resolve_author_page(
         if candidate is None:
             continue
 
-        author, _created = await service.resolve_candidate(candidate)
+        try:
+            author, _created = await service.resolve_candidate(candidate)
+        except Exception:
+            if candidate.provider == "orcid":
+                logger.warning(
+                    "orcid_resolution_failed provider_author_id=%s",
+                    candidate.provider_author_id,
+                )
+                continue
+            raise
         canonical_id = author["id"]
 
         if canonical_id in known or canonical_id in seen_page_ids:

@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from app.core.config import get_settings
 from app.integrations.arxiv.client import reset_arxiv_client_state_for_tests
 from app.main import app
+from app.services.grants.publications import build_grant_publication_facets
 from app.services.grants.suggestions import suggest_grant_numbers
 from app.services.work_persistence.normalization import normalize_grant_number
 
@@ -276,6 +277,25 @@ def test_publications_filters_affect_timeline_and_table():
     assert body["timeline"]["total_matching_publications"] == 1
     assert body["facets"]["venues"]
     assert body["facets"]["authors"]
+
+
+@pytest.mark.asyncio
+async def test_grant_publication_facets_collect_without_persistence():
+    with patch(
+        "app.services.grants.publications._collect_grant_publications",
+        new_callable=AsyncMock,
+    ) as mock_collect:
+        mock_collect.return_value = {"items": [], "grant_number": "R01GM127778", "provider": "openalex"}
+
+        result = await build_grant_publication_facets(
+            None,
+            grant_number="R01GM127778",
+            provider="openalex",
+            filters={"sources": ["openalex"]},
+        )
+
+    assert result == {"sources": [], "institutions": [], "venues": [], "grants": [], "authors": []}
+    assert mock_collect.await_args.kwargs["persist"] is False
 
 
 def test_publications_return_all_grants_and_mark_searched():

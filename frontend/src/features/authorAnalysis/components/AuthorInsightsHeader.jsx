@@ -1,7 +1,7 @@
-import { Box, Button, Chip, Typography } from "@mui/material";
+import { Box, Button, Typography } from "@mui/material";
 import ArrowBackRoundedIcon from "@mui/icons-material/ArrowBackRounded";
 
-function AuthorInsightsHeader({ authorNames = [], onBack }) {
+function AuthorInsightsHeader({ onBack }) {
   return (
     <Box sx={{ mb: 2.5 }} data-testid="author-insights-header">
       <Box
@@ -23,17 +23,17 @@ function AuthorInsightsHeader({ authorNames = [], onBack }) {
             minWidth: 0,
           }}
         >
-          <Typography variant="h4" component="h1" fontWeight={600}>
-            Author Collaboration Analysis
+          <Typography
+            variant="h4"
+            component="h1"
+            fontWeight={700}
+            sx={{
+              fontSize: { xs: "1.6rem", sm: "1.95rem", md: "2.125rem" },
+              lineHeight: 1.15,
+            }}
+          >
+            Collaboration Insights
           </Typography>
-          <Chip
-            size="small"
-            label="Demo data"
-            color="warning"
-            variant="outlined"
-            data-testid="demo-data-badge"
-            sx={{ fontWeight: 600 }}
-          />
         </Box>
 
         <Button
@@ -43,18 +43,6 @@ function AuthorInsightsHeader({ authorNames = [], onBack }) {
         >
           Back to Publications
         </Button>
-      </Box>
-
-      <Box
-        sx={{ display: "flex", flexWrap: "wrap", gap: 0.75, alignItems: "center" }}
-        data-testid="selected-author-chips"
-      >
-        <Typography variant="body2" color="text.secondary" sx={{ mr: 0.5 }}>
-          Selected authors
-        </Typography>
-        {authorNames.map((name) => (
-          <Chip key={name} size="small" label={name} />
-        ))}
       </Box>
     </Box>
   );

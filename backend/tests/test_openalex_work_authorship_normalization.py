@@ -86,6 +86,8 @@ def test_normalize_search_work_extracts_authorship_affiliations_and_orcid():
     assert authors[0]["name"] == "Author A"
     assert authors[0]["orcid"] == "0000-0001-1111-1111"
     assert authors[0]["institutions"][0]["name"] == "University X"
+    assert authors[0]["institutions"][0]["id"] == "I1"
+    assert authors[0]["institutions"][0]["affiliation_source"] == "structured_authorship"
     assert authors[1]["institutions"][0]["name"] == "University Y"
     assert authors[1]["institutions"][1]["name"] == "Institute Z"
     assert authors[2]["institutions"] == []
@@ -93,6 +95,74 @@ def test_normalize_search_work_extracts_authorship_affiliations_and_orcid():
     assert normalized["open_access_url"] == "https://example.com/oa"
     assert normalized["topics"] == ["Quantum Information"]
     assert normalized["citation_count"] == 3
+
+
+def test_normalize_search_work_extracts_department_from_raw_affiliation():
+    work = {
+        "id": "https://openalex.org/W456",
+        "title": "Affiliation Work",
+        "publication_year": 2025,
+        "authorships": [
+            {
+                "author": {
+                    "id": "https://openalex.org/A444",
+                    "display_name": "Author D",
+                },
+                "institutions": [
+                    {
+                        "id": "https://openalex.org/I9",
+                        "display_name": "University Z",
+                        "country_code": "US",
+                    }
+                ],
+                "raw_affiliation_strings": [
+                    "Department of Computer Science, University Z, United States"
+                ],
+            }
+        ],
+    }
+
+    authors = extract_normalized_work_authors(work)
+    assert authors[0]["institutions"][0]["id"] == "I9"
+    assert authors[0]["institutions"][0]["name"] == "University Z"
+    assert authors[0]["department"] == "Department of Computer Science"
+    assert authors[0]["raw_affiliation_text"] == (
+        "Department of Computer Science, University Z, United States"
+    )
+    assert authors[0]["affiliation_source"] == "structured_authorship"
+
+
+def test_raw_affiliation_requires_explicit_department_term():
+    work = {
+        "authorships": [
+            {
+                "author": {
+                    "id": "https://openalex.org/A555",
+                    "display_name": "Author E",
+                },
+                "institutions": [],
+                "raw_affiliation_strings": ["University Q, USA"],
+            },
+            {
+                "author": {
+                    "id": "https://openalex.org/A666",
+                    "display_name": "Author F",
+                },
+                "institutions": [],
+                "raw_affiliation_strings": [
+                    "School of Information, University Q, USA"
+                ],
+            },
+        ]
+    }
+
+    authors = extract_normalized_work_authors(work)
+    assert authors[0]["institutions"] == []
+    assert authors[0]["department"] is None
+    assert authors[0]["raw_affiliation_text"] == "University Q, USA"
+    assert authors[1]["institutions"][0]["name"] == "University Q"
+    assert authors[1]["department"] == "School of Information"
+    assert authors[1]["affiliation_source"] == "raw_affiliation_text"
 
 
 def test_extract_normalized_work_authors_keeps_all_coauthors():

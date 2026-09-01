@@ -67,6 +67,7 @@ COLUMN_CANDIDATES = (
     "Authors",
     "Author ORCIDs",
     "Author Affiliations",
+    "Author Departments",
     "Author Countries",
     "Citation Count",
     "DOI",
@@ -104,6 +105,7 @@ class ExportAuthor:
     name: str = ""
     orcid: str = ""
     affiliations: list[str] = field(default_factory=list)
+    departments: list[str] = field(default_factory=list)
     countries: list[str] = field(default_factory=list)
     provider_author_id: str = ""
     canonical_author_id: str = ""
@@ -319,6 +321,17 @@ def _institution_names(raw: Any) -> list[str]:
     return _unique_names(names)
 
 
+def _department_names(author: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+    names.append(clean_cell(author.get("department")))
+    raw_institutions = author.get("institutions")
+    if isinstance(raw_institutions, list):
+        for entry in raw_institutions:
+            if isinstance(entry, dict):
+                names.append(clean_cell(entry.get("department")))
+    return _unique_names(names)
+
+
 def _country_codes(raw: Any, institutions: Any = None) -> list[str]:
     codes: list[str] = []
     if isinstance(raw, list):
@@ -530,6 +543,7 @@ def build_export_authors(
             name = clean_cell(stored.get("preferred_name"))
 
         affiliations = _institution_names(author.get("institutions"))
+        departments = _department_names(author)
         affiliation_source = "authorship" if affiliations else "missing"
         if not affiliations and stored:
             affiliations = list(stored.get("institutions") or [])
@@ -553,6 +567,7 @@ def build_export_authors(
             name=name,
             orcid=orcid,
             affiliations=affiliations,
+            departments=departments,
             countries=countries,
             provider_author_id=openalex_id,
             canonical_author_id=cid,
@@ -607,6 +622,10 @@ def build_ordered_author_export_objects(
 
 def _format_affiliations(author: ExportAuthor) -> str:
     return AFFILIATION_DELIMITER.join(_unique_names(author.affiliations))
+
+
+def _format_departments(author: ExportAuthor) -> str:
+    return AFFILIATION_DELIMITER.join(_unique_names(author.departments))
 
 
 def _format_countries(author: ExportAuthor) -> str:
@@ -911,6 +930,26 @@ async def _batch_load_work_metadata(
                     "institution_ids": authorship.institution_ids or [],
                     "countries": authorship.countries or [],
                     "author_position": authorship.author_position,
+                    "department": (
+                        authorship.raw_metadata.get("department")
+                        if isinstance(authorship.raw_metadata, dict)
+                        else None
+                    ),
+                    "raw_affiliation_text": (
+                        authorship.raw_metadata.get("raw_affiliation_text")
+                        if isinstance(authorship.raw_metadata, dict)
+                        else None
+                    ),
+                    "affiliation_source": (
+                        authorship.raw_metadata.get("affiliation_source")
+                        if isinstance(authorship.raw_metadata, dict)
+                        else None
+                    ),
+                    "affiliation_confidence": (
+                        authorship.raw_metadata.get("affiliation_confidence")
+                        if isinstance(authorship.raw_metadata, dict)
+                        else None
+                    ),
                     "provider_ids": {
                         "openalex": (
                             [authorship.provider_author_id]
@@ -981,6 +1020,8 @@ def _merge_item_authors_with_stored(
                 if not _institution_names(row.get("institutions")):
                     row["institutions"] = live_row.get("institutions") or []
                     row["countries"] = live_row.get("countries") or row.get("countries") or []
+                if not _department_names(row):
+                    row["department"] = live_row.get("department")
                 if not _author_orcid_direct(row):
                     row["orcid"] = live_row.get("orcid")
                     row["provider_ids"] = live_row.get("provider_ids") or row.get(
@@ -1084,6 +1125,9 @@ def publication_item_to_row_dict(
         "Author ORCIDs": join_aligned([author.orcid for author in export_authors]),
         "Author Affiliations": join_aligned(
             [_format_affiliations(author) for author in export_authors]
+        ),
+        "Author Departments": join_aligned(
+            [_format_departments(author) for author in export_authors]
         ),
         "Author Countries": join_aligned(
             [_format_countries(author) for author in export_authors]
@@ -1237,7 +1281,7 @@ async def prepare_author_publication_export(
 ) -> dict[str, Any]:
     started = time.perf_counter()
     diagnostics = ExportDiagnostics()
-    collected = await _collect_author_publications(session, authors=authors)
+    collected = await _collect_author_publications(session, authors=authors, collect_all=True)
     echo_authors = collected["authors"]
     normalized_filters = normalize_filters(filters)
     filename = build_authors_export_filename(

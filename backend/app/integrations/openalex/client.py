@@ -12,6 +12,7 @@ from typing import Any
 import httpx
 
 from app.core.config import get_settings
+from app.integrations.rate_limited_http import provider_get
 
 OPENALEX_AUTHORS_URL = "https://api.openalex.org/authors"
 OPENALEX_AUTOCOMPLETE_AUTHORS_URL = "https://api.openalex.org/autocomplete/authors"
@@ -340,12 +341,14 @@ async def _openalex_get(url: str, *, params: dict[str, Any]) -> httpx.Response:
         "Accept": "application/json",
     }
     try:
-        async with httpx.AsyncClient(
+        return await provider_get(
+            "openalex",
+            url,
+            params=params,
             timeout=REQUEST_TIMEOUT_SECONDS,
             follow_redirects=True,
             headers=headers,
-        ) as client:
-            return await client.get(url, params=params)
+        )
     except httpx.TimeoutException as exc:
         raise OpenAlexApiError(
             "OpenAlex author search timed out. Please try again shortly."

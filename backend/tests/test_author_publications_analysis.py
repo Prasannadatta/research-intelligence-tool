@@ -80,6 +80,7 @@ def test_single_author_openalex_publications(monkeypatch):
             ],
             "next_cursor": None,
             "has_more": False,
+            "count": 1,
         }
 
         response = client.post(
@@ -112,6 +113,7 @@ def test_single_author_openalex_publications(monkeypatch):
     assert mock_oa.await_count == 1
     assert body["timeline"] is not None
     assert mock_oa.await_args.kwargs["author_id_groups"] == [["A1234567890"]]
+    assert body["provider_total_count"] == 1
 
 
 def test_multi_author_uses_openalex_intersection_filter(monkeypatch):
@@ -174,14 +176,90 @@ def test_multi_author_uses_openalex_intersection_filter(monkeypatch):
     assert response.status_code == 200
     body = response.json()
     assert body["mode"] == "common_publications"
-    assert body["pagination"]["has_more"] is False
-    assert body["pagination"]["next_cursor"] is None
+    assert body["pagination"]["has_more"] is True
+    assert body["pagination"]["next_cursor"]
     assert len(body["items"]) == 1
     assert body["items"][0]["analysis_match"]["verified"] is True
+    assert mock_oa.await_count == 1
     assert mock_oa.await_args.kwargs["author_id_groups"] == [
         ["A1111111111"],
         ["A2222222222"],
     ]
+
+
+def test_three_author_openalex_intersection_fetches_one_page(monkeypatch):
+    monkeypatch.setenv("ARXIV_ENABLED", "true")
+    get_settings.cache_clear()
+
+    with patch(
+        "app.services.analysis.author_publications.search_works_by_author_ids",
+        new_callable=AsyncMock,
+    ) as mock_oa, patch(
+        "app.services.analysis.author_publications.search_arxiv_publications_by_authors",
+        new_callable=AsyncMock,
+    ) as mock_arxiv:
+        mock_arxiv.side_effect = AssertionError("arXiv should not be queried")
+        mock_oa.return_value = {
+            "results": [
+                {
+                    "result_id": "openalex:W3",
+                    "result_type": "work",
+                    "openalex_id": "W3",
+                    "title": "Triple Paper",
+                    "authors": [
+                        {"id": "A1", "name": "John Smith"},
+                        {"id": "A2", "name": "Jane Doe"},
+                        {"id": "A3", "name": "Alex Roe"},
+                    ],
+                    "publication_year": 2022,
+                    "source": "openalex",
+                    "grants": [],
+                }
+            ],
+            "next_cursor": None,
+            "has_more": False,
+        }
+
+        response = client.post(
+            "/api/analysis/authors/publications",
+            json={
+                "authors": [
+                    _author(
+                        canonical_author_id="c1",
+                        provider="openalex",
+                        provider_author_id="A1111111111",
+                        display_name="John Smith",
+                    ),
+                    _author(
+                        canonical_author_id="c2",
+                        provider="openalex",
+                        provider_author_id="A2222222222",
+                        display_name="Jane Doe",
+                    ),
+                    _author(
+                        canonical_author_id="c3",
+                        provider="openalex",
+                        provider_author_id="A3333333333",
+                        display_name="Alex Roe",
+                    ),
+                ],
+                "limit": 20,
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["mode"] == "common_publications"
+    assert len(body["items"]) == 1
+    assert body["items"][0]["title"] == "Triple Paper"
+    assert mock_oa.await_count == 1
+    assert mock_oa.await_args.kwargs["author_id_groups"] == [
+        ["A1111111111"],
+        ["A2222222222"],
+        ["A3333333333"],
+    ]
+    assert mock_arxiv.await_count == 0
+    get_settings.cache_clear()
 
 
 def test_multi_author_arxiv_marks_experimental():
@@ -330,3 +408,113 @@ def test_single_author_passes_all_linked_openalex_ids_as_or_group():
         ["A1111111111", "A2222222222"]
     ]
     assert response.json()["items"][0]["analysis_match"]["verified"] is True
+
+
+def test_openalex_only_author_does_not_query_arxiv_or_follow_cursor(monkeypatch):
+    monkeypatch.setenv("ARXIV_ENABLED", "true")
+    get_settings.cache_clear()
+
+    with patch(
+        "app.services.analysis.author_publications.search_works_by_author_ids",
+        new_callable=AsyncMock,
+    ) as mock_oa, patch(
+        "app.services.analysis.author_publications.search_arxiv_publications_by_authors",
+        new_callable=AsyncMock,
+    ) as mock_arxiv:
+        mock_arxiv.side_effect = AssertionError("arXiv should not be queried")
+
+        async def openalex_pages(*_args, cursor=None, **_kwargs):
+            if cursor in (None, "", "*"):
+                return {
+                    "results": [
+                        {
+                            "result_id": "openalex:W1",
+                            "result_type": "work",
+                            "openalex_id": "W1",
+                            "title": "First Page Only",
+                            "authors": [{"id": "A1", "name": "John Smith"}],
+                            "publication_year": 2024,
+                            "source": "openalex",
+                            "grants": [],
+                        }
+                    ],
+                    "next_cursor": "page-2",
+                    "has_more": True,
+                    "count": 1037,
+                }
+            raise AssertionError("OpenAlex next_cursor must not be followed on page 1")
+
+        mock_oa.side_effect = openalex_pages
+
+        response = client.post(
+            "/api/analysis/authors/publications",
+            json={
+                "authors": [
+                    _author(
+                        canonical_author_id="author-1",
+                        provider="openalex",
+                        provider_author_id="A1234567890",
+                        display_name="John Smith",
+                    )
+                ],
+                "limit": 20,
+                "cursor": None,
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["items"]) == 1
+    assert body["items"][0]["title"] == "First Page Only"
+    assert body["pagination"]["has_more"] is True
+    assert mock_oa.await_count == 1
+    assert mock_arxiv.await_count == 0
+    assert body["provider_total_count"] == 1037
+    get_settings.cache_clear()
+
+
+def test_arxiv_only_publications_omit_provider_total_count():
+    with patch(
+        "app.services.analysis.author_publications.search_works_by_author_ids",
+        new_callable=AsyncMock,
+    ) as mock_oa, patch(
+        "app.services.analysis.author_publications.search_arxiv_publications_by_authors",
+        new_callable=AsyncMock,
+    ) as mock_arxiv:
+        mock_oa.side_effect = AssertionError("OpenAlex should not be called")
+        mock_arxiv.return_value = {
+            "results": [
+                {
+                    "result_id": "arxiv:2401.12345",
+                    "result_type": "work",
+                    "source": "arxiv",
+                    "source_id": "2401.12345",
+                    "title": "Preprint",
+                    "authors": [{"id": None, "name": "John Smith"}],
+                    "publication_year": 2024,
+                    "entry_url": "https://arxiv.org/abs/2401.12345",
+                    "grants": [],
+                }
+            ],
+            "next_cursor": None,
+            "has_more": False,
+        }
+
+        response = client.post(
+            "/api/analysis/authors/publications",
+            json={
+                "authors": [
+                    _author(
+                        canonical_author_id="arxiv-author-name:john smith",
+                        provider="arxiv",
+                        provider_author_id="arxiv-author-name:john smith",
+                        display_name="John Smith",
+                    )
+                ],
+                "limit": 20,
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["provider_total_count"] is None
+    assert mock_arxiv.await_count == 1

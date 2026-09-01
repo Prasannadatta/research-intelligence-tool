@@ -10,6 +10,7 @@ import {
 import CloseRoundedIcon from "@mui/icons-material/CloseRounded";
 
 import { ENTITY_TYPES } from "../../api/searchApi";
+import { getAnalysisPalette } from "../../theme/analysisPalette";
 
 function getInitials(name = "") {
   return String(name)
@@ -76,8 +77,8 @@ function AuthorSelectedRow({ item }) {
           mt: 0.15,
           fontSize: "0.8rem",
           fontWeight: 600,
-          bgcolor: "action.selected",
-          color: "text.primary",
+          bgcolor: (theme) => getAnalysisPalette(theme).navySoft,
+          color: (theme) => getAnalysisPalette(theme).navy,
           flexShrink: 0,
         }}
       >

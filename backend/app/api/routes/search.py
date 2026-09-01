@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.integrations.openalex import OpenAlexApiError
 from app.integrations.openalex.filters import search_institutions, search_topics
@@ -14,7 +14,15 @@ from app.services.search import (
     run_search,
 )
 
-router = APIRouter(prefix="/api/search", tags=["search"])
+import logging
+import time
+
+_diag_logger = logging.getLogger(__name__)
+
+router = APIRouter(
+    prefix="/api/search",
+    tags=["search"]
+)
 
 
 @router.get("/capabilities", response_model=SearchCapabilitiesResponse)
@@ -84,13 +92,13 @@ async def unified_search(
     ),
     source: str | None = Query(
         None,
-        description="Provider id: openalex | arxiv (alias: provider). 'all' is disabled.",
-        pattern="^(openalex|arxiv|all)$",
+        description="Provider id: openalex | arxiv | orcid | all (alias: provider).",
+        pattern="^(openalex|arxiv|orcid|all)$",
     ),
     provider: str | None = Query(
         None,
         description="Alias for source.",
-        pattern="^(openalex|arxiv|all)$",
+        pattern="^(openalex|arxiv|orcid|all)$",
     ),
     search_mode: str = Query(
         "auto",
@@ -105,6 +113,13 @@ async def unified_search(
     institution_id: str | None = Query(
         None,
         description="OpenAlex institution ID filter (authors only), e.g. I123.",
+    ),
+    affiliation: str | None = Query(
+        None,
+        description=(
+            "Optional affiliation/institution name hint for ORCID author search, "
+            "e.g. Berkeley. Used when a display name is already available."
+        ),
     ),
     topic_id: str | None = Query(
         None,
@@ -143,6 +158,11 @@ async def unified_search(
     ]
 
     try:
+        from app.services.search.diag_timing import enabled as diag_enabled, log_summary, reset
+
+        if diag_enabled():
+            reset()
+        started = time.perf_counter()
         payload = await run_search(
             query=resolved_query,
             entity_type=resolved_entity,
@@ -154,7 +174,19 @@ async def unified_search(
             search_mode=search_mode,
             known_author_ids=known_ids,
             search_session_id=search_session_id,
+            affiliation=affiliation,
         )
+        if diag_enabled():
+            log_summary(
+                label="search_request_total",
+                extra={
+                    "source": resolved_provider,
+                    "query": resolved_query,
+                    "entity_type": resolved_entity,
+                    "total_ms": round((time.perf_counter() - started) * 1000, 1),
+                    "result_count": len(payload.get("results") or []),
+                },
+            )
     except SearchServiceError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 

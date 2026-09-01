@@ -638,7 +638,7 @@ function AuthorSearch({
   const [resultsAreStale, setResultsAreStale] = useState(false);
   const [validationMessage, setValidationMessage] = useState(null);
   const [capabilities, setCapabilities] = useState(FALLBACK_CAPABILITIES);
-  const [source, setSource] = useState(SEARCH_SOURCES.OPENALEX);
+  const [source, setSource] = useState(SEARCH_SOURCES.ALL);
 
   const requestIdRef = useRef(0);
   const abortControllerRef = useRef(null);
@@ -677,10 +677,12 @@ function AuthorSearch({
   const isAuthors = entityType === ENTITY_TYPES.AUTHORS;
   const isGrants = entityType === ENTITY_TYPES.GRANTS;
   const isOpenAlex = source === SEARCH_SOURCES.OPENALEX;
+  const usesAuthorFilters =
+    isOpenAlex || source === SEARCH_SOURCES.ALL;
   const isArxiv = source === SEARCH_SOURCES.ARXIV;
   const minQueryLength = minQueryLengthForEntity(entityType);
   const canSearch = normalizedQuery.length >= minQueryLength;
-  const showAuthorFilters = isAuthors && isOpenAlex;
+  const showAuthorFilters = isAuthors && usesAuthorFilters;
 
 
   const selectedIdSet = useMemo(
@@ -833,12 +835,14 @@ function AuthorSearch({
           limit: PAGE_SIZE,
           cursor: requestCursor,
           institutionId:
-            requestSource === SEARCH_SOURCES.OPENALEX &&
+            (requestSource === SEARCH_SOURCES.OPENALEX ||
+              requestSource === SEARCH_SOURCES.ALL) &&
             type === ENTITY_TYPES.AUTHORS
               ? institutionId
               : "",
           topicId:
-            requestSource === SEARCH_SOURCES.OPENALEX &&
+            (requestSource === SEARCH_SOURCES.OPENALEX ||
+              requestSource === SEARCH_SOURCES.ALL) &&
             type === ENTITY_TYPES.AUTHORS
               ? topicId
               : "",
@@ -919,12 +923,14 @@ function AuthorSearch({
         query,
         source: requestSource,
         institutionId:
-          requestSource === SEARCH_SOURCES.OPENALEX &&
+          (requestSource === SEARCH_SOURCES.OPENALEX ||
+            requestSource === SEARCH_SOURCES.ALL) &&
           type === ENTITY_TYPES.AUTHORS
             ? institutionId || ""
             : "",
         topicId:
-          requestSource === SEARCH_SOURCES.OPENALEX &&
+          (requestSource === SEARCH_SOURCES.OPENALEX ||
+            requestSource === SEARCH_SOURCES.ALL) &&
           type === ENTITY_TYPES.AUTHORS
             ? topicId || ""
             : "",
@@ -968,7 +974,10 @@ function AuthorSearch({
   }, []);
 
   useEffect(() => {
-    if (entityType !== ENTITY_TYPES.AUTHORS || source !== SEARCH_SOURCES.OPENALEX) {
+    if (
+      entityType !== ENTITY_TYPES.AUTHORS ||
+      (source !== SEARCH_SOURCES.OPENALEX && source !== SEARCH_SOURCES.ALL)
+    ) {
       setInstitutionFilter(null);
       setTopicFilter(null);
     }
@@ -1063,12 +1072,14 @@ function AuthorSearch({
       }
 
       const institutionId =
-        requestSource === SEARCH_SOURCES.OPENALEX &&
+        (requestSource === SEARCH_SOURCES.OPENALEX ||
+          requestSource === SEARCH_SOURCES.ALL) &&
         type === ENTITY_TYPES.AUTHORS
           ? institutionFilterRef.current?.id || ""
           : "";
       const topicId =
-        requestSource === SEARCH_SOURCES.OPENALEX &&
+        (requestSource === SEARCH_SOURCES.OPENALEX ||
+          requestSource === SEARCH_SOURCES.ALL) &&
         type === ENTITY_TYPES.AUTHORS
           ? topicFilterRef.current?.id || ""
           : "";
@@ -1252,15 +1263,15 @@ function AuthorSearch({
       type: entityType,
       source,
       institutionId:
-        isAuthors && isOpenAlex ? institutionFilter?.id || "" : "",
-      topicId: isAuthors && isOpenAlex ? topicFilter?.id || "" : "",
+        isAuthors && usesAuthorFilters ? institutionFilter?.id || "" : "",
+      topicId: isAuthors && usesAuthorFilters ? topicFilter?.id || "" : "",
     });
   }, [
     entityType,
     institutionFilter?.id,
     isAuthors,
     isGrants,
-    isOpenAlex,
+    usesAuthorFilters,
     minQueryLength,
     normalizedQuery,
     openGrant,
@@ -1480,7 +1491,6 @@ function AuthorSearch({
                 boxShadow: "none",
                 transition: "box-shadow 120ms ease, border-color 120ms ease",
                 "&:focus-within": {
-                  borderColor: "text.disabled",
                   boxShadow: (theme) =>
                     theme.palette.mode === "dark"
                       ? "0 8px 24px rgba(0,0,0,0.28)"

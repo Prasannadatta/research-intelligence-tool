@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Routes, Route, useNavigate, useLocation, useSearchParams } from "react-router-dom";
+import {
+  Routes,
+  Route,
+  useNavigate,
+  useLocation,
+  useSearchParams,
+} from "react-router-dom";
 import {
   Box,
   Drawer,
@@ -20,11 +26,16 @@ import DarkModeRoundedIcon from "@mui/icons-material/DarkModeRounded";
 import PersonSearchRoundedIcon from "@mui/icons-material/PersonSearchRounded";
 import PaidRoundedIcon from "@mui/icons-material/PaidRounded";
 import ArticleOutlinedIcon from "@mui/icons-material/ArticleOutlined";
+import BookmarkBorderRoundedIcon from "@mui/icons-material/BookmarkBorderRounded";
+import SyncRoundedIcon from "@mui/icons-material/SyncRounded";
+
 
 import AuthorSearch from "./components/authors/AuthorSearch";
 import SelectedAuthorsList from "./components/authors/SelectedAuthorsList";
 import AuthorAnalysisPage from "./components/authors/AuthorAnalysisPage";
 import AuthorInsightsPage from "./features/authorAnalysis/AuthorInsightsPage";
+import SavedSearchesPage from "./features/savedSearches/SavedSearchesPage";
+import DataUpdaterPage from "./features/dataUpdater/DataUpdaterPage";
 import GrantPublicationsPage from "./components/grants/GrantPublicationsPage";
 import { toAnalysisAuthorPayload } from "./api/analysisApi";
 import { ENTITY_TYPES } from "./api/searchApi";
@@ -36,8 +47,31 @@ import {
   isSearchHomePath,
   parseEntityParam,
 } from "./navigation/searchNavigation";
+import { getAnalysisPalette } from "./theme/analysisPalette";
+import {
+  analysisPagePaddingLeftVar,
+  closedDrawerContentInset,
+} from "./layout/pageLayout";
 
 const drawerWidth = 270;
+const navItemSx = (theme) => {
+  const accents = getAnalysisPalette(theme);
+  return {
+    "&.Mui-selected": {
+      bgcolor: accents.navySoft,
+      color: accents.navy,
+      "& .MuiListItemIcon-root": {
+        color: accents.navy,
+      },
+      "& .MuiListItemText-primary": {
+        fontWeight: 600,
+      },
+    },
+    "&.Mui-selected:hover": {
+      bgcolor: accents.navySoft,
+    },
+  };
+};
 
 function AuthorSearchHome({
   drawerOpen,
@@ -184,7 +218,7 @@ function AuthorSearchHome({
         <Typography
           variant="h3"
           component="h1"
-          fontWeight={600}
+          fontWeight={700}
           sx={{
             mb: 1.5,
             fontSize: {
@@ -245,7 +279,7 @@ function AuthorSearchHome({
   );
 }
 
-function App() {
+function AppShell() {
   const [drawerOpen, setDrawerOpen] = useState(true);
   const [entityType, setEntityType] = useState(() => {
     if (typeof window === "undefined") {
@@ -275,12 +309,14 @@ function App() {
   );
 
   const activeMenuEntity = getActiveSearchMenuEntity(location.pathname, searchParams);
-
+  const savedSearchesSelected = location.pathname.startsWith("/saved-searches");
+  const dataUpdaterSelected = location.pathname.startsWith("/data-updater");
   useEffect(() => {
     if (!isSearchHomePath(location.pathname)) {
       return;
     }
     const parsed = parseEntityParam(searchParams.get(ENTITY_QUERY_PARAM));
+    /* eslint-disable react-hooks/set-state-in-effect -- URL query params are the source of truth for the search home selector. */
     setEntityType((current) => {
       if (current === parsed) {
         return current;
@@ -288,6 +324,7 @@ function App() {
       clearSelectionsForEntity(parsed, selectionSetters);
       return parsed;
     });
+    /* eslint-enable react-hooks/set-state-in-effect */
   }, [location.pathname, searchParams, selectionSetters]);
 
   const handleEntityTypeChange = useCallback(
@@ -338,7 +375,6 @@ function App() {
         sx={{
           width: drawerOpen ? drawerWidth : 0,
           flexShrink: 0,
-
           "& .MuiDrawer-paper": {
             width: drawerWidth,
             boxSizing: "border-box",
@@ -389,6 +425,7 @@ function App() {
           <ListItemButton
             selected={activeMenuEntity === ENTITY_TYPES.AUTHORS}
             onClick={() => navigateToSearchEntity(ENTITY_TYPES.AUTHORS)}
+            sx={navItemSx}
           >
             <ListItemIcon>
               <PersonSearchRoundedIcon />
@@ -399,6 +436,7 @@ function App() {
           <ListItemButton
             selected={activeMenuEntity === ENTITY_TYPES.GRANTS}
             onClick={() => navigateToSearchEntity(ENTITY_TYPES.GRANTS)}
+            sx={navItemSx}
           >
             <ListItemIcon>
               <PaidRoundedIcon />
@@ -409,12 +447,36 @@ function App() {
           <ListItemButton
             selected={activeMenuEntity === ENTITY_TYPES.WORKS}
             onClick={() => navigateToSearchEntity(ENTITY_TYPES.WORKS)}
+            sx={navItemSx}
           >
             <ListItemIcon>
               <ArticleOutlinedIcon />
             </ListItemIcon>
             <ListItemText primary="Works / Publications" />
           </ListItemButton>
+
+          <ListItemButton
+            selected={savedSearchesSelected}
+            onClick={() => navigate("/saved-searches")}
+            sx={navItemSx}
+          >
+            <ListItemIcon>
+              <BookmarkBorderRoundedIcon />
+            </ListItemIcon>
+            <ListItemText primary="Saved Searches" />
+          </ListItemButton>
+
+          <ListItemButton
+            selected={dataUpdaterSelected}
+            onClick={() => navigate("/data-updater")}
+            sx={navItemSx}
+          >
+            <ListItemIcon>
+              <SyncRoundedIcon />
+            </ListItemIcon>
+            <ListItemText primary="Data Updater" />
+          </ListItemButton>
+
         </List>
 
         <Box sx={{ flexGrow: 1 }} />
@@ -442,9 +504,19 @@ function App() {
           position: "relative",
           flexGrow: 1,
           minWidth: 0,
+          boxSizing: "border-box",
+          [analysisPagePaddingLeftVar]: {
+            xs: "16px",
+            sm: "24px",
+            md: drawerOpen ? "32px" : `${closedDrawerContentInset}px`,
+          },
+          width: {
+            xs: "100%",
+            md: drawerOpen ? `calc(100% - ${drawerWidth}px)` : "100%",
+          },
           minHeight: "100vh",
           transition: (theme) =>
-            theme.transitions.create("margin", {
+            theme.transitions.create("width", {
               easing: theme.transitions.easing.sharp,
               duration: theme.transitions.duration.leavingScreen,
             }),
@@ -530,6 +602,52 @@ function App() {
             }
           />
           <Route
+            path="/saved-searches"
+            element={
+              <Box sx={{ position: "relative", minHeight: "100vh" }}>
+                {!drawerOpen && (
+                  <Tooltip title="Open sidebar">
+                    <IconButton
+                      onClick={() => setDrawerOpen(true)}
+                      sx={{
+                        position: "absolute",
+                        top: 18,
+                        left: 18,
+                        zIndex: 10,
+                      }}
+                    >
+                      <MenuRoundedIcon />
+                    </IconButton>
+                  </Tooltip>
+                )}
+                <SavedSearchesPage />
+              </Box>
+            }
+          />
+          <Route
+            path="/data-updater"
+            element={
+              <Box sx={{ position: "relative", minHeight: "100vh" }}>
+                {!drawerOpen && (
+                  <Tooltip title="Open sidebar">
+                    <IconButton
+                      onClick={() => setDrawerOpen(true)}
+                      sx={{
+                        position: "absolute",
+                        top: 18,
+                        left: 18,
+                        zIndex: 10,
+                      }}
+                    >
+                      <MenuRoundedIcon />
+                    </IconButton>
+                  </Tooltip>
+                )}
+                <DataUpdaterPage />
+              </Box>
+            }
+          />
+          <Route
             path="/grants/:grantNumber"
             element={
               <Box sx={{ position: "relative", minHeight: "100vh" }}>
@@ -556,6 +674,10 @@ function App() {
       </Box>
     </Box>
   );
+}
+
+function App() {
+  return <AppShell />;
 }
 
 export default App;

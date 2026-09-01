@@ -9,11 +9,12 @@ export const ENTITY_TYPES = {
 export const SEARCH_SOURCES = {
   OPENALEX: "openalex",
   ARXIV: "arxiv",
+  ORCID: "orcid",
   ALL: "all",
 };
 
 export const ENTITY_PLACEHOLDERS = {
-  authors: "Search authors by name or grant number",
+  authors: "Search authors by name, ORCID, or grant number",
   works: "Search papers by title, topic, author, or grant number",
   grants: "Enter a grant or award number",
 };
@@ -25,7 +26,7 @@ export const MIN_QUERY_LENGTH = {
 };
 
 export const FALLBACK_CAPABILITIES = {
-  default_source: SEARCH_SOURCES.OPENALEX,
+  default_source: SEARCH_SOURCES.ALL,
   sources: [
     {
       id: SEARCH_SOURCES.OPENALEX,
@@ -40,13 +41,29 @@ export const FALLBACK_CAPABILITIES = {
       supported_entity_types: [],
     },
     {
+      id: SEARCH_SOURCES.ORCID,
+      label: "ORCID",
+      enabled: true,
+      supported_entity_types: ["authors"],
+    },
+    {
       id: SEARCH_SOURCES.ALL,
-      label: "All",
-      enabled: false,
-      supported_entity_types: [],
+      label: "All sources",
+      enabled: true,
+      supported_entity_types: ["authors", "works", "grants"],
     },
   ],
 };
+
+const ORCID_ID_RE = /^\d{4}-\d{4}-\d{4}-\d{3}[\dX]$/i;
+
+export function looksLikeOrcidQuery(query) {
+  const text = String(query || "")
+    .trim()
+    .replace(/^https?:\/\/orcid\.org\//i, "")
+    .replace(/\/$/, "");
+  return ORCID_ID_RE.test(text);
+}
 
 /**
  * Normalize search query for requests and cache keys.
@@ -58,6 +75,10 @@ export function normalizeSearchQuery(query, entityType = ENTITY_TYPES.AUTHORS) {
     .replace(/\s+/g, " ");
   if (entityType === ENTITY_TYPES.GRANTS) {
     return collapsed;
+  }
+  if (entityType === ENTITY_TYPES.AUTHORS && looksLikeOrcidQuery(collapsed)) {
+    const bare = collapsed.replace(/^https?:\/\/orcid\.org\//i, "").replace(/\/$/, "");
+    return bare.slice(0, -1) + bare.slice(-1).toUpperCase();
   }
   return collapsed.toLowerCase();
 }
@@ -82,12 +103,21 @@ export function resolveCompatibleSource(capabilities, entityType, preferredSourc
   if (preferred && isSourceCompatible(preferred, entityType)) {
     return preferred.id;
   }
+  const defaultSource = capabilities?.default_source;
+  const defaultCapability = sources.find((item) => item.id === defaultSource);
+  if (defaultCapability && isSourceCompatible(defaultCapability, entityType)) {
+    return defaultCapability.id;
+  }
+  const all = sources.find((item) => item.id === SEARCH_SOURCES.ALL);
+  if (all && isSourceCompatible(all, entityType)) {
+    return SEARCH_SOURCES.ALL;
+  }
   const openalex = sources.find((item) => item.id === SEARCH_SOURCES.OPENALEX);
   if (openalex && isSourceCompatible(openalex, entityType)) {
     return SEARCH_SOURCES.OPENALEX;
   }
   const first = sources.find((item) => isSourceCompatible(item, entityType));
-  return first?.id || SEARCH_SOURCES.OPENALEX;
+  return first?.id || SEARCH_SOURCES.ALL;
 }
 
 /**
@@ -124,7 +154,7 @@ export async function fetchSearchCapabilities({ signal } = {}) {
       return FALLBACK_CAPABILITIES;
     }
     return {
-      default_source: data.default_source || SEARCH_SOURCES.OPENALEX,
+      default_source: data.default_source || SEARCH_SOURCES.ALL,
       sources: data.sources,
     };
   } catch {
@@ -140,7 +170,7 @@ export async function fetchSearchCapabilities({ signal } = {}) {
 export async function unifiedSearch({
   query,
   entityType,
-  source = SEARCH_SOURCES.OPENALEX,
+  source = SEARCH_SOURCES.ALL,
   limit = 20,
   cursor,
   institutionId,
@@ -151,24 +181,9 @@ export async function unifiedSearch({
 } = {}) {
   const cleanedQuery = normalizeSearchQuery(query, entityType);
   const minLength = minQueryLengthForEntity(entityType);
-  const sourceId = source || SEARCH_SOURCES.OPENALEX;
+  const sourceId = source || SEARCH_SOURCES.ALL;
 
   if (cleanedQuery.length < minLength) {
-    return {
-      query: cleanedQuery,
-      entity_type: entityType,
-      source: sourceId,
-      results: [],
-      items: [],
-      updates: [],
-      next_cursor: null,
-      has_more: false,
-      search_session_id: null,
-    };
-  }
-
-  // Frontend guard: never send the disabled combined source.
-  if (sourceId === SEARCH_SOURCES.ALL) {
     return {
       query: cleanedQuery,
       entity_type: entityType,
@@ -198,14 +213,14 @@ export async function unifiedSearch({
   }
 
   if (
-    sourceId === SEARCH_SOURCES.OPENALEX &&
+    (sourceId === SEARCH_SOURCES.OPENALEX || sourceId === SEARCH_SOURCES.ALL) &&
     entityType === ENTITY_TYPES.AUTHORS &&
     institutionId
   ) {
     params.institution_id = institutionId;
   }
   if (
-    sourceId === SEARCH_SOURCES.OPENALEX &&
+    (sourceId === SEARCH_SOURCES.OPENALEX || sourceId === SEARCH_SOURCES.ALL) &&
     entityType === ENTITY_TYPES.AUTHORS &&
     topicId
   ) {
@@ -227,10 +242,18 @@ export async function unifiedSearch({
     params.search_session_id = searchSessionId;
   }
 
+  const started = performance.now();
   const response = await apiClient.get("/search", {
     params,
     timeout: 30000,
     signal,
+  });
+  console.info("[search-timing] unified_search_done", {
+    ms: Math.round(performance.now() - started),
+    source: sourceId,
+    entityType,
+    query: cleanedQuery,
+    resultCount: Array.isArray(response.data?.results) ? response.data.results.length : 0,
   });
 
   const data = response.data || {};

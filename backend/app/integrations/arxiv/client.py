@@ -13,6 +13,7 @@ from typing import Any
 import httpx
 
 from app.core.config import get_settings
+from app.integrations.rate_limited_http import provider_get
 from app.integrations.arxiv.parser import (
     aggregate_arxiv_author_names,
     author_name_matches_query,
@@ -72,7 +73,6 @@ class _TtlCache:
 
 
 _page_cache = _TtlCache(ttl_seconds=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
-_request_lock = asyncio.Lock()
 _last_uncached_request_at = 0.0
 
 
@@ -177,47 +177,42 @@ async def _fetch_arxiv_atom(*, search_query: str, start: int, max_results: int) 
         "Accept": "application/atom+xml, application/xml, text/xml, */*",
     }
 
-    async with _request_lock:
-        now = time.monotonic()
-        wait_for = MIN_REQUEST_INTERVAL_SECONDS - (now - _last_uncached_request_at)
-        if wait_for > 0:
-            await asyncio.sleep(wait_for)
+    try:
+        response = await provider_get(
+            "arxiv",
+            settings.arxiv_base_url,
+            params=params,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+            follow_redirects=True,
+            headers=headers,
+        )
+    except httpx.TimeoutException as exc:
+        raise ArxivApiError(
+            "arXiv search is temporarily unavailable. Please try again."
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise ArxivApiError(
+            "arXiv search is temporarily unavailable. Please try again."
+        ) from exc
+    finally:
+        _last_uncached_request_at = time.monotonic()
 
-        try:
-            async with httpx.AsyncClient(
-                timeout=REQUEST_TIMEOUT_SECONDS,
-                follow_redirects=True,
-                headers=headers,
-            ) as client:
-                response = await client.get(settings.arxiv_base_url, params=params)
-        except httpx.TimeoutException as exc:
-            raise ArxivApiError(
-                "arXiv search is temporarily unavailable. Please try again."
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise ArxivApiError(
-                "arXiv search is temporarily unavailable. Please try again."
-            ) from exc
-        finally:
-            _last_uncached_request_at = time.monotonic()
+    if response.status_code in {429, 503}:
+        raise ArxivApiError(
+            "arXiv search is temporarily unavailable. Please try again.",
+            status_code=502,
+        )
+    if response.status_code >= 500:
+        raise ArxivApiError(
+            "arXiv search is temporarily unavailable. Please try again."
+        )
+    if response.status_code >= 400:
+        raise ArxivApiError(
+            "arXiv rejected the search request.",
+            status_code=502,
+        )
 
-        if response.status_code in {429, 503}:
-            # Do not immediately retry 429/503.
-            raise ArxivApiError(
-                "arXiv search is temporarily unavailable. Please try again.",
-                status_code=502,
-            )
-        if response.status_code >= 500:
-            raise ArxivApiError(
-                "arXiv search is temporarily unavailable. Please try again."
-            )
-        if response.status_code >= 400:
-            raise ArxivApiError(
-                "arXiv rejected the search request.",
-                status_code=502,
-            )
-
-        return response.text
+    return response.text
 
 
 async def _get_parsed_page(

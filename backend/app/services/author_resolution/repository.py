@@ -19,6 +19,7 @@ from app.db.models import (
 )
 from app.services.author_resolution.candidate import AuthorCandidate
 from app.services.author_resolution.normalization import normalize_author_name
+from app.services.author_resolution.scoring import expand_work_id_keys, normalize_work_id
 
 
 class AuthorIdentityRepository:
@@ -115,14 +116,18 @@ class AuthorIdentityRepository:
             ).all()
         }
         for work in candidate.works:
-            if work.id in existing_work_ids:
+            stored_id = normalize_work_id(work.id, id_type=work.id_type) or work.id
+            if stored_id in existing_work_ids:
                 continue
+            existing_work_ids.add(stored_id)
             self.session.add(
                 AuthorWork(
                     id=uuid.uuid4(),
                     provider_author_record_id=existing.id,
-                    work_id=work.id,
-                    work_id_type=work.id_type,
+                    work_id=stored_id,
+                    work_id_type=work.id_type or (
+                        "doi" if str(stored_id).startswith("doi:") else None
+                    ),
                     title=work.title,
                     publication_year=work.publication_year,
                 )
@@ -156,7 +161,10 @@ class AuthorIdentityRepository:
         if candidate.orcid:
             clauses.append(ProviderAuthorRecord.orcid == candidate.orcid)
 
-        work_ids = [work.id for work in candidate.works if work.id]
+        work_ids: list[str] = []
+        for work in candidate.works:
+            work_ids.extend(expand_work_id_keys(work.id, id_type=work.id_type))
+        work_ids = list({key for key in work_ids if key})
         if work_ids:
             work_subq = select(AuthorWork.provider_author_record_id).where(
                 AuthorWork.work_id.in_(work_ids)

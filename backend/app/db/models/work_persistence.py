@@ -235,7 +235,12 @@ class WorkGrantMatch(Base):
 
 
 class WorkAuthorship(Base):
-    """Publication-specific authorship with affiliations (not career profile)."""
+    """Authoritative publication-specific authorship identity and affiliations.
+
+    `canonical_author_id` is the source of truth for canonical author-to-work
+    membership. `author_works` is retained as a derived provider-work index for
+    legacy author identity overlap code.
+    """
 
     __tablename__ = "work_authorships"
     __table_args__ = (
@@ -282,3 +287,39 @@ class WorkAuthorship(Base):
     )
 
     canonical_work: Mapped[CanonicalWork] = relationship(back_populates="authorships")
+
+
+class AuthorWorkSyncState(Base):
+    __tablename__ = "author_work_sync_state"
+    __table_args__ = (
+        UniqueConstraint(
+            "canonical_author_id",
+            "provider",
+            name="uq_author_work_sync_state_author_provider",
+        ),
+        Index("ix_author_work_sync_state_author", "canonical_author_id"),
+        Index("ix_author_work_sync_state_provider_status", "provider", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(GUID(), primary_key=True, default=uuid.uuid4)
+    canonical_author_id: Mapped[uuid.UUID] = mapped_column(
+        GUID(),
+        ForeignKey("canonical_authors.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    last_synced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    stored_work_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    provider_work_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(64), nullable=False, default="never")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )

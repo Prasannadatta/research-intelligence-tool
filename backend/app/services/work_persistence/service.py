@@ -139,6 +139,7 @@ class WorkPersistenceService:
         await self.repo.replace_work_authorships(
             canonical_work_id=canonical.id,
             provider=candidate.provider,
+            provider_work_id=candidate.provider_work_id,
             raw_metadata=candidate.raw_metadata,
         )
         return canonical, created

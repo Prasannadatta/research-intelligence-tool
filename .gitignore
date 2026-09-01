@@ -1,5 +1,5 @@
 # Environment / secrets — never commit real credentials
-# .env
+.env
 # **/.env
 # !.env.example
 # !**/.env.example

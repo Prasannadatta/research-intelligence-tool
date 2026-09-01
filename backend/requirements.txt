@@ -1,8 +1,8 @@
+aiosqlite==0.22.1
+alembic==1.18.5
 annotated-doc==0.0.4
 annotated-types==0.7.0
 anyio==4.14.2
-aiosqlite==0.22.1
-alembic==1.18.5
 certifi==2026.6.17
 click==8.4.2
 fastapi==0.139.2
@@ -15,12 +15,12 @@ idna==3.18
 iniconfig==2.3.0
 packaging==26.2
 pluggy==1.6.0
-pydantic==2.13.4
 pydantic-settings==2.14.2
+pydantic==2.13.4
 pydantic_core==2.46.4
 Pygments==2.20.0
-pytest==9.1.1
 pytest-asyncio==1.4.0
+pytest==9.1.1
 python-dotenv==1.2.2
 sgmllib3k==1.0.0
 SQLAlchemy==2.0.51

@@ -6,6 +6,7 @@ from typing import Any
 
 from app.integrations.openalex.client import (
     OpenAlexApiError,
+    _as_optional_int,
     _openalex_get,
     _require_api_key,
     _short_openalex_id,
@@ -218,6 +219,7 @@ async def search_works_by_author_ids(
     meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
     next_cursor = _optional_str(meta.get("next_cursor"))
     has_more = bool(next_cursor) and len(results_list) > 0
+    count = _as_optional_int(meta.get("count"))
 
     return {
         "entity_type": "works",
@@ -229,4 +231,5 @@ async def search_works_by_author_ids(
         "results": normalized,
         "next_cursor": next_cursor,
         "has_more": has_more,
+        "count": count if count is not None and count >= 0 else None,
     }
