@@ -29,7 +29,8 @@ class AnalysisJob(Base):
     request_payload: Mapped[dict[str, Any]] = mapped_column(JSONType, nullable=False)
     result: Mapped[dict[str, Any] | None] = mapped_column(JSONType, nullable=True)
     progress_percent: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    progress_stage: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    progress_stage: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    progress_detail: Mapped[dict[str, Any] | None] = mapped_column(JSONType, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False

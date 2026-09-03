@@ -4,6 +4,7 @@ import {
   Alert,
   Box,
   Button,
+  CircularProgress,
   Paper,
   Snackbar,
   Typography,
@@ -57,6 +58,7 @@ import { getWorkDate, getWorkId } from "./authorPublicationHelpers";
 import PublicationExclusionManager from "../../features/authorAnalysis/components/PublicationExclusionManager";
 import { saveSavedSearch } from "../../features/savedSearches/savedSearchesApi";
 import { analysisPageLayoutSx } from "../../layout/pageLayout";
+import * as publicationStatsRequest from "./publicationStatsRequest";
 
 const PAGE_SIZE = 20;
 
@@ -171,6 +173,13 @@ function AuthorAnalysisPage() {
   );
   const [publicationSort, setPublicationSort] = useState(DEFAULT_PUBLICATION_SORT);
   const [facets, setFacets] = useState(emptyFacets);
+  const [corpusComplete, setCorpusComplete] = useState(false);
+  const [statsLoading, setStatsLoading] = useState(false);
+  const [statsError, setStatsError] = useState(null);
+  const [statsProgress, setStatsProgress] = useState(null);
+  const [corpusTotalCount, setCorpusTotalCount] = useState(null);
+  const [statsRetryToken, setStatsRetryToken] = useState(0);
+  const [statsReadySnackbarOpen, setStatsReadySnackbarOpen] = useState(false);
 
   const appliedFiltersKey = useMemo(
     () => publicationFiltersKey(appliedFilters),
@@ -353,9 +362,12 @@ function AuthorAnalysisPage() {
             .filter(Boolean),
         );
         setItems(cached.items || []);
-        setTimeline(cached.timeline ?? null);
+        setTimeline(null);
         setTimelineError(null);
-        setFacets(cached.facets || emptyFacets());
+        setFacets(emptyFacets());
+        setCorpusComplete(false);
+        setCorpusTotalCount(null);
+        setStatsError(null);
         setProviderTotalCount(asProviderTotalCount(cached.provider_total_count));
         setNextCursor(cached.next_cursor ?? null);
         setHasMore(Boolean(cached.has_more));
@@ -383,6 +395,10 @@ function AuthorAnalysisPage() {
         setItems([]);
         setTimeline(null);
         setProviderTotalCount(null);
+        setFacets(emptyFacets());
+        setCorpusComplete(false);
+        setCorpusTotalCount(null);
+        setStatsError(null);
       }
       setNextCursor(null);
       setHasMore(false);
@@ -414,8 +430,8 @@ function AuthorAnalysisPage() {
 
         publicationsPageCache.set(cacheKey, {
           items: pageItems,
-          timeline: response.timeline ?? null,
-          facets: response.facets || emptyFacets(),
+          timeline: null,
+          facets: emptyFacets(),
           provider_total_count: asProviderTotalCount(response.provider_total_count),
           next_cursor: response.next_cursor,
           has_more: response.has_more,
@@ -424,9 +440,12 @@ function AuthorAnalysisPage() {
         });
 
         setItems(pageItems);
-        setTimeline(response.timeline ?? null);
+        setTimeline(null);
         setTimelineError(null);
-        setFacets(response.facets || emptyFacets());
+        setFacets(emptyFacets());
+        setCorpusComplete(false);
+        setCorpusTotalCount(null);
+        setStatsError(null);
         setProviderTotalCount(asProviderTotalCount(response.provider_total_count));
         setNextCursor(response.next_cursor);
         setHasMore(Boolean(response.has_more));
@@ -616,13 +635,108 @@ function AuthorAnalysisPage() {
     [activeAuthors],
   );
 
+  // Facet option counts come from the complete-corpus stats job, not live provider crawls.
   usePublicationFacetPreview({
-    enabled: hasLoadedOnce && !unsupported && activeAuthors.length > 0,
+    enabled: false,
     requestKey: `${selectionKey}::${recordsKey}`,
     draftFilters,
     fetchFacets: fetchFacetPreview,
     onFacets: setFacets,
   });
+
+  const statsRequestIdRef = useRef(0);
+
+  useEffect(() => {
+    if (!hasLoadedOnce || unsupported || activeAuthors.length === 0) {
+      return undefined;
+    }
+
+    const controller = new AbortController();
+    const requestId = ++statsRequestIdRef.current;
+    setStatsLoading(true);
+    setStatsError(null);
+    setStatsProgress({
+      status: "queued",
+      stage: "Preparing",
+      percent: 0,
+      detail: { phase: "preparing" },
+    });
+    setStatsReadySnackbarOpen(false);
+    setCorpusComplete(false);
+    setTimeline(null);
+    setFacets(emptyFacets());
+    setCorpusTotalCount(null);
+
+    const statsAuthors = activeAuthors.map((author) => ({
+      canonical_author_id: author.canonical_author_id,
+      display_name: author.display_name,
+    }));
+
+    publicationStatsRequest
+      .fetchAuthorPublicationCorpusStats({
+        authors: statsAuthors,
+        filters: appliedFiltersPayload,
+        signal: controller.signal,
+        onProgress: (job) => {
+          if (requestId !== statsRequestIdRef.current) {
+            return;
+          }
+          setStatsProgress({
+            status: job.status || "running",
+            stage: job.progress_stage || job.progressStage || "Preparing",
+            percent: Number(job.progress_percent ?? job.progressPercent ?? 0),
+            detail: job.progress_detail || job.progressDetail || null,
+          });
+        },
+      })
+      .then((result) => {
+        if (requestId !== statsRequestIdRef.current) {
+          return;
+        }
+        setTimeline(result.timeline ?? null);
+        setFacets(result.facets || emptyFacets());
+        setCorpusTotalCount(
+          Number.isFinite(Number(result.total_matching_publications))
+            ? Number(result.total_matching_publications)
+            : null,
+        );
+        setCorpusComplete(Boolean(result.corpus_complete));
+        setStatsError(null);
+        setStatsReadySnackbarOpen(true);
+      })
+      .catch((err) => {
+        if (
+          requestId !== statsRequestIdRef.current ||
+          err?.name === "CanceledError" ||
+          err?.code === "ERR_CANCELED"
+        ) {
+          return;
+        }
+        setCorpusComplete(false);
+        setTimeline(null);
+        setFacets(emptyFacets());
+        setCorpusTotalCount(null);
+        setStatsError(
+          err?.message ||
+            "Complete publication statistics are temporarily unavailable.",
+        );
+      })
+      .finally(() => {
+        if (requestId === statsRequestIdRef.current) {
+          setStatsLoading(false);
+        }
+      });
+
+    return () => {
+      controller.abort();
+    };
+  }, [
+    activeAuthors,
+    appliedFiltersPayload,
+    hasLoadedOnce,
+    statsRetryToken,
+    unsupported,
+  ]);
 
   // Author selection drives the main fetch. Draft filter edits never fetch here.
   useEffect(() => {
@@ -1095,7 +1209,10 @@ function AuthorAnalysisPage() {
             onReset={handleResetFilters}
             onRemoveChip={handleRemoveChip}
             facets={facets}
-            showLoadedSampleHint
+            showLoadedSampleHint={false}
+            corpusComplete={corpusComplete}
+            corpusTotalCount={corpusTotalCount}
+            facetsLoading={statsLoading}
             disabled={unsupported || activeAuthors.length === 0}
             applying={loading && hasLoadedOnce}
           />
@@ -1104,13 +1221,52 @@ function AuthorAnalysisPage() {
         {!unsupported ? (
           <AuthorPublicationTrendChart
             timeline={timeline}
-            loading={loading}
+            loading={statsLoading}
             mode={mode}
-            error={timelineError}
-            pageLocal
+            error={statsError || timelineError}
+            pageLocal={false}
+            corpusComplete={corpusComplete}
+            corpusTotalCount={corpusTotalCount}
             providerTotalCount={providerTotalCount}
+            onRetry={
+              statsError
+                ? () => {
+                    setStatsRetryToken((value) => value + 1);
+                  }
+                : undefined
+            }
           />
         ) : null}
+
+        <Snackbar
+          open={statsLoading && !statsError}
+          anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
+          data-testid="publication-stats-progress-snackbar"
+        >
+          <Alert
+            severity="info"
+            variant="filled"
+            icon={<CircularProgress size={18} color="inherit" />}
+            sx={{ alignItems: "center" }}
+          >
+            {publicationStatsRequest.formatPublicationStatsProgressMessage(statsProgress)}
+          </Alert>
+        </Snackbar>
+        <Snackbar
+          open={statsReadySnackbarOpen && corpusComplete && !statsLoading}
+          autoHideDuration={4000}
+          onClose={() => setStatsReadySnackbarOpen(false)}
+          anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
+          data-testid="publication-stats-ready-snackbar"
+        >
+          <Alert
+            severity="success"
+            variant="filled"
+            onClose={() => setStatsReadySnackbarOpen(false)}
+          >
+            Complete publication statistics ready
+          </Alert>
+        </Snackbar>
 
         {!loading && !error && !unsupported && items.length > 0 ? (
           <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>

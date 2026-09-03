@@ -7,6 +7,7 @@ import AuthorAnalysisPage from "./AuthorAnalysisPage";
 import { clearPublicationsPageCache } from "./authorAnalysisCache";
 import * as analysisApi from "../../api/analysisApi";
 import * as savedSearchesApi from "../../features/savedSearches/savedSearchesApi";
+import * as publicationStatsRequest from "./publicationStatsRequest";
 import { FILTER_DEBOUNCE_MS } from "./authorAnalysisPageLogic";
 
 vi.mock("react-apexcharts", () => ({
@@ -91,6 +92,75 @@ describe("AuthorAnalysisPage", () => {
       unsupported: false,
       unsupported_reason: null,
     });
+    const completedStatsJob = {
+      job_id: "stats-1",
+      status: "completed",
+      progress_stage: "Completed",
+      progress_percent: 100,
+      result: {
+        mode: "common_publications",
+        corpus_complete: true,
+        total_matching_publications: 1037,
+        total_corpus_publications: 1037,
+        timeline: {
+          interval: "year",
+          total_dated_publications: 1037,
+          total_matching_publications: 1037,
+          items: [{ period: "2024", label: "2024", count: 1037 }],
+        },
+        facets: {
+          sources: [{ value: "openalex", label: "OpenAlex", count: 1037 }],
+          institutions: [],
+          venues: [{ value: "nature medicine", label: "Nature Medicine", count: 500 }],
+          grants: [],
+          authors: [],
+        },
+      },
+    };
+    vi.spyOn(analysisApi, "createAuthorPublicationStatsJob").mockResolvedValue(
+      completedStatsJob,
+    );
+    vi.spyOn(analysisApi, "getAuthorPublicationStatsJob").mockResolvedValue(
+      completedStatsJob,
+    );
+    vi.spyOn(publicationStatsRequest, "fetchAuthorPublicationCorpusStats").mockImplementation(
+      async ({ authors, onProgress }) => {
+        const authorCount = (authors || []).length;
+        const result =
+          authorCount === 1
+            ? {
+                mode: "single_author",
+                corpus_complete: true,
+                total_matching_publications: 2,
+                timeline: {
+                  interval: "year",
+                  total_dated_publications: 2,
+                  total_matching_publications: 2,
+                  items: [
+                    { period: "2022", label: "2022", count: 1 },
+                    { period: "2023", label: "2023", count: 2 },
+                  ],
+                },
+                facets: {
+                  sources: [{ value: "openalex", label: "OpenAlex", count: 2 }],
+                  institutions: [],
+                  venues: [],
+                  grants: [],
+                  authors: [],
+                },
+              }
+            : {
+                ...completedStatsJob.result,
+              };
+        onProgress?.({
+          status: "completed",
+          progress_stage: "Completed",
+          progress_percent: 100,
+          result,
+        });
+        return result;
+      },
+    );
     vi.spyOn(savedSearchesApi, "saveSavedSearch").mockResolvedValue({ id: "saved-1" });
   });
 
@@ -250,63 +320,76 @@ describe("AuthorAnalysisPage", () => {
     });
     expect(await screen.findByTestId("author-publication-trend-chart")).toBeInTheDocument();
     expect(
-      screen.getByText("Based on the first 1 loaded publications"),
+      await screen.findByText("Timeline based on all 1,037 publications"),
     ).toBeInTheDocument();
   });
 
   it("refreshes chart when checkbox selection changes", async () => {
-    analysisApi.fetchAuthorPublications
-      .mockResolvedValueOnce({
+    analysisApi.fetchAuthorPublications.mockImplementation(async ({ authors }) => {
+      if ((authors || []).length === 1) {
+        return {
+          mode: "single_author",
+          authors: [AUTHORS[0]],
+          items: [
+            {
+              id: "w2",
+              title: "Solo Paper",
+              analysis_match: { verified: true, method: "x" },
+            },
+          ],
+          next_cursor: null,
+          has_more: false,
+          unsupported: false,
+          unsupported_reason: null,
+        };
+      }
+      return {
         mode: "common_publications",
         authors: AUTHORS,
         items: [{ id: "w1", title: "Paper", analysis_match: { verified: true, method: "x" } }],
-        timeline: {
-          interval: "year",
-          items: [{ period: "2024", label: "2024", count: 1 }],
-        },
         next_cursor: null,
         has_more: false,
         unsupported: false,
         unsupported_reason: null,
-      })
-      .mockResolvedValueOnce({
-        mode: "single_author",
-        authors: [AUTHORS[0]],
-        items: [
-          {
-            id: "w2",
-            title: "Solo Paper",
-            analysis_match: { verified: true, method: "x" },
-          },
-        ],
-        timeline: {
-          interval: "year",
-          total_dated_publications: 2,
-          total_matching_publications: 2,
-          items: [
-            { period: "2022", label: "2022", count: 1 },
-            { period: "2023", label: "2023", count: 2 },
-          ],
-        },
-        next_cursor: null,
-        has_more: false,
-        unsupported: false,
-        unsupported_reason: null,
-      });
+      };
+    });
 
     renderPage();
     await waitFor(() => expect(screen.getByText("Common publications over time")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTestId("apex-chart-mock")).toBeInTheDocument());
 
     fireEvent.click(screen.getByLabelText("Jane Doe"));
     await sleep(FILTER_DEBOUNCE_MS + 50);
 
+    await waitFor(() => expect(screen.getByText("Solo Paper")).toBeInTheDocument());
     await waitFor(() => {
       expect(screen.getByText("Publications over time")).toBeInTheDocument();
     });
-    const categories = JSON.parse(
-      screen.getByTestId("apex-chart-mock").getAttribute("data-categories"),
+    await waitFor(() => {
+      expect(publicationStatsRequest.fetchAuthorPublicationCorpusStats).toHaveBeenCalledWith(
+        expect.objectContaining({
+          authors: [expect.objectContaining({ canonical_author_id: "c1" })],
+        }),
+      );
+    });
+  });
+
+  it("keeps the publication table usable when corpus stats sync fails", async () => {
+    publicationStatsRequest.fetchAuthorPublicationCorpusStats.mockRejectedValue(
+      new Error(
+        "Complete publication statistics are unavailable because coverage sync did not finish.",
+      ),
     );
-    expect(categories).toEqual(["2022", "2023"]);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText("Paper")).toBeInTheDocument());
+    expect(
+      await screen.findByText(
+        /Complete publication statistics are unavailable because coverage sync did not finish/i,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    expect(screen.queryByText(/Based on the first/i)).not.toBeInTheDocument();
   });
 
   it("does not refetch timeline when loading additional table pages", async () => {
@@ -339,13 +422,12 @@ describe("AuthorAnalysisPage", () => {
     renderPage();
     await waitFor(() => expect(analysisApi.fetchAuthorPublications).toHaveBeenCalledTimes(1));
     expect(
-      screen.getByText("Timeline based on 20 of 1,037 publications"),
+      await screen.findByText("Timeline based on all 1,037 publications"),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(
-        "Filter options and counts are from currently loaded publications, not the full corpus.",
-      ),
+      await screen.findByText(/Filter options and counts are from all 1,?037 publications/i),
     ).toBeInTheDocument();
+    expect(publicationStatsRequest.fetchAuthorPublicationCorpusStats).toHaveBeenCalled();
 
     analysisApi.fetchAuthorPublications.mockResolvedValueOnce({
       mode: "common_publications",
@@ -377,7 +459,7 @@ describe("AuthorAnalysisPage", () => {
     );
     expect(categories).toEqual(["2024"]);
     expect(
-      screen.getByText("Timeline based on 20 of 1,037 publications"),
+      screen.getByText("Timeline based on all 1,037 publications"),
     ).toBeInTheDocument();
     expect(screen.queryByText("Timeline based on 8 of 50 publications")).not.toBeInTheDocument();
     expect(await screen.findByText("Second Paper")).toBeInTheDocument();
@@ -572,6 +654,9 @@ describe("AuthorAnalysisPage", () => {
     fireEvent.change(screen.getByLabelText("To year"), { target: { value: "2024" } });
     fireEvent.click(screen.getByRole("button", { name: "Apply filters" }));
     await waitFor(() => expect(analysisApi.fetchAuthorPublications).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Reset" })).not.toBeDisabled(),
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "Reset" }));
     await waitFor(() => expect(analysisApi.fetchAuthorPublications).toHaveBeenCalledTimes(3));

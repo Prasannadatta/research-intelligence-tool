@@ -373,7 +373,8 @@ async def test_repeated_sync_is_idempotent_and_fresh_state_skips_provider_fetch(
 
     assert mock_fetch.await_count == 1
     assert first[0]["fetched_work_count"] == 1
-    assert second[0]["status"] == "fresh"
+    assert second[0]["status"] == "complete"
+    assert second[0]["network_skipped"] is True
     assert work_count == 1
 
 
@@ -431,7 +432,8 @@ async def test_sync_fetches_all_provider_ids_before_marking_provider_fresh(
 
     assert mock_fetch.await_count == 2
     assert first[0]["fetched_work_count"] == 2
-    assert second[0]["status"] == "fresh"
+    assert second[0]["status"] == "complete"
+    assert second[0]["network_skipped"] is True
     assert work_count == 2
 
 
@@ -445,9 +447,11 @@ async def test_stale_sync_refetches_provider(session_factory):
                 canonical_author_id=author.id,
                 provider="openalex",
                 last_synced_at=datetime.now(timezone.utc) - timedelta(days=2),
+                last_successful_synced_at=datetime.now(timezone.utc) - timedelta(days=2),
+                last_attempted_at=datetime.now(timezone.utc) - timedelta(days=2),
                 stored_work_count=0,
                 provider_work_count=None,
-                status="success",
+                status="complete",
             )
         )
         await session.commit()
@@ -541,7 +545,7 @@ async def test_provider_failure_falls_back_to_repaired_stored_coverage(session_f
             )
         ).scalar_one()
 
-    assert stats[0]["status"] == "provider_failed"
+    assert stats[0]["status"] == "partial"
     assert count == 1
 
 def test_pairwise_publications_outside_abc_available_in_insights_after_sync(session_factory):
@@ -657,4 +661,4 @@ async def test_sync_timeout_skips_remaining_author_groups(session_factory):
 
     assert mock_fetch.await_count == 0
     assert len(stats) == 2
-    assert {row["status"] for row in stats} == {"skipped_timeout"}
+    assert {row["status"] for row in stats} == {"partial"}

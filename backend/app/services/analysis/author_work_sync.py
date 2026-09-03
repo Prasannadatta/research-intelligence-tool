@@ -3,6 +3,12 @@
 `work_authorships.canonical_author_id` is the authoritative author-to-work
 relationship. `author_works` is maintained as a derived provider-work index for
 existing author identity overlap code.
+
+Sync completeness statuses:
+- complete: provider crawl finished; all available pages processed
+- partial: some works persisted but crawl did not finish
+- stale: previously complete coverage whose TTL has expired (effective status)
+- failed: sync could not produce reliable coverage
 """
 
 from __future__ import annotations
@@ -11,6 +17,7 @@ import asyncio
 import logging
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -37,8 +44,23 @@ logger = logging.getLogger(__name__)
 
 SYNC_BATCH_SIZE = 40
 
+STATUS_COMPLETE = "complete"
+STATUS_PARTIAL = "partial"
+STATUS_STALE = "stale"
+STATUS_FAILED = "failed"
+STATUS_NEVER = "never"
+
+# Legacy statuses still readable from older rows.
+_LEGACY_COMPLETE = {"success", "fresh", STATUS_COMPLETE}
+_LEGACY_FAILED = {"provider_failed", STATUS_FAILED}
+_LEGACY_PARTIAL = {"timeout", "skipped_timeout", STATUS_PARTIAL}
+
+INCOMPLETE_STATUSES = {STATUS_PARTIAL, STATUS_FAILED, "skipped_timeout", "timeout", "provider_failed"}
+
 _sync_locks: dict[str, asyncio.Lock] = {}
 _sync_locks_guard = asyncio.Lock()
+
+SyncProgressCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -58,6 +80,13 @@ class SyncProviderGroup:
     records: tuple[SyncProviderRecord, ...]
 
 
+@dataclass(frozen=True)
+class FetchResult:
+    rows: list[dict[str, Any]]
+    finished: bool
+    error_message: str | None = None
+
+
 async def _lock_for_key(key: str) -> asyncio.Lock:
     async with _sync_locks_guard:
         lock = _sync_locks.get(key)
@@ -65,6 +94,19 @@ async def _lock_for_key(key: str) -> asyncio.Lock:
             lock = asyncio.Lock()
             _sync_locks[key] = lock
         return lock
+
+
+def normalize_stored_status(status: str | None) -> str:
+    text = str(status or STATUS_NEVER).strip().lower()
+    if text in _LEGACY_COMPLETE:
+        return STATUS_COMPLETE
+    if text in _LEGACY_FAILED:
+        return STATUS_FAILED
+    if text in _LEGACY_PARTIAL:
+        return STATUS_PARTIAL
+    if text == STATUS_STALE:
+        return STATUS_STALE
+    return text or STATUS_NEVER
 
 
 class AuthorWorkSyncService:
@@ -79,6 +121,7 @@ class AuthorWorkSyncService:
         authors: list[dict[str, Any]],
         *,
         timeout_seconds: float | None = None,
+        on_progress: SyncProgressCallback | None = None,
     ) -> list[dict[str, Any]]:
         records = await self._load_selected_provider_records(authors)
         groups = self._group_provider_records(records)
@@ -87,36 +130,126 @@ class AuthorWorkSyncService:
             if timeout_seconds is not None
             else None
         )
+        author_names = {
+            str(group.canonical_author_id): (
+                group.records[0].display_name if group.records else "Selected author"
+            )
+            for group in groups
+        }
+        author_order = list(dict.fromkeys(str(group.canonical_author_id) for group in groups))
+        authors_total = max(len(author_order), 1)
+        completed_authors: set[str] = set()
+
+        async def _emit(**kwargs: Any) -> None:
+            if on_progress is None:
+                return
+            author_id = kwargs.get("canonical_author_id")
+            author_index = 0
+            if author_id and author_id in author_order:
+                author_index = author_order.index(str(author_id)) + 1
+            elif completed_authors:
+                author_index = len(completed_authors)
+            payload = {
+                "phase": kwargs.get("phase") or "syncing",
+                "current_author": kwargs.get("current_author"),
+                "canonical_author_id": author_id,
+                "author_index": author_index,
+                "authors_completed": len(completed_authors),
+                "authors_total": len(author_order),
+                "publications_processed": kwargs.get("publications_processed"),
+                "publications_total": kwargs.get("publications_total"),
+                "provider": kwargs.get("provider"),
+                "sync_status": kwargs.get("sync_status"),
+                "status": kwargs.get("status") or kwargs.get("sync_status"),
+            }
+            await on_progress(payload)
+
+        await _emit(phase="checking", authors_total=authors_total)
+
         stats: list[dict[str, Any]] = []
         for group in groups:
+            author_key = str(group.canonical_author_id)
+            display_name = author_names.get(author_key) or "Selected author"
+            expected_total = next(
+                (record.works_count for record in group.records if record.works_count),
+                None,
+            )
+
             if _deadline_exceeded(deadline):
-                stat = {
-                    "canonical_author_id": str(group.canonical_author_id),
-                    "provider": group.provider,
-                    "stored_work_count_before": 0,
-                    "existing_links_repaired": 0,
-                    "fetched_work_count": 0,
-                    "new_works": 0,
-                    "stored_work_count_after": 0,
-                    "status": "skipped_timeout",
-                    "last_synced_at": None,
-                }
-                logger.info(
-                    "author_work_sync skipped_timeout author=%s provider=%s",
-                    group.canonical_author_id,
-                    group.provider,
+                stat = await self._mark_group_incomplete(
+                    group,
+                    display_name=display_name,
+                    status=STATUS_PARTIAL,
+                    error_message="Sync timed out before this author/provider started.",
+                    stored_work_count=await self._stored_work_count(group.canonical_author_id),
                 )
                 stats.append(stat)
+                completed_authors.add(author_key)
+                await _emit(
+                    phase="syncing",
+                    current_author=display_name,
+                    canonical_author_id=author_key,
+                    provider=group.provider,
+                    sync_status=STATUS_PARTIAL,
+                    status=STATUS_PARTIAL,
+                    publications_total=expected_total,
+                )
                 continue
-            key = "|".join(
-                [
-                    str(group.canonical_author_id),
-                    group.provider,
-                ]
-            )
+
+            key = f"{group.canonical_author_id}|{group.provider}"
             lock = await _lock_for_key(key)
+
+            async def _group_progress(
+                *,
+                publications_processed: int | None = None,
+                publications_total: int | None = None,
+                sync_status: str | None = None,
+                phase: str = "syncing",
+            ) -> None:
+                await _emit(
+                    phase=phase,
+                    current_author=display_name,
+                    canonical_author_id=author_key,
+                    provider=group.provider,
+                    publications_processed=publications_processed,
+                    publications_total=(
+                        publications_total
+                        if publications_total is not None
+                        else expected_total
+                    ),
+                    sync_status=sync_status,
+                    status=sync_status,
+                )
+
             async with lock:
-                stats.append(await self._sync_provider_group(group, deadline=deadline))
+                await _group_progress(
+                    phase="syncing",
+                    publications_processed=0,
+                    sync_status=STATUS_STALE,
+                )
+                stats.append(
+                    await self._sync_provider_group(
+                        group,
+                        deadline=deadline,
+                        display_name=display_name,
+                        on_progress=_group_progress,
+                    )
+                )
+
+            completed_authors.add(author_key)
+            final_stat = stats[-1]
+            await _emit(
+                phase="syncing",
+                current_author=display_name,
+                canonical_author_id=author_key,
+                provider=group.provider,
+                publications_processed=final_stat.get("stored_work_count_after"),
+                publications_total=expected_total
+                or final_stat.get("fetched_work_count")
+                or final_stat.get("stored_work_count_after"),
+                sync_status=final_stat.get("status"),
+                status=final_stat.get("status"),
+            )
         return stats
 
     def _group_provider_records(
@@ -133,9 +266,7 @@ class AuthorWorkSyncService:
             SyncProviderGroup(
                 canonical_author_id=canonical_author_id,
                 provider=provider,
-                records=tuple(
-                    sorted(rows, key=lambda row: row.provider_author_id)
-                ),
+                records=tuple(sorted(rows, key=lambda row: row.provider_author_id)),
             )
             for (canonical_author_id, provider), rows in sorted(
                 grouped.items(), key=lambda item: (str(item[0][0]), item[0][1])
@@ -199,11 +330,32 @@ class AuthorWorkSyncService:
             )
         return records
 
+    def effective_status(self, state: AuthorWorkSyncState | None) -> str:
+        if state is None:
+            return STATUS_NEVER
+        stored = normalize_stored_status(state.status)
+        if stored != STATUS_COMPLETE:
+            return stored
+        if self._complete_within_ttl(state):
+            return STATUS_COMPLETE
+        return STATUS_STALE
+
+    def _complete_within_ttl(self, state: AuthorWorkSyncState) -> bool:
+        synced_at = state.last_successful_synced_at or state.last_synced_at
+        if synced_at is None:
+            return False
+        if synced_at.tzinfo is None:
+            synced_at = synced_at.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - synced_at).total_seconds()
+        return age < self.settings.author_work_sync_ttl_seconds
+
     async def _sync_provider_group(
         self,
         group: SyncProviderGroup,
         *,
         deadline: float | None = None,
+        display_name: str,
+        on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
         started = time.perf_counter()
         before_count = await self._stored_work_count(group.canonical_author_id)
@@ -214,42 +366,79 @@ class AuthorWorkSyncService:
         await self.session.commit()
 
         state = await self._load_state(group)
-        if self._state_is_fresh(state):
-            # Fresh cache reuse: do not rewrite last_synced_at.
+        effective = self.effective_status(state)
+        expected_total = next(
+            (record.works_count for record in group.records if record.works_count),
+            state.provider_work_count if state else None,
+        )
+
+        if effective == STATUS_COMPLETE:
+            # Fresh complete coverage: reuse stored works, no provider HTTP.
             stat = {
                 "canonical_author_id": str(group.canonical_author_id),
                 "provider": group.provider,
+                "display_name": display_name,
                 "stored_work_count_before": before_count,
                 "existing_links_repaired": repaired,
                 "fetched_work_count": 0,
                 "new_works": 0,
                 "stored_work_count_after": after_repair_count,
-                "status": "fresh",
+                "status": STATUS_COMPLETE,
+                "network_skipped": True,
+                "error_message": None,
                 "last_synced_at": (
-                    state.last_synced_at.isoformat()
-                    if state and state.last_synced_at
+                    (state.last_successful_synced_at or state.last_synced_at).isoformat()
+                    if state and (state.last_successful_synced_at or state.last_synced_at)
                     else None
                 ),
             }
             self._log_stats(stat, started)
             return stat
 
+        if on_progress is not None:
+            await on_progress(
+                publications_processed=after_repair_count,
+                publications_total=expected_total,
+                sync_status=effective if effective != STATUS_NEVER else STATUS_STALE,
+                phase="syncing",
+            )
+
+        # Mark attempt / expose stale before network work.
+        if effective == STATUS_STALE and state is not None:
+            await self._upsert_state(
+                group,
+                stored_work_count=after_repair_count,
+                provider_work_count=expected_total,
+                status=STATUS_STALE,
+                error_message=None,
+                mark_attempt=True,
+                mark_success=False,
+            )
+            await self.session.commit()
+
         fetched: list[dict[str, Any]] = []
-        fetch_status = "success"
+        crawl_finished = True
+        error_message: str | None = None
         new_works = 0
+        fetch_failed = False
+
         for record in group.records:
             if _deadline_exceeded(deadline):
-                fetch_status = "timeout"
-                logger.info(
-                    "author_work_sync fetch_timeout author=%s provider=%s",
-                    group.canonical_author_id,
-                    group.provider,
-                )
+                crawl_finished = False
+                error_message = "Sync timed out while fetching provider publications."
                 break
             try:
-                record_rows = await self._fetch_provider_works(record, deadline=deadline)
+                result = await self._fetch_provider_works(
+                    record,
+                    deadline=deadline,
+                    on_page=on_progress,
+                    publications_total=expected_total,
+                    base_processed=len(fetched),
+                )
             except Exception as exc:
-                fetch_status = "provider_failed"
+                fetch_failed = True
+                crawl_finished = False
+                error_message = str(exc) or "Provider request failed."
                 logger.warning(
                     "author_work_sync provider_failed author=%s provider=%s "
                     "provider_author_id=%s error=%s",
@@ -259,41 +448,63 @@ class AuthorWorkSyncService:
                     exc,
                 )
                 continue
-            if _deadline_exceeded(deadline) and fetch_status == "success":
-                fetch_status = "timeout"
-                logger.info(
-                    "author_work_sync fetch_timeout author=%s provider=%s",
-                    group.canonical_author_id,
-                    group.provider,
+
+            if not result.finished:
+                crawl_finished = False
+                error_message = result.error_message or error_message
+            if result.error_message and not error_message:
+                error_message = result.error_message
+            fetched.extend(result.rows)
+            if result.rows:
+                new_works += await self._persist_fetched_works(
+                    record,
+                    result.rows,
+                    on_progress=on_progress,
+                    publications_total=expected_total,
+                    base_processed=max(0, len(fetched) - len(result.rows)),
                 )
-            fetched.extend(record_rows)
-            if record_rows:
-                new_works += await self._persist_fetched_works(record, record_rows)
                 repaired += await self._repair_existing_links(record)
 
         after_count = await self._stored_work_count(group.canonical_author_id)
-        status = "success" if fetch_status == "success" else fetch_status
+        if fetch_failed and not fetched and after_count == before_count:
+            status = STATUS_FAILED
+            if not error_message:
+                error_message = "Provider sync failed."
+        elif crawl_finished and not fetch_failed:
+            status = STATUS_COMPLETE
+            error_message = None
+        elif after_count > 0 or fetched:
+            status = STATUS_PARTIAL
+            if not error_message:
+                error_message = "Provider crawl did not finish; coverage is partial."
+        else:
+            status = STATUS_FAILED
+            if not error_message:
+                error_message = "Provider crawl did not finish and no works were stored."
+
         await self._upsert_state(
             group,
             stored_work_count=after_count,
-            provider_work_count=sum(
-                record.works_count or 0 for record in group.records
-            )
-            or len(fetched)
-            or None,
+            provider_work_count=expected_total or len(fetched) or None,
             status=status,
+            error_message=error_message,
+            mark_attempt=True,
+            mark_success=status == STATUS_COMPLETE,
         )
         await self.session.commit()
 
         stat = {
             "canonical_author_id": str(group.canonical_author_id),
             "provider": group.provider,
+            "display_name": display_name,
             "stored_work_count_before": before_count,
             "existing_links_repaired": repaired,
             "fetched_work_count": len(fetched),
             "new_works": new_works,
             "stored_work_count_after": after_count,
             "status": status,
+            "network_skipped": False,
+            "error_message": error_message,
             "last_synced_at": datetime.now(timezone.utc).isoformat(),
         }
         if after_count == 0:
@@ -305,6 +516,40 @@ class AuthorWorkSyncService:
             )
         self._log_stats(stat, started)
         return stat
+
+    async def _mark_group_incomplete(
+        self,
+        group: SyncProviderGroup,
+        *,
+        display_name: str,
+        status: str,
+        error_message: str,
+        stored_work_count: int,
+    ) -> dict[str, Any]:
+        await self._upsert_state(
+            group,
+            stored_work_count=stored_work_count,
+            provider_work_count=None,
+            status=status,
+            error_message=error_message,
+            mark_attempt=True,
+            mark_success=False,
+        )
+        await self.session.commit()
+        return {
+            "canonical_author_id": str(group.canonical_author_id),
+            "provider": group.provider,
+            "display_name": display_name,
+            "stored_work_count_before": stored_work_count,
+            "existing_links_repaired": 0,
+            "fetched_work_count": 0,
+            "new_works": 0,
+            "stored_work_count_after": stored_work_count,
+            "status": status,
+            "network_skipped": True,
+            "error_message": error_message,
+            "last_synced_at": None,
+        }
 
     async def _repair_existing_links(self, record: SyncProviderRecord) -> int:
         provider_author_ids = {record.provider_author_id}
@@ -346,28 +591,50 @@ class AuthorWorkSyncService:
         record: SyncProviderRecord,
         *,
         deadline: float | None = None,
-    ) -> list[dict[str, Any]]:
+        on_page: Callable[..., Awaitable[None]] | None = None,
+        publications_total: int | None = None,
+        base_processed: int = 0,
+    ) -> FetchResult:
         if record.provider == "openalex":
             if not self.settings.openalex_configured:
                 raise OpenAlexApiError("OpenAlex is not configured.", status_code=503)
-            return await self._fetch_openalex_works(record, deadline=deadline)
+            return await self._fetch_openalex_works(
+                record,
+                deadline=deadline,
+                on_page=on_page,
+                publications_total=publications_total,
+                base_processed=base_processed,
+            )
         if record.provider == "arxiv":
             if not self.settings.arxiv_configured:
                 raise ArxivApiError("arXiv is not configured.", status_code=503)
-            return await self._fetch_arxiv_works(record, deadline=deadline)
-        return []
+            return await self._fetch_arxiv_works(
+                record,
+                deadline=deadline,
+                on_page=on_page,
+                publications_total=publications_total,
+                base_processed=base_processed,
+            )
+        return FetchResult(rows=[], finished=True)
 
     async def _fetch_openalex_works(
         self,
         record: SyncProviderRecord,
         *,
         deadline: float | None = None,
-    ) -> list[dict[str, Any]]:
+        on_page: Callable[..., Awaitable[None]] | None = None,
+        publications_total: int | None = None,
+        base_processed: int = 0,
+    ) -> FetchResult:
         cursor: str | None = "*"
         rows: list[dict[str, Any]] = []
         seen_work_ids: set[str] = set()
+        finished = True
+        error_message: str | None = None
         while cursor is not None:
             if _deadline_exceeded(deadline):
+                finished = False
+                error_message = "Sync timed out while fetching OpenAlex publications."
                 break
             page = await search_works_by_author_ids(
                 author_id_groups=[[record.provider_author_id]],
@@ -383,23 +650,37 @@ class AuthorWorkSyncService:
                 if work_id:
                     seen_work_ids.add(work_id)
                 rows.append(row)
+            if on_page is not None:
+                await on_page(
+                    publications_processed=base_processed + len(rows),
+                    publications_total=publications_total or record.works_count,
+                    sync_status=STATUS_PARTIAL,
+                    phase="syncing",
+                )
             if page.get("has_more") and page.get("next_cursor"):
                 cursor = str(page.get("next_cursor"))
             else:
                 cursor = None
-        return rows
+        return FetchResult(rows=rows, finished=finished, error_message=error_message)
 
     async def _fetch_arxiv_works(
         self,
         record: SyncProviderRecord,
         *,
         deadline: float | None = None,
-    ) -> list[dict[str, Any]]:
+        on_page: Callable[..., Awaitable[None]] | None = None,
+        publications_total: int | None = None,
+        base_processed: int = 0,
+    ) -> FetchResult:
         cursor: str | None = None
         rows: list[dict[str, Any]] = []
         seen_work_ids: set[str] = set()
+        finished = True
+        error_message: str | None = None
         while True:
             if _deadline_exceeded(deadline):
+                finished = False
+                error_message = "Sync timed out while fetching arXiv publications."
                 break
             page = await search_arxiv_publications_by_authors(
                 author_names=[record.display_name],
@@ -415,16 +696,27 @@ class AuthorWorkSyncService:
                 if work_id:
                     seen_work_ids.add(work_id)
                 rows.append(row)
+            if on_page is not None:
+                await on_page(
+                    publications_processed=base_processed + len(rows),
+                    publications_total=publications_total or record.works_count,
+                    sync_status=STATUS_PARTIAL,
+                    phase="syncing",
+                )
             if page.get("has_more") and page.get("next_cursor"):
                 cursor = str(page.get("next_cursor"))
             else:
                 break
-        return rows
+        return FetchResult(rows=rows, finished=finished, error_message=error_message)
 
     async def _persist_fetched_works(
         self,
         record: SyncProviderRecord,
         rows: list[dict[str, Any]],
+        *,
+        on_progress: Callable[..., Awaitable[None]] | None = None,
+        publications_total: int | None = None,
+        base_processed: int = 0,
     ) -> int:
         new_works = 0
         for start in range(0, len(rows), SYNC_BATCH_SIZE):
@@ -456,6 +748,13 @@ class AuthorWorkSyncService:
                     publication_year=candidate.publication_year,
                 )
             await self.session.commit()
+            if on_progress is not None:
+                await on_progress(
+                    publications_processed=base_processed + start + len(batch),
+                    publications_total=publications_total or record.works_count,
+                    sync_status=STATUS_PARTIAL,
+                    phase="syncing",
+                )
         return new_works
 
     async def _has_author_authorship_link(
@@ -492,15 +791,6 @@ class AuthorWorkSyncService:
             )
         ).scalar_one_or_none()
 
-    def _state_is_fresh(self, state: AuthorWorkSyncState | None) -> bool:
-        if state is None or state.status != "success" or state.last_synced_at is None:
-            return False
-        synced_at = state.last_synced_at
-        if synced_at.tzinfo is None:
-            synced_at = synced_at.replace(tzinfo=timezone.utc)
-        age = (datetime.now(timezone.utc) - synced_at).total_seconds()
-        return age < self.settings.author_work_sync_ttl_seconds
-
     async def _upsert_state(
         self,
         group: SyncProviderGroup,
@@ -508,6 +798,9 @@ class AuthorWorkSyncService:
         stored_work_count: int,
         provider_work_count: int | None,
         status: str,
+        error_message: str | None,
+        mark_attempt: bool,
+        mark_success: bool,
     ) -> None:
         state = await self._load_state(group)
         now = datetime.now(timezone.utc)
@@ -516,17 +809,28 @@ class AuthorWorkSyncService:
                 id=uuid.uuid4(),
                 canonical_author_id=group.canonical_author_id,
                 provider=group.provider,
-                last_synced_at=now,
+                last_synced_at=now if mark_success else None,
+                last_successful_synced_at=now if mark_success else None,
+                last_attempted_at=now if mark_attempt else None,
                 stored_work_count=stored_work_count,
                 provider_work_count=provider_work_count,
                 status=status,
+                error_message=error_message,
             )
             self.session.add(state)
         else:
-            state.last_synced_at = now
+            if mark_attempt:
+                state.last_attempted_at = now
+            if mark_success:
+                state.last_synced_at = now
+                state.last_successful_synced_at = now
+            elif status in {STATUS_PARTIAL, STATUS_FAILED, STATUS_STALE}:
+                # Keep last_successful_synced_at; refresh last_synced_at only on success.
+                pass
             state.stored_work_count = stored_work_count
             state.provider_work_count = provider_work_count
             state.status = status
+            state.error_message = error_message
         await self.session.flush()
 
     async def _stored_work_count(self, canonical_author_id: uuid.UUID) -> int:

@@ -714,7 +714,7 @@ class DataUpdaterService:
         changed = any(
             stat.get("new_works", 0) > 0
             or stat.get("existing_links_repaired", 0) > 0
-            or stat.get("status") not in {"fresh", "success"}
+            or stat.get("status") not in {"complete", "fresh", "success"}
             for stat in before_stats
         )
         return ("updated" if changed else "unchanged", "Author publication coverage synchronized.")

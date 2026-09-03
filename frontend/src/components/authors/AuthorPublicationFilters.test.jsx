@@ -192,6 +192,15 @@ describe("AuthorPublicationFilters checkbox multi-select", () => {
     ).toBeInTheDocument();
   });
 
+  it("explains that filter options are from the complete corpus when ready", () => {
+    renderFilters({ corpusComplete: true, corpusTotalCount: 1037 });
+    expect(
+      screen.getByText(
+        "Filter options and counts are from all 1,037 publications.",
+      ),
+    ).toBeInTheDocument();
+  });
+
   it("does not show the loaded-sample hint by default", () => {
     renderFilters();
     expect(

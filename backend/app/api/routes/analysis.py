@@ -19,6 +19,7 @@ from app.schemas.analysis import (
     AuthorInsightsRequest,
     AuthorInsightsResponse,
     AuthorPublicationFacetSearchRequest,
+    AuthorPublicationStatsJobResponse,
     AuthorPublicationsExportRequest,
     AuthorPublicationsRequest,
     AuthorPublicationsResponse,
@@ -35,6 +36,11 @@ from app.services.analysis.insights_jobs import (
     InsightsJobService,
     enqueue_insights_job,
     serialize_analysis_job,
+)
+from app.services.analysis.publication_stats_jobs import (
+    PublicationStatsJobService,
+    enqueue_publication_stats_job,
+    serialize_publication_stats_job,
 )
 from app.services.analysis.author_publications import (
     build_author_publication_facets,
@@ -147,6 +153,38 @@ async def author_publication_facets(
         round((time.perf_counter() - started) * 1000, 1),
     )
     return PublicationFacets.model_validate(result)
+
+
+@router.post(
+    "/authors/publications/stats/jobs",
+    response_model=AuthorPublicationStatsJobResponse,
+)
+async def create_author_publication_stats_job(
+    body: AuthorInsightsRequest,
+    session: AsyncSession = Depends(get_db_session),
+) -> AuthorPublicationStatsJobResponse:
+    payload = {
+        "authors": [author.model_dump() for author in body.authors],
+        "filters": body.filters.model_dump() if body.filters else None,
+    }
+    job = await enqueue_publication_stats_job(session, payload)
+    return AuthorPublicationStatsJobResponse.model_validate(job)
+
+
+@router.get(
+    "/authors/publications/stats/jobs/{job_id}",
+    response_model=AuthorPublicationStatsJobResponse,
+)
+async def get_author_publication_stats_job(
+    job_id: uuid.UUID,
+    session: AsyncSession = Depends(get_db_session),
+) -> AuthorPublicationStatsJobResponse:
+    job = await PublicationStatsJobService(session).get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Publication statistics job not found.")
+    return AuthorPublicationStatsJobResponse.model_validate(
+        serialize_publication_stats_job(job)
+    )
 
 
 @router.post(

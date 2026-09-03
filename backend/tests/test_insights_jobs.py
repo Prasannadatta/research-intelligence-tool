@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import pytest
@@ -14,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.pool import StaticPool
 
 from app.db.base import Base
+from app.db.models import AuthorWorkSyncState
 from app.db.session import get_db_session
 from app.main import app
 from app.services.analysis import insights_jobs
@@ -64,6 +66,23 @@ def _hold_scheduler(monkeypatch):
     return scheduled
 
 
+async def _mark_complete(session: AsyncSession, author_id: uuid.UUID, *, stored: int = 1) -> None:
+    now = datetime.now(timezone.utc)
+    session.add(
+        AuthorWorkSyncState(
+            id=uuid.uuid4(),
+            canonical_author_id=author_id,
+            provider="openalex",
+            last_synced_at=now,
+            last_successful_synced_at=now,
+            last_attempted_at=now,
+            stored_work_count=stored,
+            provider_work_count=stored,
+            status="complete",
+        )
+    )
+
+
 @pytest.mark.asyncio
 async def test_insights_job_post_returns_quickly_and_completes(session_factory, monkeypatch):
     scheduled = _hold_scheduler(monkeypatch)
@@ -78,6 +97,7 @@ async def test_insights_job_post_returns_quickly_and_completes(session_factory, 
             provider_work_id="JW1",
             selected_authors=[author],
         )
+        await _mark_complete(session, author.id)
         await session.commit()
 
     started = time.perf_counter()
@@ -145,6 +165,7 @@ async def test_insights_job_unexpected_error_does_not_hang(session_factory, monk
 
     async with session_factory() as session:
         author = await _seed_author(session, name="Boom Author", openalex_id="BA1")
+        await _mark_complete(session, author.id, stored=0)
         await session.commit()
 
     async def boom(*_args, **_kwargs):
@@ -173,6 +194,9 @@ async def test_fifty_author_insights_job_completes(session_factory, monkeypatch)
 
     async with session_factory() as session:
         authors = await _seed_scalable_author_set(session, 50)
+        for author in authors:
+            await _mark_complete(session, author.id, stored=1)
+        await session.commit()
 
     created = client.post(
         "/api/analysis/authors/insights/jobs",

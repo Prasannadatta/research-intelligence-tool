@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, fireEvent } from "@testing-library/react";
 import { ThemeProvider, createTheme } from "@mui/material/styles";
 
 import AuthorPublicationTrendChart from "./AuthorPublicationTrendChart";
@@ -60,14 +60,40 @@ describe("AuthorPublicationTrendChart", () => {
 
     expect(screen.getByText("Publications over time")).toBeInTheDocument();
     expect(
-      screen.getByText("3 of 3 publications have usable date metadata"),
-    ).toBeInTheDocument();
+      screen.queryByText("3 of 3 publications have usable date metadata"),
+    ).not.toBeInTheDocument();
     const chart = screen.getByTestId("author-publication-trend-chart");
     expect(chart).toHaveAttribute("data-chart-interval", "month");
     const categories = JSON.parse(
       screen.getByTestId("apex-chart-mock").getAttribute("data-categories"),
     );
     expect(categories).toEqual(["Jan 2024", "Feb 2024", "Mar 2024"]);
+  });
+
+  it("describes a complete corpus timeline", () => {
+    renderChart({
+      corpusComplete: true,
+      corpusTotalCount: 1037,
+      timeline: {
+        interval: "year",
+        total_dated_publications: 1000,
+        total_matching_publications: 1037,
+        items: [{ period: "2021", label: "2021", count: 100 }],
+      },
+    });
+    expect(
+      screen.getByText("Timeline based on all 1,037 publications"),
+    ).toBeInTheDocument();
+  });
+
+  it("shows retry when stats sync fails", () => {
+    const onRetry = vi.fn();
+    renderChart({
+      error: "Unable to build complete publication statistics.",
+      onRetry,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(onRetry).toHaveBeenCalledTimes(1);
   });
 
   it("uses common-publications title for multiple authors", () => {

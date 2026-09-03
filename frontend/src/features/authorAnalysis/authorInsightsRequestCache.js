@@ -36,6 +36,7 @@ function delay(ms, signal) {
 }
 
 function jobProgressSnapshot(job = {}) {
+  const detail = job.progress_detail || job.progressDetail || null;
   return {
     jobId: job.job_id || job.jobId || null,
     status: job.status || "queued",
@@ -45,10 +46,35 @@ function jobProgressSnapshot(job = {}) {
       : Number.isFinite(Number(job.progressPercent))
         ? Math.round(Number(job.progressPercent))
         : 0,
+    detail,
   };
 }
 
 export function formatInsightsJobProgressMessage(progress) {
+  const detail = progress?.detail || {};
+  const phase = String(detail.phase || "").toLowerCase();
+  const authorName = String(detail.author_name || detail.authorName || "").trim();
+  const processed = detail.publications_processed ?? detail.publicationsProcessed;
+  const total = detail.publications_total ?? detail.publicationsTotal;
+
+  if (phase === "checking") {
+    return "Checking publication coverage…";
+  }
+
+  if (authorName && processed != null && total != null) {
+    const processedLabel = Number(processed).toLocaleString();
+    const totalLabel = Number(total).toLocaleString();
+    return `Syncing ${authorName} — ${processedLabel} / ${totalLabel} publications`;
+  }
+
+  if (authorName && processed != null) {
+    return `Syncing ${authorName} — ${Number(processed).toLocaleString()} publications`;
+  }
+
+  if (authorName && String(progress?.stage || "").toLowerCase().includes("sync")) {
+    return `Syncing ${authorName}…`;
+  }
+
   const stage = String(progress?.stage || "Preparing")
     .replace(/[.…]+\s*$/, "")
     .trim() || "Preparing";

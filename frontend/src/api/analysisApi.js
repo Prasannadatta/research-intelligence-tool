@@ -221,6 +221,33 @@ export async function getAuthorInsightsJob(jobId, { signal } = {}) {
 }
 
 /**
+ * POST /api/analysis/authors/publications/stats/jobs
+ */
+export async function createAuthorPublicationStatsJob({
+  authors,
+  filters,
+  signal,
+} = {}) {
+  const response = await apiClient.post(
+    "/analysis/authors/publications/stats/jobs",
+    buildAuthorInsightsPayload({ authors, filters }),
+    { signal },
+  );
+  return response.data || {};
+}
+
+/**
+ * GET /api/analysis/authors/publications/stats/jobs/{jobId}
+ */
+export async function getAuthorPublicationStatsJob(jobId, { signal } = {}) {
+  const response = await apiClient.get(
+    `/analysis/authors/publications/stats/jobs/${jobId}`,
+    { signal },
+  );
+  return response.data || {};
+}
+
+/**
  * POST /api/analysis/authors/insights (legacy blocking endpoint)
  */
 export async function fetchAuthorInsights({ authors, filters, excludedWorkIds, signal } = {}) {

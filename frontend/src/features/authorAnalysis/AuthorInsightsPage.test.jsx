@@ -665,14 +665,22 @@ describe("AuthorInsightsPage", () => {
     );
   });
 
-  it("polls the insights job until completed and shows stage progress", async () => {
+    it("polls the insights job until completed and shows stage progress", async () => {
     analysisApi.createAuthorInsightsJob.mockResolvedValue(queuedInsightsJob());
     analysisApi.getAuthorInsightsJob
       .mockResolvedValueOnce({
         job_id: "job-1",
         status: "running",
-        progress_stage: "Loading publications",
+        progress_stage: "Syncing publications for Martin Head-Gordon — 420 / 1,037",
         progress_percent: 25,
+        progress_detail: {
+          phase: "syncing",
+          author_name: "Martin Head-Gordon",
+          publications_processed: 420,
+          publications_total: 1037,
+          provider: "openalex",
+          sync_status: "partial",
+        },
         result: null,
         error_message: null,
       })
@@ -682,7 +690,7 @@ describe("AuthorInsightsPage", () => {
 
     await waitFor(() => {
       expect(screen.getByTestId("insights-job-progress-snackbar")).toHaveTextContent(
-        "Loading publications… 25%",
+        "Syncing Martin Head-Gordon — 420 / 1,037 publications",
       );
     });
     await waitFor(

@@ -35,6 +35,14 @@ const YEAR_FIELD_SX = {
 
 const MAX_VISIBLE_TAGS = 1;
 
+export function formatCompleteCorpusFilterCaption(totalCount) {
+  const total = Number(totalCount);
+  if (!Number.isFinite(total) || total < 0) {
+    return "Filter options and counts are from all matching publications.";
+  }
+  return `Filter options and counts are from all ${total.toLocaleString("en-US")} publications.`;
+}
+
 const FILTER_WIDTHS = {
   source: { xs: "100%", sm: 232 },
   institution: { xs: "100%", sm: 340 },
@@ -356,9 +364,17 @@ function AuthorPublicationFilters({
   secondarySearchFn,
   lookupContext,
   showLoadedSampleHint = false,
+  corpusComplete = false,
+  corpusTotalCount = null,
+  facetsLoading = false,
 }) {
   const [expanded, setExpanded] = useState(false);
   const isGrantMode = filterMode === "grant";
+  const completeCorpusHint =
+    corpusComplete && !isGrantMode
+      ? formatCompleteCorpusFilterCaption(corpusTotalCount)
+      : null;
+  const facetControlsDisabled = disabled || facetsLoading;
 
   const resolvedLookupContext = useMemo(() => {
     if (lookupContext != null) {
@@ -568,7 +584,16 @@ function AuthorPublicationFilters({
           {expanded ? "Hide filters" : "Show filters"}
         </Button>
       </Stack>
-      {showLoadedSampleHint && !isGrantMode ? (
+      {completeCorpusHint ? (
+        <Typography
+          variant="caption"
+          color="text.secondary"
+          sx={{ display: "block", mb: expanded ? 1 : 0 }}
+          data-testid="publication-filter-corpus-hint"
+        >
+          {completeCorpusHint}
+        </Typography>
+      ) : showLoadedSampleHint && !isGrantMode ? (
         <Typography
           variant="caption"
           color="text.secondary"
@@ -647,7 +672,8 @@ function AuthorPublicationFilters({
             placeholder="Select sources"
             options={sourceOptionsWithSelected}
             value={selectedSources}
-            disabled={disabled || sourceOptions.length === 0}
+            disabled={facetControlsDisabled || sourceOptions.length === 0}
+            loading={facetsLoading}
             getOptionLabel={(option) => option?.label || ""}
             isOptionEqualToValue={(option, selected) => option?.value === selected?.value}
             getTagLabel={(option) => option?.label || option?.value || ""}
@@ -664,7 +690,8 @@ function AuthorPublicationFilters({
             placeholder="Select institutions"
             options={institutionOptions}
             value={selectedInstitutions}
-            disabled={disabled}
+            disabled={facetControlsDisabled}
+            loading={facetsLoading}
             getOptionLabel={(option) => option?.label || ""}
             isOptionEqualToValue={(option, selected) => option?.value === selected?.value}
             getTagLabel={(option) => option?.label || option?.value || ""}
@@ -686,8 +713,8 @@ function AuthorPublicationFilters({
             placeholder="Search venues"
             options={venueOptions}
             value={draftFilters.venues}
-            disabled={disabled}
-            loading={venueLookup.loading}
+            disabled={facetControlsDisabled}
+            loading={facetsLoading || venueLookup.loading}
             inputValue={venueLookup.inputValue}
             onInputChange={handleLookupInputChange(venueLookup.setInputValue)}
             getOptionLabel={(option) => option?.label || ""}
@@ -705,8 +732,8 @@ function AuthorPublicationFilters({
               placeholder="Search authors"
               options={authorOptions}
               value={draftFilters.authors || []}
-              disabled={disabled}
-              loading={secondaryLookup.loading}
+              disabled={facetControlsDisabled}
+              loading={facetsLoading || secondaryLookup.loading}
               inputValue={secondaryLookup.inputValue}
               onInputChange={handleLookupInputChange(secondaryLookup.setInputValue)}
               getOptionLabel={(option) => option?.label || ""}
@@ -723,8 +750,8 @@ function AuthorPublicationFilters({
               placeholder="Search grants"
               options={grantOptions}
               value={draftFilters.grants}
-              disabled={disabled}
-              loading={secondaryLookup.loading}
+              disabled={facetControlsDisabled}
+              loading={facetsLoading || secondaryLookup.loading}
               inputValue={secondaryLookup.inputValue}
               onInputChange={handleLookupInputChange(secondaryLookup.setInputValue)}
               getOptionLabel={(option) => option?.grant_number || ""}

@@ -500,7 +500,7 @@ class DataUpdaterRepository:
                     or_(
                         AuthorWorkSyncState.last_synced_at.is_(None),
                         AuthorWorkSyncState.last_synced_at < stale_cutoff,
-                        AuthorWorkSyncState.status != "success",
+                        AuthorWorkSyncState.status.notin_(("complete", "success")),
                     )
                 )
             return stmt

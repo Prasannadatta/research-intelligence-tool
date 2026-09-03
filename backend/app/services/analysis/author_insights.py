@@ -284,8 +284,6 @@ class AuthorInsightsService:
         selected_authors = await self._resolve_selected_authors(authors)
         selected_ids = [author.canonical_author_id for author in selected_authors]
 
-        await _progress("Loading publications", 20)
-
         load_started = time.perf_counter()
         work_membership = await self._load_work_membership(selected_ids)
         stored_works = await self._load_stored_work_insights(set(work_membership.keys()))

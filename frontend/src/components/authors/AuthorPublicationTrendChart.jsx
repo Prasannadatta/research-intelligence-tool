@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import Chart from "react-apexcharts";
-import { Alert, Box, Paper, Skeleton, Typography, useTheme } from "@mui/material";
+import { Alert, Box, Button, Paper, Skeleton, Typography, useTheme } from "@mui/material";
 import { getAnalysisPalette } from "../../theme/analysisPalette";
 
 const CHART_HEIGHT = 300;
@@ -27,6 +27,14 @@ export function formatPageLocalTimelineCaption(sampleCount, providerTotalCount) 
   return `Timeline based on ${sampleLabel} of ${total.toLocaleString("en-US")} publications`;
 }
 
+export function formatCompleteCorpusTimelineCaption(totalCount) {
+  const total = Number(totalCount);
+  if (!Number.isFinite(total) || total < 0) {
+    return "Timeline based on all matching publications";
+  }
+  return `Timeline based on all ${total.toLocaleString("en-US")} publications`;
+}
+
 function AuthorPublicationTrendChart({
   timeline,
   loading,
@@ -35,6 +43,9 @@ function AuthorPublicationTrendChart({
   title,
   pageLocal = false,
   providerTotalCount = null,
+  corpusComplete = false,
+  corpusTotalCount = null,
+  onRetry,
 }) {
   const theme = useTheme();
 
@@ -124,19 +135,28 @@ function AuthorPublicationTrendChart({
   const hasTimelineData = Array.isArray(timeline?.items) && timeline.items.length > 0;
   const totalDated = timeline?.total_dated_publications;
   const totalMatching = timeline?.total_matching_publications;
+  const completeCaption =
+    corpusComplete && hasTimelineData
+      ? formatCompleteCorpusTimelineCaption(
+          corpusTotalCount ?? totalMatching ?? providerTotalCount,
+        )
+      : null;
   const pageLocalCaption =
-    pageLocal && hasTimelineData
+    !corpusComplete &&
+    pageLocal &&
+    hasTimelineData
       ? formatPageLocalTimelineCaption(totalMatching, providerTotalCount)
       : null;
   const dateCaption =
-    !pageLocal &&
+    corpusComplete &&
     hasTimelineData &&
     typeof totalDated === "number" &&
     typeof totalMatching === "number" &&
-    totalMatching > 0
+    totalMatching > 0 &&
+    totalDated !== totalMatching
       ? `${totalDated} of ${totalMatching} publication${totalMatching === 1 ? "" : "s"} have usable date metadata`
       : null;
-  const coverageCaption = pageLocalCaption || dateCaption;
+  const coverageCaption = completeCaption || pageLocalCaption || dateCaption;
 
   return (
     <Paper
@@ -166,7 +186,17 @@ function AuthorPublicationTrendChart({
           </Typography>
         ) : null}
         {error ? (
-          <Alert severity="error" sx={{ mt: 1.5, mb: 0 }}>
+          <Alert
+            severity="error"
+            sx={{ mt: 1.5, mb: 0 }}
+            action={
+              onRetry ? (
+                <Button color="inherit" size="small" onClick={onRetry}>
+                  Retry
+                </Button>
+              ) : null
+            }
+          >
             {error}
           </Alert>
         ) : null}

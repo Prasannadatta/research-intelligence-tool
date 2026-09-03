@@ -423,6 +423,32 @@ class AuthorInsightsJobResponse(BaseModel):
     result: AuthorInsightsResponse | None = None
     progress_percent: int = 0
     progress_stage: str | None = None
+    progress_detail: dict[str, Any] | None = None
+    error_message: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+class AuthorPublicationCorpusStats(BaseModel):
+    mode: Literal["single_author", "common_publications"]
+    authors: list[AuthorInsightsAuthor] = Field(default_factory=list)
+    timeline: PublicationTimeline | None = None
+    facets: PublicationFacets = Field(default_factory=PublicationFacets)
+    total_matching_publications: int = 0
+    total_corpus_publications: int = 0
+    corpus_complete: bool = True
+
+
+class AuthorPublicationStatsJobResponse(BaseModel):
+    job_id: str
+    status: Literal["queued", "running", "completed", "failed"]
+    request_payload: dict[str, Any] | None = None
+    result: AuthorPublicationCorpusStats | None = None
+    progress_percent: int = 0
+    progress_stage: str | None = None
+    progress_detail: dict[str, Any] | None = None
     error_message: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
