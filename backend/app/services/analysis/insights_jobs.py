@@ -20,6 +20,7 @@ from app.services.analysis.author_work_sync import (
     STATUS_FAILED,
     AuthorWorkSyncService,
 )
+from app.services.analysis.sync_job_errors import incomplete_sync_failure as _incomplete_sync_failure
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,13 @@ def _format_sync_stage(detail: dict[str, Any]) -> str:
     phase = str(detail.get("phase") or "").strip().lower()
     if phase == "checking":
         return STAGE_CHECKING_COVERAGE
+    if detail.get("rate_limited"):
+        provider = str(detail.get("provider") or "Provider").strip() or "Provider"
+        label = {
+            "openalex": "OpenAlex",
+            "arxiv": "arXiv",
+        }.get(provider.lower(), provider[:1].upper() + provider[1:])
+        return f"{label} rate limit reached"
 
     author = str(detail.get("current_author") or "").strip()
     processed = detail.get("publications_processed")
@@ -117,35 +125,6 @@ def _sync_percent(detail: dict[str, Any]) -> int:
     except (TypeError, ValueError):
         page_fraction = 0.0
     return min(base + int((author_fraction + page_fraction) * span), 40)
-
-
-def _incomplete_sync_message(stats: list[dict[str, Any]]) -> str | None:
-    problems = [
-        row
-        for row in stats
-        if str(row.get("status") or "").lower()
-        not in {STATUS_COMPLETE, "fresh", "success"}
-    ]
-    if not problems:
-        return None
-
-    parts: list[str] = []
-    for row in problems:
-        name = row.get("display_name") or row.get("canonical_author_id") or "Selected author"
-        provider = row.get("provider") or "provider"
-        status = row.get("status") or STATUS_FAILED
-        detail = row.get("error_message")
-        if detail:
-            parts.append(f"{name} ({provider}): {status} — {detail}")
-        else:
-            parts.append(f"{name} ({provider}): {status}")
-    joined = "; ".join(parts[:3])
-    if len(parts) > 3:
-        joined = f"{joined}; +{len(parts) - 3} more"
-    return (
-        "Publication coverage is incomplete for the selected authors, "
-        f"so Collaboration Insights cannot be marked complete. {joined}"
-    )
 
 
 class InsightsJobService:
@@ -223,6 +202,7 @@ class InsightsJobService:
                         "provider": detail.get("provider"),
                         "sync_status": detail.get("sync_status") or detail.get("status"),
                         "phase": detail.get("phase"),
+                        "rate_limited": bool(detail.get("rate_limited")),
                     },
                 )
 
@@ -230,9 +210,13 @@ class InsightsJobService:
                 authors,
                 on_progress=on_sync_progress,
             )
-            incomplete = _incomplete_sync_message(sync_stats)
+            incomplete = _incomplete_sync_failure(sync_stats, context="insights")
             if incomplete:
-                await self._fail(job_uuid, incomplete)
+                await self._fail(
+                    job_uuid,
+                    incomplete["error_message"],
+                    detail=incomplete,
+                )
                 return
 
             async def on_dashboard_progress(stage: str, percent: int) -> None:
@@ -266,6 +250,21 @@ class InsightsJobService:
                 excluded_work_ids=list(payload.get("excluded_work_ids") or []),
                 on_progress=on_dashboard_progress,
             )
+            from app.services.analysis.sync_job_errors import _blocking_sync_problems
+
+            if _blocking_sync_problems(sync_stats):
+                await self._fail(
+                    job_uuid,
+                    "Publication coverage is incomplete for the selected authors, "
+                    "so Collaboration Insights cannot be marked complete.",
+                    detail={"sync_status": STATUS_FAILED, "rate_limited": False},
+                )
+                return
+            result["coverage"] = {
+                "verified": True,
+                "corpus_complete": True,
+                "source": "stored_complete_corpus",
+            }
         except AuthorAnalysisError as exc:
             await self._fail(job_uuid, str(exc))
             return
@@ -284,6 +283,7 @@ class InsightsJobService:
         current.progress_detail = {
             "phase": "completed",
             "sync_status": STATUS_COMPLETE,
+            "corpus_complete": True,
             "authors_synced": len(sync_stats),
         }
         current.error_message = None
@@ -291,17 +291,28 @@ class InsightsJobService:
         current.updated_at = current.completed_at
         await self.session.commit()
 
-    async def _fail(self, job_id: uuid.UUID, message: str) -> None:
+    async def _fail(
+        self,
+        job_id: uuid.UUID,
+        message: str,
+        *,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
         job = await self.get_job(job_id)
         if job is None:
             return
         job.status = STATUS_FAILED_JOB
         job.error_message = message
         job.progress_stage = STAGE_FAILED
+        extra = detail or {}
         job.progress_detail = {
             "phase": "failed",
-            "sync_status": STATUS_FAILED,
+            "sync_status": extra.get("sync_status") or STATUS_FAILED,
             "error_message": message,
+            "rate_limited": bool(extra.get("rate_limited")),
+            "provider": extra.get("provider"),
+            "providers": list(extra.get("providers") or []),
+            "corpus_complete": False,
         }
         job.completed_at = utc_now()
         job.updated_at = job.completed_at

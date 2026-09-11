@@ -32,6 +32,16 @@ function delay(ms, signal) {
 
 export function formatPublicationStatsProgressMessage(progress) {
   const detail = progress?.detail || {};
+  if (detail.rate_limited || detail.rateLimited) {
+    const provider = String(detail.provider || "OpenAlex");
+    const label =
+      provider.toLowerCase() === "openalex"
+        ? "OpenAlex"
+        : provider.toLowerCase() === "arxiv"
+          ? "arXiv"
+          : provider;
+    return `${label} rate limit reached. Your existing data is safe; please try again shortly.`;
+  }
   const processed = detail.publications_processed ?? detail.publicationsProcessed;
   const total = detail.publications_total ?? detail.publicationsTotal;
   const stage = String(progress?.stage || "Preparing")
@@ -39,10 +49,13 @@ export function formatPublicationStatsProgressMessage(progress) {
     .trim();
 
   if (processed != null && total != null) {
-    return `Building complete publication statistics — ${Number(processed).toLocaleString()} / ${Number(total).toLocaleString()}`;
+    return `Syncing publications — ${Number(processed).toLocaleString()} / ${Number(total).toLocaleString()}`;
   }
   if (stage.toLowerCase().includes("checking")) {
     return "Checking publication coverage…";
+  }
+  if (stage.toLowerCase().includes("rate limit")) {
+    return stage.endsWith(".") ? stage : `${stage}. Your existing data is safe; please try again shortly.`;
   }
   if (stage) {
     const percent = Number.isFinite(Number(progress?.percent))
@@ -51,6 +64,27 @@ export function formatPublicationStatsProgressMessage(progress) {
     return percent != null ? `${stage}… ${percent}%` : `${stage}…`;
   }
   return "Building complete publication statistics…";
+}
+
+export function formatPublicationStatsErrorMessage(error) {
+  const job = error?.statsJob || {};
+  const detail = job.progress_detail || job.progressDetail || {};
+  if (detail.rate_limited || detail.rateLimited || /rate limit/i.test(String(error?.message || ""))) {
+    const provider = String(detail.provider || "openalex");
+    const label =
+      provider.toLowerCase() === "openalex"
+        ? "OpenAlex"
+        : provider.toLowerCase() === "arxiv"
+          ? "arXiv"
+          : provider;
+    return `${label} rate limit reached. Your existing data is safe; please try again shortly.`;
+  }
+  return (
+    error?.message ||
+    job.error_message ||
+    job.errorMessage ||
+    "Complete publication statistics are temporarily unavailable."
+  );
 }
 
 export async function fetchAuthorPublicationCorpusStats({
@@ -66,7 +100,15 @@ export async function fetchAuthorPublicationCorpusStats({
   });
   onProgress?.(created);
   if (created?.status === "completed") {
-    return created.result || {};
+    const result = created.result || {};
+    if (result.corpus_complete === false) {
+      const error = new Error(
+        "Complete publication statistics are unavailable because coverage was not verified complete.",
+      );
+      error.statsJob = created;
+      throw error;
+    }
+    return result;
   }
   if (created?.status === "failed") {
     const error = new Error(
@@ -90,7 +132,15 @@ export async function fetchAuthorPublicationCorpusStats({
     const job = await getAuthorPublicationStatsJob(jobId, { signal });
     onProgress?.(job);
     if (job?.status === "completed") {
-      return job.result || {};
+      const result = job.result || {};
+      if (result.corpus_complete === false) {
+        const error = new Error(
+          "Complete publication statistics are unavailable because coverage was not verified complete.",
+        );
+        error.statsJob = job;
+        throw error;
+      }
+      return result;
     }
     if (job?.status === "failed") {
       const error = new Error(

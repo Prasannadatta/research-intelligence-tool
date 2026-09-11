@@ -105,9 +105,12 @@ async def search_orcid_author_results(
     query: str | None,
     limit: int,
     filters: dict[str, Any] | None = None,
-    enrich: bool = True,
+    enrich: bool = False,
 ) -> list[dict[str, Any]]:
-    """Return ORCID author rows. Never raises — empty list on failure."""
+    """
+    Return ORCID author rows for search display.
+    enrich=False keeps search to expanded-search / person only; deeper fetches happen on selection.
+    """
     filters = filters or {}
     affiliation = _affiliation_from_filters(filters)
     try:
@@ -118,7 +121,7 @@ async def search_orcid_author_results(
             enrich=enrich,
         )
     except Exception:
-        logger.warning("orcid_author_search_failed")
+        logger.warning("orcid_author_search_failed", exc_info=True)
         return []
 
     results: list[dict[str, Any]] = []
@@ -155,14 +158,13 @@ class OrcidProvider(BaseSearchProvider):
         limit: int,
         filters: dict[str, Any],
     ) -> dict[str, Any]:
-        from app.integrations.orcid.normalize import normalize_orcid_id
-
-        orcid_id = normalize_orcid_id(query)
+        del cursor  # ORCID public search has no opaque cursor pagination here.
+        # Search is lightweight: name → expanded-search only; ORCID-iD → /person only.
         results = await search_orcid_author_results(
             query=query,
             limit=limit,
             filters=filters,
-            enrich=bool(orcid_id),
+            enrich=False,
         )
         cleaned = " ".join((query or "").split())
         return {
@@ -173,16 +175,6 @@ class OrcidProvider(BaseSearchProvider):
             "next_cursor": None,
             "has_more": False,
         }
-
-    async def search_works(
-        self,
-        *,
-        query: str | None,
-        cursor: str | None,
-        limit: int,
-        filters: dict[str, Any],
-    ) -> dict[str, Any]:
-        raise ValueError("ORCID search does not support works.")
 
     async def search_grants(
         self,

@@ -5,7 +5,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
-EntityType = Literal["authors", "works", "grants"]
+EntityType = Literal["authors", "grants"]
 SearchMode = Literal["auto", "keywords", "grant_number"]
 SearchSource = Literal["openalex", "arxiv", "orcid", "all"]
 
@@ -104,25 +104,6 @@ class SearchWorkResult(BaseModel):
     matched_grant: MatchedGrant | None = None
     matched_grant_number: str | None = None
     grant_match: GrantMatch | None = None
-
-
-class SearchGrantResult(BaseModel):
-    result_id: str
-    result_type: Literal["grant"] = "grant"
-    openalex_id: str
-    display_name: str | None = None
-    funder_name: str | None = None
-    funder_award_id: str | None = None
-    funding_type: str | None = None
-    amount: float | None = None
-    currency: str | None = None
-    start_year: int | None = None
-    end_year: int | None = None
-    lead_investigator: str | None = None
-    funded_outputs_count: int | None = None
-    source: str = "openalex"
-    match_reason: str | None = None
-    matched_grant: MatchedGrant | None = None
 
 
 class FilterInstitutionOption(BaseModel):

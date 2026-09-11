@@ -119,6 +119,7 @@ async def test_stats_job_syncs_then_returns_full_timeline_and_facets(session_fac
             ],
             "has_more": False,
             "next_cursor": None,
+            "count": 2,
         },
     ) as mock_fetch:
         created = client.post(
@@ -209,6 +210,7 @@ async def test_stats_job_refreshes_stale_and_fails_on_provider_error(session_fac
             "results": [_work_row("SL-W1", "Stale Paper", [("SL1", "Stale")])],
             "has_more": False,
             "next_cursor": None,
+            "count": 1,
         }
 
     with patch(
@@ -284,3 +286,64 @@ async def test_stats_job_intersection_for_three_authors(session_factory, monkeyp
     assert payload["status"] == "completed"
     assert payload["result"]["mode"] == "common_publications"
     assert payload["result"]["total_matching_publications"] == 1
+
+
+@pytest.mark.asyncio
+async def test_stats_job_rate_limit_preserves_incomplete_status(session_factory, monkeypatch):
+    _hold_scheduler(monkeypatch)
+    monkeypatch.setattr(publication_stats_jobs, "SessionLocal", session_factory)
+
+    async with session_factory() as session:
+        author = await _seed_author(session, name="Limited", openalex_id="RL1")
+        await _set_works_count(session, author, 1)
+
+    from app.integrations.openalex.client import OpenAlexApiError
+
+    with patch(
+        "app.services.analysis.author_work_sync.search_works_by_author_ids",
+        new_callable=AsyncMock,
+        side_effect=OpenAlexApiError("OpenAlex rate limit reached.", status_code=429),
+    ):
+        created = client.post(
+            "/api/analysis/authors/publications/stats/jobs",
+            json={"authors": [_author_payload(author.id, "Limited")]},
+        )
+        job_id = created.json()["job_id"]
+        await run_publication_stats_job(job_id)
+
+    payload = client.get(f"/api/analysis/authors/publications/stats/jobs/{job_id}").json()
+    assert payload["status"] == "failed"
+    assert payload["result"] is None
+    assert payload["progress_detail"]["rate_limited"] is True
+    assert payload["progress_detail"]["corpus_complete"] is False
+    assert "rate limit reached" in (payload["error_message"] or "").lower()
+    assert "existing data is safe" in (payload["error_message"] or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_stats_job_fails_when_author_has_no_provider_identity(session_factory, monkeypatch):
+    _hold_scheduler(monkeypatch)
+    monkeypatch.setattr(publication_stats_jobs, "SessionLocal", session_factory)
+
+    async with session_factory() as session:
+        author = CanonicalAuthor(
+            id=uuid.uuid4(),
+            preferred_name="No Provider",
+            normalized_name="no provider",
+            resolution_status="merged",
+        )
+        session.add(author)
+        await session.commit()
+        author_id = author.id
+
+    created = client.post(
+        "/api/analysis/authors/publications/stats/jobs",
+        json={"authors": [_author_payload(author_id, "No Provider")]},
+    )
+    job_id = created.json()["job_id"]
+    await run_publication_stats_job(job_id)
+    payload = client.get(f"/api/analysis/authors/publications/stats/jobs/{job_id}").json()
+    assert payload["status"] == "failed"
+    assert payload["result"] is None
+    assert payload["progress_detail"]["corpus_complete"] is False
+    assert "provider" in (payload["error_message"] or "").lower()

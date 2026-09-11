@@ -45,22 +45,17 @@ describe("App sidebar search navigation", () => {
       expect(getEntitySelect()).toHaveTextContent("Grants");
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "Works / Publications" }));
-    await waitFor(() => {
-      expect(getEntitySelect()).toHaveTextContent("Works");
-    });
-
     fireEvent.click(screen.getByRole("button", { name: "Authors" }));
     await waitFor(() => {
       expect(getEntitySelect()).toHaveTextContent("Authors");
     });
   });
 
-  it("selects All sources on Author Search load", async () => {
+  it("selects All on Author Search load", async () => {
     renderApp("/?entity=authors");
 
     await waitFor(() => {
-      expect(screen.getByLabelText("Search source")).toHaveTextContent("All sources");
+      expect(screen.getByLabelText("Search source")).toHaveTextContent("All");
     });
   });
 
@@ -88,12 +83,10 @@ describe("App sidebar search navigation", () => {
   it("keeps menu highlight and selector aligned when switching entity", async () => {
     renderApp("/?entity=authors");
 
-    fireEvent.click(screen.getByRole("button", { name: "Works / Publications" }));
+    fireEvent.click(screen.getByRole("button", { name: "Grants" }));
     await waitFor(() => {
-      expect(getEntitySelect()).toHaveTextContent("Works");
-      expect(screen.getByRole("button", { name: "Works / Publications" })).toHaveClass(
-        "Mui-selected",
-      );
+      expect(getEntitySelect()).toHaveTextContent("Grants");
+      expect(screen.getByRole("button", { name: "Grants" })).toHaveClass("Mui-selected");
     });
   });
 
@@ -123,10 +116,18 @@ describe("App sidebar search navigation", () => {
   });
 
   it("supports /search alias with entity query", async () => {
+    renderApp("/search?entity=grants");
+
+    await waitFor(() => {
+      expect(getEntitySelect()).toHaveTextContent("Grants");
+    });
+  });
+
+  it("treats legacy works entity query as authors", async () => {
     renderApp("/search?entity=works");
 
     await waitFor(() => {
-      expect(getEntitySelect()).toHaveTextContent("Works");
+      expect(getEntitySelect()).toHaveTextContent("Authors");
     });
   });
 

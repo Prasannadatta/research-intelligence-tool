@@ -1,10 +1,13 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db_session
-from app.schemas.author import AuthorResponse
-from app.schemas.author_summary import AuthorSummaryResponse
-from app.services.author_service import AuthorDataError, search_authors
+from app.schemas.author_summary import (
+    AuthorSummaryResponse,
+    ResolveAuthorsRequest,
+    ResolveAuthorsResponse,
+)
+from app.services.authors.resolve import resolve_selected_authors
 from app.services.authors.summary import (
     AuthorSummaryError,
     get_author_summary,
@@ -17,15 +20,16 @@ router = APIRouter(
 )
 
 
-@router.get("/search", response_model=list[AuthorResponse])
-def search_authors_endpoint(
-    query: str = Query(..., min_length=2, description="Author search text"),
-    limit: int = Query(10, ge=1, le=25, description="Maximum number of results"),
-) -> list[AuthorResponse]:
-    try:
-        return search_authors(query=query, limit=limit)
-    except AuthorDataError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+@router.post("/resolve", response_model=ResolveAuthorsResponse)
+async def resolve_authors_endpoint(
+    body: ResolveAuthorsRequest,
+) -> ResolveAuthorsResponse:
+    """Resolve selected search hits into canonical author identity records.
+
+    Called on selection — not during typeahead — to avoid DB writes on every page.
+    """
+    results = await resolve_selected_authors(list(body.authors or []))
+    return ResolveAuthorsResponse(results=results)
 
 
 @router.get(

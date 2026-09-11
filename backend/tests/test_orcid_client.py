@@ -363,7 +363,7 @@ def test_parse_works_counts_groups_and_extracts_dois():
 async def test_lin_lin_search_keeps_ambiguous_orcid_records_separate():
     fake = _FakeOrcidHttp()
     client = OrcidClient(request_func=fake)
-    payload = await search_orcid_authors(query="Lin Lin", client=client)
+    payload = await search_orcid_authors(query="Lin Lin", enrich=True, client=client)
     assert payload["source"] == "orcid"
     assert payload["query"] == 'given-names:"Lin" AND family-name:"Lin"'
     assert payload["num_found"] == 655
@@ -380,6 +380,35 @@ async def test_lin_lin_search_keeps_ambiguous_orcid_records_separate():
     search_urls = [url for url, _, _ in fake.calls if "expanded-search" in url]
     assert search_urls
     assert fake.calls[0][2]["Accept"] == "application/json"
+
+
+@pytest.mark.asyncio
+async def test_name_search_without_enrich_uses_expanded_search_only():
+    fake = _FakeOrcidHttp()
+    client = OrcidClient(request_func=fake)
+    payload = await search_orcid_authors(query="Lin Lin", enrich=False, client=client)
+    assert [row.orcid for row in payload["results"]] == [
+        LIN_LIN_BERKELEY,
+        LIN_LIN_EDUCATION,
+        "0000-0001-5052-1216",
+    ]
+    assert any("Berkeley" in (inst.name or "") for inst in payload["results"][0].institutions)
+    urls = [url for url, _, _ in fake.calls]
+    assert any("expanded-search" in url for url in urls)
+    assert not any(url.endswith("/person") for url in urls)
+    assert not any(url.endswith("/employments") for url in urls)
+    assert not any(url.endswith("/works") for url in urls)
+
+
+@pytest.mark.asyncio
+async def test_assembled_search_payload_is_cached():
+    fake = _FakeOrcidHttp()
+    client = OrcidClient(request_func=fake)
+    first = await search_orcid_authors(query="Lin Lin", enrich=False, client=client)
+    second = await search_orcid_authors(query="Lin Lin", enrich=False, client=client)
+    assert [row.orcid for row in first["results"]] == [row.orcid for row in second["results"]]
+    search_calls = [url for url, _, _ in fake.calls if "expanded-search" in url]
+    assert len(search_calls) == 1
 
 
 @pytest.mark.asyncio
@@ -461,13 +490,15 @@ async def test_client_uses_cache_for_repeated_person_reads():
 async def test_orcid_id_query_fetches_person_not_expanded_search():
     fake = _FakeOrcidHttp()
     client = OrcidClient(request_func=fake)
-    payload = await search_orcid_authors(query=LIN_LIN_BERKELEY, client=client)
+    payload = await search_orcid_authors(query=LIN_LIN_BERKELEY, enrich=False, client=client)
     assert payload["num_found"] == 1
     assert payload["results"][0].orcid == LIN_LIN_BERKELEY
     assert payload["results"][0].display_name == "Lin Lin"
     urls = [url for url, _, _ in fake.calls]
     assert any(url.endswith(f"/{LIN_LIN_BERKELEY}/person") for url in urls)
     assert not any("expanded-search" in url for url in urls)
+    assert not any(url.endswith("/employments") for url in urls)
+    assert not any(url.endswith("/works") for url in urls)
 
 
 @pytest.mark.asyncio

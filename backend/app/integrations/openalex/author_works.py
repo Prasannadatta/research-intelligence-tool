@@ -190,6 +190,11 @@ async def search_works_by_author_ids(
 
     response = await _openalex_get(OPENALEX_WORKS_URL, params=params)
 
+    if response.status_code == 429:
+        raise OpenAlexApiError(
+            "OpenAlex rate limit reached.",
+            status_code=429,
+        )
     if response.status_code >= 500:
         raise OpenAlexApiError("OpenAlex works search is temporarily unavailable.")
     if response.status_code >= 400:

@@ -7,7 +7,6 @@ export const SEARCH_HOME_PATH = "/";
 const VALID_ENTITIES = new Set([
   ENTITY_TYPES.AUTHORS,
   ENTITY_TYPES.GRANTS,
-  ENTITY_TYPES.WORKS,
 ]);
 
 export function parseEntityParam(value) {
@@ -33,9 +32,6 @@ export function getActiveSearchMenuEntity(pathname, searchParams) {
   }
   if (pathname.startsWith("/grants/")) {
     return ENTITY_TYPES.GRANTS;
-  }
-  if (pathname.startsWith("/works/")) {
-    return ENTITY_TYPES.WORKS;
   }
   if (isSearchHomePath(pathname)) {
     return parseEntityParam(searchParams?.get(ENTITY_QUERY_PARAM));

@@ -89,7 +89,7 @@ async def _seed_author(
             provider_author_id=openalex_id,
             display_name=name,
             normalized_name=name.lower(),
-            works_count=3,
+            works_count=1,
         )
     )
     return author
@@ -203,7 +203,12 @@ async def test_historical_authorship_link_repair_updates_author_works(session_fa
             "app.services.analysis.author_work_sync.search_works_by_author_ids",
             new_callable=AsyncMock,
         ) as mock_fetch:
-            mock_fetch.return_value = {"results": [], "has_more": False, "next_cursor": None}
+            mock_fetch.return_value = {
+                "results": [],
+                "has_more": False,
+                "next_cursor": None,
+                "count": 1,
+            }
             stats = await AuthorWorkSyncService(session).synchronize_selected_authors(
                 [_author_payload(author)]
             )
@@ -223,6 +228,7 @@ async def test_historical_authorship_link_repair_updates_author_works(session_fa
     assert author_work_count == 1
     assert stats[0]["existing_links_repaired"] == 1
     assert stats[0]["stored_work_count_after"] == 1
+    assert stats[0]["status"] == "complete"
 
 
 @pytest.mark.asyncio
@@ -242,7 +248,12 @@ async def test_repair_links_by_provider_id_not_name(session_factory):
             "app.services.analysis.author_work_sync.search_works_by_author_ids",
             new_callable=AsyncMock,
         ) as mock_fetch:
-            mock_fetch.return_value = {"results": [], "has_more": False, "next_cursor": None}
+            mock_fetch.return_value = {
+                "results": [],
+                "has_more": False,
+                "next_cursor": None,
+                "count": 0,
+            }
             await AuthorWorkSyncService(session).synchronize_selected_authors(
                 [_author_payload(author)]
             )
@@ -325,6 +336,7 @@ async def test_sync_repairs_existing_provider_work_missing_authoritative_authors
                 ],
                 "has_more": False,
                 "next_cursor": None,
+                "count": 1,
             }
             stats = await AuthorWorkSyncService(session).synchronize_selected_authors(
                 [_author_payload(author)]
@@ -356,6 +368,7 @@ async def test_repeated_sync_is_idempotent_and_fresh_state_skips_provider_fetch(
                 "results": [_work_row("W4", "Synced Paper", [("A1", "Author A")])],
                 "has_more": False,
                 "next_cursor": None,
+                "count": 1,
             }
 
             first = await AuthorWorkSyncService(session).synchronize_selected_authors(
@@ -398,17 +411,16 @@ async def test_sync_fetches_all_provider_ids_before_marking_provider_fresh(
         await session.commit()
 
         async def fake_fetch(*, author_id_groups, **_kwargs):
-            author_id = author_id_groups[0][0]
+            ids = author_id_groups[0]
+            assert set(ids) == {"A1", "A1b"}
             return {
                 "results": [
-                    _work_row(
-                        f"W-{author_id}",
-                        f"Paper {author_id}",
-                        [(author_id, "Author A")],
-                    )
+                    _work_row("W-A1", "Paper A1", [("A1", "Author A")]),
+                    _work_row("W-A1b", "Paper A1b", [("A1b", "Author A")]),
                 ],
                 "has_more": False,
                 "next_cursor": None,
+                "count": 2,
             }
 
         with patch(
@@ -430,8 +442,9 @@ async def test_sync_fetches_all_provider_ids_before_marking_provider_fresh(
             )
         ).scalar_one()
 
-    assert mock_fetch.await_count == 2
-    assert first[0]["fetched_work_count"] == 2
+    assert mock_fetch.await_count == 1
+    assert first[0]["status"] == "complete"
+    assert first[0]["coverage_verified"] is True
     assert second[0]["status"] == "complete"
     assert second[0]["network_skipped"] is True
     assert work_count == 2
@@ -460,7 +473,12 @@ async def test_stale_sync_refetches_provider(session_factory):
             "app.services.analysis.author_work_sync.search_works_by_author_ids",
             new_callable=AsyncMock,
         ) as mock_fetch:
-            mock_fetch.return_value = {"results": [], "has_more": False, "next_cursor": None}
+            mock_fetch.return_value = {
+                "results": [],
+                "has_more": False,
+                "next_cursor": None,
+                "count": 0,
+            }
             await AuthorWorkSyncService(session).synchronize_selected_authors(
                 [_author_payload(author)]
             )
@@ -476,7 +494,12 @@ async def test_provider_fetch_occurs_outside_write_transaction(session_factory):
 
         async def fake_fetch(**_kwargs):
             assert session.in_transaction() is False
-            return {"results": [], "has_more": False, "next_cursor": None}
+            return {
+                "results": [],
+                "has_more": False,
+                "next_cursor": None,
+                "count": 0,
+            }
 
         with patch(
             "app.services.analysis.author_work_sync.search_works_by_author_ids",
@@ -504,6 +527,7 @@ async def test_simultaneous_same_author_sync_is_deduplicated(session_factory):
             "results": [_work_row("W5", "Concurrent Paper", [("A1", "Author A")])],
             "has_more": False,
             "next_cursor": None,
+            "count": 1,
         }
 
     with patch(
@@ -591,10 +615,12 @@ def test_pairwise_publications_outside_abc_available_in_insights_after_sync(sess
 
     async def fake_fetch(*, author_id_groups, **_kwargs):
         author_id = author_id_groups[0][0]
+        rows = responses[author_id]
         return {
-            "results": responses[author_id],
+            "results": rows,
             "has_more": False,
             "next_cursor": None,
+            "count": len(rows),
         }
 
     with patch(
@@ -653,6 +679,7 @@ async def test_sync_timeout_skips_remaining_author_groups(session_factory):
                 "results": [_work_row("W1", "Paper", [("A1", "Author A")])],
                 "has_more": False,
                 "next_cursor": None,
+                "count": 1,
             }
             stats = await AuthorWorkSyncService(session).synchronize_selected_authors(
                 [_author_payload(author_a), _author_payload(author_b)],
@@ -662,3 +689,469 @@ async def test_sync_timeout_skips_remaining_author_groups(session_factory):
     assert mock_fetch.await_count == 0
     assert len(stats) == 2
     assert {row["status"] for row in stats} == {"partial"}
+
+
+@pytest.mark.asyncio
+async def test_undercounted_crawl_is_not_marked_complete(session_factory):
+    async with session_factory() as session:
+        author = await _seed_author(session, name="Author A", openalex_id="A1")
+        await session.commit()
+
+        with patch(
+            "app.services.analysis.author_work_sync.search_works_by_author_ids",
+            new_callable=AsyncMock,
+        ) as mock_fetch:
+            mock_fetch.return_value = {
+                "results": [_work_row("W1", "Only One", [("A1", "Author A")])],
+                "has_more": False,
+                "next_cursor": None,
+                "count": 5,
+            }
+            stats = await AuthorWorkSyncService(session).synchronize_selected_authors(
+                [_author_payload(author)]
+            )
+
+        state = (
+            await session.execute(
+                select(AuthorWorkSyncState).where(
+                    AuthorWorkSyncState.canonical_author_id == author.id
+                )
+            )
+        ).scalar_one()
+
+    assert stats[0]["status"] == "partial"
+    assert stats[0]["coverage_verified"] is False
+    assert "Linked 1" in (stats[0]["error_message"] or "")
+    assert state.status == "partial"
+    assert state.provider_work_count == 5
+
+
+@pytest.mark.asyncio
+async def test_missing_provider_total_cannot_be_marked_complete(session_factory):
+    async with session_factory() as session:
+        author = await _seed_author(session, name="Author A", openalex_id="A1")
+        record = await _provider_record(session, author)
+        record.works_count = None
+        await session.commit()
+
+        with patch(
+            "app.services.analysis.author_work_sync.search_works_by_author_ids",
+            new_callable=AsyncMock,
+        ) as mock_fetch:
+            mock_fetch.return_value = {
+                "results": [_work_row("W1", "Paper", [("A1", "Author A")])],
+                "has_more": False,
+                "next_cursor": None,
+                "count": None,
+            }
+            stats = await AuthorWorkSyncService(session).synchronize_selected_authors(
+                [_author_payload(author)]
+            )
+
+    assert stats[0]["status"] == "partial"
+    assert "cannot be verified" in (stats[0]["error_message"] or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_preserves_prior_complete_data_and_resume_cursor(session_factory):
+    async with session_factory() as session:
+        author = await _seed_author(session, name="Author A", openalex_id="A1")
+        await session.commit()
+
+        with patch(
+            "app.services.analysis.author_work_sync.search_works_by_author_ids",
+            new_callable=AsyncMock,
+        ) as mock_fetch:
+            mock_fetch.return_value = {
+                "results": [_work_row("W1", "Paper", [("A1", "Author A")])],
+                "has_more": False,
+                "next_cursor": None,
+                "count": 1,
+            }
+            first = await AuthorWorkSyncService(session).synchronize_selected_authors(
+                [_author_payload(author)]
+            )
+            assert first[0]["status"] == "complete"
+
+            from app.integrations.openalex.client import OpenAlexApiError
+
+            mock_fetch.side_effect = OpenAlexApiError(
+                "OpenAlex rate limit reached.",
+                status_code=429,
+            )
+            # Force refresh by making coverage stale.
+            state = (
+                await session.execute(
+                    select(AuthorWorkSyncState).where(
+                        AuthorWorkSyncState.canonical_author_id == author.id
+                    )
+                )
+            ).scalar_one()
+            state.last_successful_synced_at = datetime.now(timezone.utc) - timedelta(days=2)
+            state.last_synced_at = state.last_successful_synced_at
+            await session.commit()
+
+            second = await AuthorWorkSyncService(session).synchronize_selected_authors(
+                [_author_payload(author)]
+            )
+
+        count = (
+            await session.execute(
+                select(func.count(func.distinct(WorkAuthorship.canonical_work_id))).where(
+                    WorkAuthorship.canonical_author_id == author.id
+                )
+            )
+        ).scalar_one()
+        state = (
+            await session.execute(
+                select(AuthorWorkSyncState).where(
+                    AuthorWorkSyncState.canonical_author_id == author.id
+                )
+            )
+        ).scalar_one()
+
+    assert second[0]["status"] == "partial"
+    assert second[0]["rate_limited"] is True
+    assert count == 1
+    assert state.last_successful_synced_at is not None
+    assert state.resume_cursor == "*"
+
+
+@pytest.mark.asyncio
+async def test_pagination_resume_continues_from_saved_cursor(session_factory):
+    async with session_factory() as session:
+        author = await _seed_author(session, name="Author A", openalex_id="A1")
+        await session.commit()
+
+        pages = [
+            {
+                "results": [_work_row("W1", "One", [("A1", "Author A")])],
+                "has_more": True,
+                "next_cursor": "page-2",
+                "count": 2,
+            },
+            {
+                "results": [_work_row("W2", "Two", [("A1", "Author A")])],
+                "has_more": False,
+                "next_cursor": None,
+                "count": 2,
+            },
+        ]
+
+        with patch(
+            "app.services.analysis.author_work_sync.search_works_by_author_ids",
+            new_callable=AsyncMock,
+        ) as mock_fetch:
+            from app.integrations.openalex.client import OpenAlexApiError
+
+            mock_fetch.side_effect = [
+                pages[0],
+                OpenAlexApiError("OpenAlex rate limit reached.", status_code=429),
+            ]
+            partial = await AuthorWorkSyncService(session).synchronize_selected_authors(
+                [_author_payload(author)]
+            )
+            assert partial[0]["status"] == "partial"
+            assert partial[0]["resume_cursor"] == "page-2"
+
+            mock_fetch.side_effect = [pages[1]]
+            done = await AuthorWorkSyncService(session).synchronize_selected_authors(
+                [_author_payload(author)]
+            )
+
+        work_count = (
+            await session.execute(
+                select(func.count(func.distinct(WorkAuthorship.canonical_work_id))).where(
+                    WorkAuthorship.canonical_author_id == author.id
+                )
+            )
+        ).scalar_one()
+        state = (
+            await session.execute(
+                select(AuthorWorkSyncState).where(
+                    AuthorWorkSyncState.canonical_author_id == author.id
+                )
+            )
+        ).scalar_one()
+
+    assert mock_fetch.await_count == 3
+    resume_call = mock_fetch.await_args_list[2]
+    assert resume_call.kwargs["cursor"] == "page-2"
+    assert done[0]["status"] == "complete"
+    assert done[0]["coverage_verified"] is True
+    assert work_count == 2
+    assert state.resume_cursor is None
+    assert state.status == "complete"
+
+
+@pytest.mark.asyncio
+async def test_empty_page_with_continuation_cursor_is_partial(session_factory):
+    async with session_factory() as session:
+        author = await _seed_author(session, name="Author A", openalex_id="A1")
+        await session.commit()
+
+        with patch(
+            "app.services.analysis.author_work_sync.search_works_by_author_ids",
+            new_callable=AsyncMock,
+        ) as mock_fetch:
+            mock_fetch.return_value = {
+                "results": [],
+                "has_more": False,
+                "next_cursor": "ghost-cursor",
+                "count": 3,
+            }
+            stats = await AuthorWorkSyncService(session).synchronize_selected_authors(
+                [_author_payload(author)]
+            )
+
+    assert stats[0]["status"] == "partial"
+    assert "empty page" in (stats[0]["error_message"] or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_unverified_complete_within_ttl_is_refetched(session_factory):
+    """Legacy complete rows without provider_work_count must not skip network."""
+    async with session_factory() as session:
+        author = await _seed_author(session, name="Author A", openalex_id="A1")
+        session.add(
+            AuthorWorkSyncState(
+                id=uuid.uuid4(),
+                canonical_author_id=author.id,
+                provider="openalex",
+                last_synced_at=datetime.now(timezone.utc),
+                last_successful_synced_at=datetime.now(timezone.utc),
+                last_attempted_at=datetime.now(timezone.utc),
+                stored_work_count=1,
+                provider_work_count=None,
+                status="complete",
+            )
+        )
+        await session.commit()
+
+        with patch(
+            "app.services.analysis.author_work_sync.search_works_by_author_ids",
+            new_callable=AsyncMock,
+        ) as mock_fetch:
+            mock_fetch.return_value = {
+                "results": [_work_row("W1", "Paper", [("A1", "Author A")])],
+                "has_more": False,
+                "next_cursor": None,
+                "count": 1,
+            }
+            stats = await AuthorWorkSyncService(session).synchronize_selected_authors(
+                [_author_payload(author)]
+            )
+
+    assert mock_fetch.await_count == 1
+    assert stats[0]["network_skipped"] is False
+    assert stats[0]["status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_no_provider_identity_fails_instead_of_empty_complete(session_factory):
+    async with session_factory() as session:
+        author = CanonicalAuthor(
+            id=uuid.uuid4(),
+            preferred_name="Orphan",
+            normalized_name="orphan",
+            resolution_status="merged",
+        )
+        session.add(author)
+        await session.commit()
+
+        stats = await AuthorWorkSyncService(session).synchronize_selected_authors(
+            [_author_payload(author)]
+        )
+
+    assert len(stats) == 1
+    assert stats[0]["status"] == "failed"
+    assert stats[0]["coverage_verified"] is False
+    assert "No OpenAlex/arXiv provider identity" in (stats[0]["error_message"] or "")
+
+
+@pytest.mark.asyncio
+async def test_completeness_requires_linked_authorship_not_just_crawl_ids(session_factory):
+    async with session_factory() as session:
+        author = await _seed_author(session, name="Author A", openalex_id="A1")
+        await session.commit()
+
+        # Work payload omits the selected author from authorships metadata.
+        row = _work_row("W-missing-author", "Missing Author Meta", [("A999", "Other")])
+        row["authors"] = [
+            {
+                "id": "A999",
+                "name": "Other",
+                "display_name": "Other",
+                "author_position": 0,
+                "provider_ids": {"openalex": ["A999"], "orcid": [], "arxiv": []},
+                "institutions": [],
+                "institution_ids": [],
+                "countries": [],
+            }
+        ]
+
+        with patch(
+            "app.services.analysis.author_work_sync.search_works_by_author_ids",
+            new_callable=AsyncMock,
+            return_value={
+                "results": [row],
+                "has_more": False,
+                "next_cursor": None,
+                "count": 1,
+            },
+        ):
+            stats = await AuthorWorkSyncService(session).synchronize_selected_authors(
+                [_author_payload(author)]
+            )
+
+        linked = (
+            await session.execute(
+                select(func.count(WorkAuthorship.id)).where(
+                    WorkAuthorship.canonical_author_id == author.id
+                )
+            )
+        ).scalar_one()
+
+    assert linked == 1  # selected authorship injected
+    assert stats[0]["status"] == "complete"
+    assert stats[0]["coverage_verified"] is True
+
+
+@pytest.mark.asyncio
+async def test_sync_refresh_links_known_coauthors_for_intersection(session_factory):
+    async with session_factory() as session:
+        author_a = await _seed_author(session, name="Author A", openalex_id="A1")
+        author_b = await _seed_author(session, name="Author B", openalex_id="A2")
+        await session.commit()
+
+        with patch(
+            "app.services.analysis.author_work_sync.search_works_by_author_ids",
+            new_callable=AsyncMock,
+        ) as mock_fetch:
+            mock_fetch.side_effect = [
+                {
+                    "results": [
+                        _work_row(
+                            "W-AB",
+                            "Shared",
+                            [("A1", "Author A"), ("A2", "Author B")],
+                        )
+                    ],
+                    "has_more": False,
+                    "next_cursor": None,
+                    "count": 1,
+                },
+                {
+                    "results": [],
+                    "has_more": False,
+                    "next_cursor": None,
+                    "count": 0,
+                },
+            ]
+            await AuthorWorkSyncService(session).synchronize_selected_authors(
+                [_author_payload(author_a)]
+            )
+            # B has empty crawl but should already be linked from A's replace_work_authorships.
+            await AuthorWorkSyncService(session).synchronize_selected_authors(
+                [_author_payload(author_b)]
+            )
+
+        linked_b = (
+            await session.execute(
+                select(func.count(WorkAuthorship.id)).where(
+                    WorkAuthorship.canonical_author_id == author_b.id,
+                    WorkAuthorship.canonical_work_id.in_(
+                        select(WorkAuthorship.canonical_work_id).where(
+                            WorkAuthorship.canonical_author_id == author_a.id
+                        )
+                    ),
+                )
+            )
+        ).scalar_one()
+
+    assert linked_b == 1
+
+
+@pytest.mark.asyncio
+async def test_timeout_before_start_preserves_resume_cursor(session_factory):
+    async with session_factory() as session:
+        author_a = await _seed_author(session, name="Author A", openalex_id="A1")
+        author_b = await _seed_author(session, name="Author B", openalex_id="A2")
+        session.add(
+            AuthorWorkSyncState(
+                id=uuid.uuid4(),
+                canonical_author_id=author_b.id,
+                provider="openalex",
+                last_synced_at=None,
+                last_successful_synced_at=None,
+                last_attempted_at=datetime.now(timezone.utc),
+                stored_work_count=1,
+                provider_work_count=3,
+                status="partial",
+                resume_cursor="keep-me",
+                error_message="mid-crawl",
+            )
+        )
+        await session.commit()
+
+        with patch(
+            "app.services.analysis.author_work_sync.search_works_by_author_ids",
+            new_callable=AsyncMock,
+        ) as mock_fetch:
+            mock_fetch.return_value = {
+                "results": [_work_row("W1", "Paper", [("A1", "Author A")])],
+                "has_more": False,
+                "next_cursor": None,
+                "count": 1,
+            }
+            stats = await AuthorWorkSyncService(session).synchronize_selected_authors(
+                [_author_payload(author_a), _author_payload(author_b)],
+                timeout_seconds=0,
+            )
+
+        state_b = (
+            await session.execute(
+                select(AuthorWorkSyncState).where(
+                    AuthorWorkSyncState.canonical_author_id == author_b.id
+                )
+            )
+        ).scalar_one()
+
+    assert all(row["status"] == "partial" for row in stats)
+    assert state_b.resume_cursor == "keep-me"
+
+
+def test_blocking_sync_problems_requires_openalex_not_arxiv_enrichment():
+    from app.services.analysis.sync_job_errors import _blocking_sync_problems
+
+    assert _blocking_sync_problems([])  # empty is blocking
+    assert not _blocking_sync_problems(
+        [
+            {
+                "canonical_author_id": "a1",
+                "provider": "openalex",
+                "status": "complete",
+                "coverage_verified": True,
+            },
+            {
+                "canonical_author_id": "a1",
+                "provider": "arxiv",
+                "status": "partial",
+                "coverage_verified": False,
+                "error_message": "unverified",
+            },
+        ]
+    )
+    problems = _blocking_sync_problems(
+        [
+            {
+                "canonical_author_id": "a1",
+                "provider": "arxiv",
+                "status": "partial",
+                "coverage_verified": False,
+                "display_name": "Only Arxiv",
+            }
+        ]
+    )
+    assert problems
+    assert "OpenAlex" in (problems[0].get("error_message") or "")

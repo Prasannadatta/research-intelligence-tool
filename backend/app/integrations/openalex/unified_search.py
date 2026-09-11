@@ -1,4 +1,4 @@
-"""Unified OpenAlex search for authors, works, and grants-linked publications."""
+"""Unified OpenAlex search for authors and grants-linked publications."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from app.integrations.openalex.client import (
     _as_optional_int,
     _extract_institutions,
     _extract_topics,
+    _institution_from_raw,
     _normalize_orcid,
     _openalex_get,
     _require_api_key,
@@ -24,8 +25,6 @@ OPENALEX_AWARDS_URL = "https://api.openalex.org/awards"
 
 ENTITY_ENDPOINTS = {
     "authors": OPENALEX_AUTHORS_URL,
-    "works": OPENALEX_WORKS_URL,
-    "grants": OPENALEX_AWARDS_URL,
 }
 
 DEFAULT_PAGE_SIZE = 20
@@ -216,7 +215,52 @@ def _extract_biblio(work: dict[str, Any]) -> dict[str, str | None]:
         "pages": pages,
     }
 
-def normalize_search_author(author: dict[str, Any]) -> dict[str, Any] | None:
+def _find_author_institution(
+    author: dict[str, Any],
+    institution_id: str,
+) -> dict[str, Any] | None:
+    """Locate an institution on the raw OpenAlex author (last_known or affiliations)."""
+    prefer = _short_openalex_id(institution_id) or (institution_id or "").strip()
+    if not prefer:
+        return None
+
+    last_known = author.get("last_known_institutions")
+    if isinstance(last_known, list):
+        for item in last_known:
+            if not isinstance(item, dict):
+                continue
+            normalized = _institution_from_raw(item)
+            if normalized and normalized.get("id") == prefer:
+                return {
+                    "id": normalized.get("id"),
+                    "name": normalized.get("name"),
+                    "country_code": normalized.get("country_code"),
+                    "type": normalized.get("type"),
+                }
+
+    affiliations = author.get("affiliations")
+    if isinstance(affiliations, list):
+        for affiliation in affiliations:
+            if not isinstance(affiliation, dict):
+                continue
+            institution = affiliation.get("institution")
+            raw = institution if isinstance(institution, dict) else affiliation
+            normalized = _institution_from_raw(raw if isinstance(raw, dict) else None)
+            if normalized and normalized.get("id") == prefer:
+                return {
+                    "id": normalized.get("id"),
+                    "name": normalized.get("name"),
+                    "country_code": normalized.get("country_code"),
+                    "type": normalized.get("type"),
+                }
+    return None
+
+
+def normalize_search_author(
+    author: dict[str, Any],
+    *,
+    prefer_institution_id: str | None = None,
+) -> dict[str, Any] | None:
     openalex_id = _short_openalex_id(author.get("id"))
     if not openalex_id:
         return None
@@ -234,6 +278,17 @@ def normalize_search_author(author: dict[str, Any]) -> dict[str, Any] | None:
                 alternative_names.append(text)
 
     institutions = _extract_institutions(author)
+    preferred = None
+    if prefer_institution_id:
+        preferred = _find_author_institution(author, prefer_institution_id)
+        if preferred:
+            prefer_id = preferred.get("id")
+            institutions = [preferred] + [
+                row
+                for row in institutions
+                if isinstance(row, dict) and row.get("id") != prefer_id
+            ]
+
     primary_institution = None
     if institutions:
         first = institutions[0]
@@ -416,17 +471,19 @@ def normalize_search_grant(award: dict[str, Any]) -> dict[str, Any] | None:
 def _normalize_page(
     entity_type: str,
     results: list[Any],
+    *,
+    prefer_institution_id: str | None = None,
 ) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     for item in results:
         if not isinstance(item, dict):
             continue
-        if entity_type == "authors":
-            candidate = normalize_search_author(item)
-        elif entity_type == "works":
-            candidate = normalize_search_work(item)
-        else:
-            candidate = normalize_search_grant(item)
+        if entity_type != "authors":
+            continue
+        candidate = normalize_search_author(
+            item,
+            prefer_institution_id=prefer_institution_id,
+        )
         if candidate is not None:
             normalized.append(candidate)
     return normalized
@@ -525,7 +582,6 @@ async def unified_openalex_search(
     from app.integrations.openalex.grant_search import (
         search_authors_by_grant_number,
         search_publications_for_grant_number,
-        search_works_by_grant_number,
     )
 
     if source and source != "openalex":
@@ -534,9 +590,9 @@ async def unified_openalex_search(
             status_code=422,
         )
 
-    if entity_type not in ENTITY_ENDPOINTS:
+    if entity_type not in {"authors", "grants"}:
         raise OpenAlexApiError(
-            "entity_type must be one of: authors, works, grants.",
+            "entity_type must be one of: authors, grants.",
             status_code=422,
         )
 
@@ -560,7 +616,11 @@ async def unified_openalex_search(
     cleaned_topic = (topic_id or "").strip() or None
 
     if entity_type == "authors":
+        from app.integrations.openalex.client import _short_openalex_id
         from app.integrations.orcid.normalize import normalize_orcid_id
+
+        cleaned_institution = _short_openalex_id(cleaned_institution) or cleaned_institution
+        cleaned_topic = _short_openalex_id(cleaned_topic) or cleaned_topic
 
         orcid_query = normalize_orcid_id(cleaned_query)
         if orcid_query:
@@ -596,12 +656,6 @@ async def unified_openalex_search(
                 "Grant-number search requires at least 3 characters.",
                 status_code=422,
             )
-        if entity_type == "works":
-            return await search_works_by_grant_number(
-                query=cleaned_query,
-                limit=limit,
-                cursor=cursor,
-            )
         return await search_authors_by_grant_number(
             query=cleaned_query,
             limit=limit,
@@ -631,7 +685,9 @@ async def unified_openalex_search(
     if entity_type == "authors" and has_author_filters:
         filter_parts: list[str] = []
         if cleaned_institution:
-            filter_parts.append(f"affiliations.institution.id:{cleaned_institution}")
+            # Match current/last-known institutions (what the UI shows as primary),
+            # not historical affiliations.institution rows.
+            filter_parts.append(f"last_known_institutions.id:{cleaned_institution}")
         if cleaned_topic:
             filter_parts.append(f"topics.id:{cleaned_topic}")
         params["filter"] = ",".join(filter_parts)
@@ -662,7 +718,11 @@ async def unified_openalex_search(
 
     raw_results = payload.get("results")
     results_list = raw_results if isinstance(raw_results, list) else []
-    normalized = _normalize_page(entity_type, results_list)
+    normalized = _normalize_page(
+        entity_type,
+        results_list,
+        prefer_institution_id=cleaned_institution if entity_type == "authors" else None,
+    )
 
     meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
     next_cursor = meta.get("next_cursor")

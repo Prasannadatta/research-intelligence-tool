@@ -254,9 +254,9 @@ Never commit real credentials. `backend/.env` is gitignored.
 
 ## Basic use
 
-1. Choose **Authors**, **Grants**, or **Works / Publications** from the menu.
-2. For authors, **All sources** is selected by default (or choose OpenAlex, ORCID, or arXiv).
-3. Enter a search — author name, ORCID iD, grant number, or publication query.
+1. Choose **Authors** or **Grants** from the menu.
+2. For authors, **All sources** is selected by default (or choose OpenAlex or ORCID).
+3. Enter a search — author name, ORCID iD, or grant number.
 4. Select authors or a grant.
 5. Open publication results or **Analyze authors**.
 6. Use filters, sorting, Insights, and exclusions as needed.

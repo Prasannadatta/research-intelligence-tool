@@ -34,9 +34,6 @@ function getItemKey(item) {
 }
 
 function getHeading(entityType, count) {
-  if (entityType === ENTITY_TYPES.WORKS) {
-    return count === 1 ? "Selected work" : "Selected works";
-  }
   if (entityType === ENTITY_TYPES.GRANTS) {
     return count === 1 ? "Selected publication" : "Selected publications";
   }
@@ -44,9 +41,6 @@ function getHeading(entityType, count) {
 }
 
 function getAnalyzeLabel(entityType, count) {
-  if (entityType === ENTITY_TYPES.WORKS) {
-    return count <= 1 ? "Analyze work" : "Analyze works";
-  }
   if (entityType === ENTITY_TYPES.GRANTS) {
     return count <= 1 ? "Analyze publication" : "Analyze publications";
   }
@@ -366,8 +360,7 @@ function SelectedAuthorsList({
               >
                 {item.result_type === "author_name" ? (
                   <ArxivAuthorNameSelectedRow item={item} />
-                ) : entityType === ENTITY_TYPES.WORKS ||
-                  entityType === ENTITY_TYPES.GRANTS ||
+                ) : entityType === ENTITY_TYPES.GRANTS ||
                   item.result_type === "work" ? (
                   <WorkSelectedRow item={item} />
                 ) : item.result_type === "grant" ? (

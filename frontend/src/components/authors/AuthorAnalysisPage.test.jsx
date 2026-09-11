@@ -384,12 +384,35 @@ describe("AuthorAnalysisPage", () => {
     renderPage();
     await waitFor(() => expect(screen.getByText("Paper")).toBeInTheDocument());
     expect(
-      await screen.findByText(
+      await screen.findAllByText(
         /Complete publication statistics are unavailable because coverage sync did not finish/i,
       ),
-    ).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    ).not.toHaveLength(0);
+    expect(screen.getAllByRole("button", { name: "Retry" }).length).toBeGreaterThan(0);
     expect(screen.queryByText(/Based on the first/i)).not.toBeInTheDocument();
+  });
+
+  it("shows a rate-limit warning without labeling stats complete", async () => {
+    const rateLimitError = new Error(
+      "OpenAlex rate limit reached. Your existing data is safe; please try again shortly.",
+    );
+    rateLimitError.statsJob = {
+      status: "failed",
+      progress_detail: { rate_limited: true, provider: "openalex", corpus_complete: false },
+    };
+    publicationStatsRequest.fetchAuthorPublicationCorpusStats.mockRejectedValue(
+      rateLimitError,
+    );
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText("Paper")).toBeInTheDocument());
+    expect(
+      await screen.findByTestId("publication-stats-error-snackbar"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getAllByText(/OpenAlex rate limit reached\. Your existing data is safe/i).length,
+    ).toBeGreaterThan(0);
+    expect(screen.queryByTestId("publication-stats-ready-snackbar")).not.toBeInTheDocument();
   });
 
   it("does not refetch timeline when loading additional table pages", async () => {

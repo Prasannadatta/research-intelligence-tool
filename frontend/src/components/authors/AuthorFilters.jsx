@@ -6,6 +6,7 @@ import {
   Chip,
   CircularProgress,
   Collapse,
+  Fade,
   TextField,
   Typography,
 } from "@mui/material";
@@ -16,6 +17,21 @@ import { searchInstitutions, searchTopics } from "../../api/searchApi";
 
 const FILTER_DEBOUNCE_MS = 400;
 const MIN_FILTER_QUERY_LENGTH = 2;
+
+const chipSx = {
+  maxWidth: "100%",
+  bgcolor: "action.selected",
+  borderColor: "divider",
+  transition: "background-color 140ms ease, box-shadow 140ms ease",
+  "& .MuiChip-label": {
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+  },
+  "& .MuiChip-deleteIcon": {
+    color: "text.secondary",
+    "&:hover": { color: "text.primary" },
+  },
+};
 
 function useDebouncedLookup(lookupFn) {
   const [inputValue, setInputValue] = useState("");
@@ -110,6 +126,20 @@ function FilterAutocomplete({
       filterOptions={(x) => x}
       getOptionLabel={(option) => option?.display_name || ""}
       isOptionEqualToValue={(option, selected) => option?.id === selected?.id}
+      slotProps={{
+        paper: {
+          sx: {
+            mt: 0.5,
+            borderRadius: 2,
+            border: "1px solid",
+            borderColor: "divider",
+            boxShadow: (theme) =>
+              theme.palette.mode === "dark"
+                ? "0 8px 20px rgba(0,0,0,0.28)"
+                : "0 8px 20px rgba(15,23,42,0.08)",
+          },
+        },
+      }}
       onInputChange={(_event, next, reason) => {
         if (reason === "reset") {
           return;
@@ -122,11 +152,21 @@ function FilterAutocomplete({
           lookupState.reset();
         }
       }}
+      noOptionsText={
+        lookupState.inputValue.trim().length < MIN_FILTER_QUERY_LENGTH
+          ? "Type at least 2 characters"
+          : lookupState.loading
+            ? "Searching…"
+            : "No matches"
+      }
       renderOption={(props, option) => {
         const { key, ...optionProps } = props;
-        const meta = [option.country_code || option.type, option.works_count != null
-          ? `${Number(option.works_count).toLocaleString()} works`
-          : null]
+        const meta = [
+          option.country_code || option.type,
+          option.works_count != null
+            ? `${Number(option.works_count).toLocaleString()} works`
+            : null,
+        ]
           .filter(Boolean)
           .join(" · ");
 
@@ -158,22 +198,25 @@ function FilterAutocomplete({
         );
       }}
       renderInput={(params) => {
-        const inputProps = params.InputProps ?? params.slotProps?.input ?? {};
+        const inputSlot = params.slotProps?.input ?? {};
         return (
           <TextField
             {...params}
             label={label}
             placeholder={placeholder}
-            InputProps={{
-              ...inputProps,
-              endAdornment: (
-                <>
-                  {lookupState.loading ? (
-                    <CircularProgress color="inherit" size={14} />
-                  ) : null}
-                  {inputProps.endAdornment}
-                </>
-              ),
+            slotProps={{
+              ...params.slotProps,
+              input: {
+                ...inputSlot,
+                endAdornment: (
+                  <>
+                    {lookupState.loading ? (
+                      <CircularProgress color="inherit" size={14} />
+                    ) : null}
+                    {inputSlot.endAdornment}
+                  </>
+                ),
+              },
             }}
           />
         );
@@ -191,12 +234,24 @@ function AuthorFilters({
   const [filtersOpen, setFiltersOpen] = useState(false);
   const institutionLookup = useDebouncedLookup(searchInstitutions);
   const topicLookup = useDebouncedLookup(searchTopics);
+  const hasAnyFilter = Boolean(institution || topic);
+  const missingFilterSlots = !institution || !topic;
+  const activeCount = Number(Boolean(institution)) + Number(Boolean(topic));
 
   useEffect(() => {
     if (institution && topic) {
       setFiltersOpen(false);
     }
   }, [institution, topic]);
+
+  const clearAll = () => {
+    if (institution) {
+      onInstitutionChange(null);
+    }
+    if (topic) {
+      onTopicChange(null);
+    }
+  };
 
   return (
     <Box sx={{ mt: 1, textAlign: "left" }}>
@@ -206,55 +261,72 @@ function AuthorFilters({
           flexWrap: "wrap",
           alignItems: "center",
           gap: 0.75,
-          minHeight: 28,
+          minHeight: 32,
         }}
       >
-        {institution ? (
+        <Fade in={Boolean(institution)} unmountOnExit>
           <Chip
             size="small"
-            label={`Institution: ${institution.display_name}`}
+            variant="outlined"
+            color="primary"
+            label={`Institution: ${institution?.display_name || ""}`}
             onDelete={() => onInstitutionChange(null)}
             deleteIcon={<CloseRoundedIcon sx={{ fontSize: "14px !important" }} />}
-            sx={{
-              maxWidth: "100%",
-              bgcolor: "action.hover",
-              "& .MuiChip-label": {
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-              },
-            }}
+            sx={chipSx}
           />
-        ) : null}
+        </Fade>
 
-        {topic ? (
+        <Fade in={Boolean(topic)} unmountOnExit>
           <Chip
             size="small"
-            label={`Research: ${topic.display_name}`}
+            variant="outlined"
+            color="primary"
+            label={`Research: ${topic?.display_name || ""}`}
             onDelete={() => onTopicChange(null)}
             deleteIcon={<CloseRoundedIcon sx={{ fontSize: "14px !important" }} />}
-            sx={{
-              maxWidth: "100%",
-              bgcolor: "action.hover",
-              "& .MuiChip-label": {
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-              },
-            }}
+            sx={chipSx}
           />
-        ) : null}
+        </Fade>
 
-        {(!institution || !topic) && (
+        {missingFilterSlots ? (
           <Button
             size="small"
             color="inherit"
             startIcon={<FilterListRoundedIcon sx={{ fontSize: 16 }} />}
             onClick={() => setFiltersOpen((open) => !open)}
+            aria-expanded={filtersOpen}
+            sx={{
+              textTransform: "none",
+              color: filtersOpen || hasAnyFilter ? "text.primary" : "text.secondary",
+              fontWeight: 600,
+              minWidth: 0,
+              px: 1,
+              py: 0.25,
+              borderRadius: 999,
+              bgcolor: filtersOpen ? "action.hover" : "transparent",
+              transition: "background-color 140ms ease, color 140ms ease",
+              "&:hover": {
+                bgcolor: "action.hover",
+                color: "text.primary",
+              },
+            }}
+          >
+            {filtersOpen ? "Hide filters" : hasAnyFilter ? "Add filter" : "Filters"}
+            {!filtersOpen && activeCount > 0 ? ` (${activeCount})` : ""}
+          </Button>
+        ) : null}
+
+        <Fade in={hasAnyFilter} unmountOnExit>
+          <Button
+            size="small"
+            color="inherit"
+            onClick={clearAll}
             sx={{
               textTransform: "none",
               color: "text.secondary",
               fontWeight: 500,
               minWidth: 0,
-              px: 1,
+              px: 0.75,
               py: 0.25,
               borderRadius: 999,
               "&:hover": {
@@ -263,20 +335,32 @@ function AuthorFilters({
               },
             }}
           >
-            {filtersOpen ? "Hide filters" : "Filters"}
+            Clear
           </Button>
-        )}
+        </Fade>
       </Box>
 
-      <Collapse in={filtersOpen && (!institution || !topic)} unmountOnExit>
+      <Collapse in={filtersOpen && missingFilterSlots} timeout={160} unmountOnExit>
         <Box
           sx={{
             mt: 1,
+            p: 1.25,
+            borderRadius: 2,
+            border: "1px solid",
+            borderColor: "divider",
+            bgcolor: "action.hover",
             display: "grid",
             gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" },
             gap: 1,
           }}
         >
+          <Typography
+            variant="caption"
+            color="text.secondary"
+            sx={{ gridColumn: "1 / -1", mb: 0.25 }}
+          >
+            Narrow OpenAlex authors by institution or research area.
+          </Typography>
           {!institution ? (
             <FilterAutocomplete
               label="Institution"

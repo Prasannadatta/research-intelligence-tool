@@ -702,7 +702,7 @@ function AuthorAnalysisPage() {
         );
         setCorpusComplete(Boolean(result.corpus_complete));
         setStatsError(null);
-        setStatsReadySnackbarOpen(true);
+        setStatsReadySnackbarOpen(Boolean(result.corpus_complete));
       })
       .catch((err) => {
         if (
@@ -717,8 +717,7 @@ function AuthorAnalysisPage() {
         setFacets(emptyFacets());
         setCorpusTotalCount(null);
         setStatsError(
-          err?.message ||
-            "Complete publication statistics are temporarily unavailable.",
+          publicationStatsRequest.formatPublicationStatsErrorMessage(err),
         );
       })
       .finally(() => {
@@ -1265,6 +1264,32 @@ function AuthorAnalysisPage() {
             onClose={() => setStatsReadySnackbarOpen(false)}
           >
             Complete publication statistics ready
+          </Alert>
+        </Snackbar>
+
+        <Snackbar
+          open={Boolean(statsError)}
+          anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
+          data-testid="publication-stats-error-snackbar"
+          onClose={() => setStatsError(null)}
+        >
+          <Alert
+            severity={/rate limit/i.test(String(statsError || "")) ? "warning" : "error"}
+            variant="filled"
+            onClose={() => setStatsError(null)}
+            action={
+              <Button
+                color="inherit"
+                size="small"
+                onClick={() => {
+                  setStatsRetryToken((value) => value + 1);
+                }}
+              >
+                Retry
+              </Button>
+            }
+          >
+            {statsError}
           </Alert>
         </Snackbar>
 

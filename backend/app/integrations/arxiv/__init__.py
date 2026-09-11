@@ -7,7 +7,6 @@ from app.integrations.arxiv.client import (
     search_arxiv_authors,
     search_arxiv_grants,
     search_arxiv_publications_by_authors,
-    search_arxiv_works,
     validate_arxiv_cursor,
 )
 from app.integrations.arxiv.parser import (
@@ -26,6 +25,5 @@ __all__ = [
     "search_arxiv_authors",
     "search_arxiv_grants",
     "search_arxiv_publications_by_authors",
-    "search_arxiv_works",
     "validate_arxiv_cursor",
 ]

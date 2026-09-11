@@ -14,6 +14,7 @@ import {
   Avatar,
   Box,
   CircularProgress,
+  ClickAwayListener,
   IconButton,
   InputBase,
   MenuItem,
@@ -33,8 +34,13 @@ import {
   minQueryLengthForEntity,
   normalizeSearchQuery,
   resolveCompatibleSource,
+  sourceUsesOpenAlexAuthorFilters,
   unifiedSearch,
 } from "../../api/searchApi";
+import {
+  isAuthorAlreadySelected,
+  selectedAuthorIdentityKeySet,
+} from "../../api/authorSearchIdentity";
 import {
   GRANT_SUGGESTION_LIMIT,
   buildGrantPublicationsPath,
@@ -54,14 +60,8 @@ const SEARCH_ERROR_MESSAGE =
   "Search is temporarily unavailable. Please try again.";
 const ARXIV_SEARCH_ERROR_MESSAGE =
   "arXiv search is temporarily unavailable. Please try again.";
-const ARXIV_WORKS_NO_RESULTS_MESSAGE =
-  "No matching arXiv papers were found.";
-const ARXIV_AUTHORS_NO_RESULTS_MESSAGE =
-  "No matching author names were found in arXiv paper metadata.";
 const AUTHOR_MIN_CHARS_MESSAGE =
   "Enter at least 3 characters of an author’s name.";
-const FILTERS_STALE_MESSAGE =
-  "Search again to apply updated filters.";
 
 const clampOneLine = {
   overflow: "hidden",
@@ -78,6 +78,18 @@ const clampTwoLines = {
 
 /** Session-scoped page cache. Key includes cursor. Not persisted. */
 const searchPageCache = new Map();
+const SEARCH_PAGE_CACHE_MAX = 40;
+
+function setSearchPageCache(key, payload) {
+  if (searchPageCache.has(key)) {
+    searchPageCache.delete(key);
+  }
+  searchPageCache.set(key, payload);
+  while (searchPageCache.size > SEARCH_PAGE_CACHE_MAX) {
+    const oldest = searchPageCache.keys().next().value;
+    searchPageCache.delete(oldest);
+  }
+}
 
 function getInitials(name = "") {
   return String(name)
@@ -116,49 +128,6 @@ function getPrimaryLabel(item) {
   return item.display_name || item.title || "";
 }
 
-function mergeAuthorResolutionOptions(existing, payload, selectedIds) {
-  const selected = new Set((selectedIds || []).filter(Boolean));
-  const byId = new Map();
-  const order = [];
-
-  for (const item of existing || []) {
-    const id = getResultKey(item);
-    if (!id) {
-      continue;
-    }
-    byId.set(id, item);
-    order.push(id);
-  }
-
-  for (const update of payload.updates || []) {
-    const author = update?.author;
-    const id = update?.canonical_author_id || getResultKey(author);
-    if (!id || !author || !byId.has(id)) {
-      continue;
-    }
-    byId.set(id, author);
-  }
-
-  const insertAuthors = Array.isArray(payload.items) && payload.items.length > 0
-    ? payload.items
-        .filter((entry) => entry?.operation === "insert" && entry.author)
-        .map((entry) => entry.author)
-    : Array.isArray(payload.results)
-      ? payload.results
-      : [];
-
-  for (const author of insertAuthors) {
-    const id = getResultKey(author);
-    if (!id || selected.has(id) || byId.has(id)) {
-      continue;
-    }
-    byId.set(id, author);
-    order.push(id);
-  }
-
-  return order.map((id) => byId.get(id)).filter(Boolean);
-}
-
 function appendUniqueByResultId(existing, incoming) {
   const seen = new Set(existing.map(getResultKey).filter(Boolean));
   const merged = [...existing];
@@ -191,6 +160,7 @@ function AuthorResultsPaper({ children, ...other }, ref) {
           theme.palette.mode === "dark"
             ? "0 10px 28px rgba(0,0,0,0.32)"
             : "0 10px 28px rgba(15,23,42,0.08)",
+        transition: "opacity 140ms ease, box-shadow 140ms ease",
       }}
     >
       {children}
@@ -268,7 +238,7 @@ const SearchListbox = memo(
         }}
         sx={{
           maxHeight: 320,
-          py: 0.75,
+          py: 0.5,
           px: 0.5,
           m: 0,
           listStyle: "none",
@@ -279,11 +249,11 @@ const SearchListbox = memo(
           contain: "layout paint",
           bgcolor: "background.paper",
           animation: playEntranceFade
-            ? "searchResultsFadeIn 140ms ease"
+            ? "searchResultsFadeIn 160ms ease"
             : "none",
           "@keyframes searchResultsFadeIn": {
-            from: { opacity: 0 },
-            to: { opacity: 1 },
+            from: { opacity: 0, transform: "translateY(-2px)" },
+            to: { opacity: 1, transform: "translateY(0)" },
           },
         }}
       >
@@ -348,6 +318,15 @@ const AuthorResultRow = memo(function AuthorResultRow({
     .filter(Boolean)
     .join(" · ");
 
+  const sourceLabel =
+    option.source === "orcid"
+      ? "ORCID"
+      : option.source === "openalex"
+        ? "OpenAlex"
+        : option.source
+          ? String(option.source)
+          : null;
+
   const grantLine =
     option.match_reason === "grant_number" &&
     option.matching_funded_works_count != null
@@ -365,18 +344,17 @@ const AuthorResultRow = memo(function AuthorResultRow({
       sx={{
         display: "flex",
         alignItems: "flex-start",
-        gap: 1.5,
-        minHeight: 84,
+        gap: 1.25,
       }}
     >
       <Avatar
         alt=""
         aria-hidden
         sx={{
-          width: 38,
-          height: 38,
+          width: 34,
+          height: 34,
           mt: 0.15,
-          fontSize: "0.85rem",
+          fontSize: "0.8rem",
           fontWeight: 600,
           bgcolor: "action.selected",
           color: "text.primary",
@@ -386,19 +364,37 @@ const AuthorResultRow = memo(function AuthorResultRow({
         {getInitials(option.display_name)}
       </Avatar>
       <Box sx={{ minWidth: 0, textAlign: "left", flex: 1 }}>
-        <Typography
-          variant="body1"
-          fontWeight={600}
-          sx={{ lineHeight: 1.35, ...clampOneLine }}
-        >
-          {option.display_name}
-        </Typography>
+        <Box sx={{ display: "flex", alignItems: "center", gap: 0.75, minWidth: 0 }}>
+          <Typography
+            variant="body1"
+            fontWeight={600}
+            sx={{ lineHeight: 1.35, flex: 1, minWidth: 0, ...clampOneLine }}
+          >
+            {option.display_name}
+          </Typography>
+          {sourceLabel ? (
+            <Typography
+              variant="caption"
+              sx={{
+                flexShrink: 0,
+                px: 0.6,
+                py: 0.1,
+                borderRadius: 1,
+                bgcolor: "action.hover",
+                color: "text.secondary",
+                fontWeight: 600,
+                letterSpacing: 0.01,
+              }}
+            >
+              {sourceLabel}
+            </Typography>
+          ) : null}
+        </Box>
         <Typography
           variant="body2"
           sx={{
             lineHeight: 1.4,
             mt: 0.15,
-            minHeight: 20,
             fontWeight: institutionMatched ? 600 : 400,
             color: institutionMatched ? "text.primary" : "text.secondary",
             ...clampOneLine,
@@ -406,36 +402,40 @@ const AuthorResultRow = memo(function AuthorResultRow({
         >
           {institutionName}
         </Typography>
-        <Typography
-          variant="caption"
-          color="text.secondary"
-          sx={{ display: "block", lineHeight: 1.4, mt: 0.15, minHeight: 18, ...clampOneLine }}
-        >
-          {topicNames.map((name, index) => {
-            const topic = topics.find((item) => item?.name === name);
-            const emphasize = matchedTopicId && topic?.id === matchedTopicId;
-            return (
-              <Box
-                component="span"
-                key={`${option.result_id}-topic-${name}`}
-                sx={{
-                  fontWeight: emphasize ? 600 : 400,
-                  color: emphasize ? "text.primary" : "inherit",
-                }}
-              >
-                {index > 0 ? " · " : ""}
-                {name}
-              </Box>
-            );
-          })}
-        </Typography>
-        <Typography
-          variant="caption"
-          color="text.secondary"
-          sx={{ display: "block", lineHeight: 1.4, mt: 0.15, minHeight: 18, ...clampOneLine }}
-        >
-          {meta}
-        </Typography>
+        {topicNames.length > 0 ? (
+          <Typography
+            variant="caption"
+            color="text.secondary"
+            sx={{ display: "block", lineHeight: 1.4, mt: 0.15, ...clampOneLine }}
+          >
+            {topicNames.map((name, index) => {
+              const topic = topics.find((item) => item?.name === name);
+              const emphasize = matchedTopicId && topic?.id === matchedTopicId;
+              return (
+                <Box
+                  component="span"
+                  key={`${option.result_id}-topic-${name}`}
+                  sx={{
+                    fontWeight: emphasize ? 600 : 400,
+                    color: emphasize ? "text.primary" : "inherit",
+                  }}
+                >
+                  {index > 0 ? " · " : ""}
+                  {name}
+                </Box>
+              );
+            })}
+          </Typography>
+        ) : null}
+        {meta ? (
+          <Typography
+            variant="caption"
+            color="text.secondary"
+            sx={{ display: "block", lineHeight: 1.4, mt: 0.15, ...clampOneLine }}
+          >
+            {meta}
+          </Typography>
+        ) : null}
         {option.identity_resolution?.status === "merged" ? (
           <Typography
             variant="caption"
@@ -448,13 +448,15 @@ const AuthorResultRow = memo(function AuthorResultRow({
               : ""}
           </Typography>
         ) : null}
-        <Typography
-          variant="caption"
-          color="text.disabled"
-          sx={{ display: "block", lineHeight: 1.35, mt: 0.1, minHeight: 16, ...clampOneLine }}
-        >
-          {grantLine}
-        </Typography>
+        {grantLine ? (
+          <Typography
+            variant="caption"
+            color="text.disabled"
+            sx={{ display: "block", lineHeight: 1.35, mt: 0.1, ...clampOneLine }}
+          >
+            {grantLine}
+          </Typography>
+        ) : null}
       </Box>
     </Box>
   );
@@ -618,6 +620,7 @@ function AuthorSearch({
   onEntityTypeChange,
   onResultSelected,
   selectedResultIds = [],
+  selectedAuthors = [],
 }) {
   const navigate = useNavigate();
   const [inputValue, setInputValue] = useState("");
@@ -635,7 +638,6 @@ function AuthorSearch({
   const [topicFilter, setTopicFilter] = useState(null);
   // Committed values actually used for GET /api/search (authors).
   const [committedSearch, setCommittedSearch] = useState(null);
-  const [resultsAreStale, setResultsAreStale] = useState(false);
   const [validationMessage, setValidationMessage] = useState(null);
   const [capabilities, setCapabilities] = useState(FALLBACK_CAPABILITIES);
   const [source, setSource] = useState(SEARCH_SOURCES.ALL);
@@ -646,6 +648,7 @@ function AuthorSearch({
   const loadingMoreRef = useRef(false);
   const loadedCursorsRef = useRef(new Set());
   const selectedIdsRef = useRef(selectedResultIds);
+  const selectedAuthorsRef = useRef(selectedAuthors);
   const entityTypeRef = useRef(entityType);
   const sourceRef = useRef(source);
   const nextCursorRef = useRef(null);
@@ -653,13 +656,32 @@ function AuthorSearch({
   const searchSessionIdRef = useRef(null);
   const normalizedQueryRef = useRef("");
   const committedSearchRef = useRef(null);
-  const resultsAreStaleRef = useRef(false);
   const debounceTimeoutRef = useRef(null);
   const institutionFilterRef = useRef(null);
   const topicFilterRef = useRef(null);
   const optionsRef = useRef([]);
+  // When the user dismisses the dropdown (outside click / Escape), do not reopen
+  // it when an in-flight search resolves.
+  const suppressOpenRef = useRef(false);
+
+  const openDropdown = useCallback(() => {
+    if (suppressOpenRef.current) {
+      return;
+    }
+    setOpen(true);
+  }, []);
+
+  const closeDropdown = useCallback(() => {
+    suppressOpenRef.current = true;
+    setOpen(false);
+  }, []);
+
+  const allowDropdownOpen = useCallback(() => {
+    suppressOpenRef.current = false;
+  }, []);
 
   selectedIdsRef.current = selectedResultIds;
+  selectedAuthorsRef.current = selectedAuthors;
   entityTypeRef.current = entityType;
   sourceRef.current = source;
   nextCursorRef.current = nextCursor;
@@ -667,7 +689,6 @@ function AuthorSearch({
   searchSessionIdRef.current = searchSessionId;
   loadingMoreRef.current = loadingMore;
   committedSearchRef.current = committedSearch;
-  resultsAreStaleRef.current = resultsAreStale;
   institutionFilterRef.current = institutionFilter;
   topicFilterRef.current = topicFilter;
   optionsRef.current = options;
@@ -676,12 +697,11 @@ function AuthorSearch({
   normalizedQueryRef.current = normalizedQuery;
   const isAuthors = entityType === ENTITY_TYPES.AUTHORS;
   const isGrants = entityType === ENTITY_TYPES.GRANTS;
-  const isOpenAlex = source === SEARCH_SOURCES.OPENALEX;
-  const usesAuthorFilters =
-    isOpenAlex || source === SEARCH_SOURCES.ALL;
+  const usesAuthorFilters = sourceUsesOpenAlexAuthorFilters(source);
   const isArxiv = source === SEARCH_SOURCES.ARXIV;
   const minQueryLength = minQueryLengthForEntity(entityType);
   const canSearch = normalizedQuery.length >= minQueryLength;
+  // Institution/topic filters are OpenAlex-only; hide for ORCID-only source.
   const showAuthorFilters = isAuthors && usesAuthorFilters;
 
 
@@ -690,10 +710,19 @@ function AuthorSearch({
     [selectedResultIds],
   );
 
-  const availableOptions = useMemo(
-    () => options.filter((item) => !selectedIdSet.has(getResultKey(item))),
-    [options, selectedIdSet],
+  const selectedAuthorKeys = useMemo(
+    () => selectedAuthorIdentityKeySet(selectedAuthors),
+    [selectedAuthors],
   );
+
+  const availableOptions = useMemo(() => {
+    if (isAuthors) {
+      return options.filter(
+        (item) => !isAuthorAlreadySelected(item, selectedAuthorKeys),
+      );
+    }
+    return options.filter((item) => !selectedIdSet.has(getResultKey(item)));
+  }, [isAuthors, options, selectedAuthorKeys, selectedIdSet]);
 
   const cancelActiveRequest = useCallback(() => {
     requestIdRef.current += 1;
@@ -718,37 +747,23 @@ function AuthorSearch({
     setPlayEntranceFade(false);
     loadedCursorsRef.current = new Set();
     setCommittedSearch(null);
-    setResultsAreStale(false);
     setValidationMessage(null);
   }, []);
 
-  const markAuthorResultsStale = useCallback(() => {
-    // Keep existing rows visible, but stop pagination until a new committed search.
-    setResultsAreStale(true);
-    setNextCursor(null);
-    setHasMore(false);
-    setSearchSessionId(null);
-    loadedCursorsRef.current = new Set();
-  }, []);
-
   const applyPagePayload = useCallback(
-    ({ payload, append, requestCursor, isFirstPage, entityType: pageEntity }) => {
-      const isAuthorsPage = pageEntity === ENTITY_TYPES.AUTHORS;
-
+    ({ payload, append, requestCursor, isFirstPage }) => {
       setOptions((current) => {
-        if (isAuthorsPage) {
-          const base = append ? current : [];
-          return mergeAuthorResolutionOptions(
-            base,
-            payload,
-            selectedIdsRef.current,
-          );
-        }
-
         const pageResults = Array.isArray(payload.results) ? payload.results : [];
-        const filtered = pageResults.filter(
-          (item) => !selectedIdsRef.current.includes(getResultKey(item)),
+        const selectedKeys = selectedAuthorIdentityKeySet(selectedAuthorsRef.current);
+        const selectedIds = new Set(
+          (selectedIdsRef.current || []).filter(Boolean),
         );
+        const filtered = pageResults.filter((item) => {
+          if (item?.result_type === "author" || item?.openalex_id || item?.orcid) {
+            return !isAuthorAlreadySelected(item, selectedKeys);
+          }
+          return !selectedIds.has(getResultKey(item));
+        });
         return append ? appendUniqueByResultId(current, filtered) : filtered;
       });
       setNextCursor(payload.next_cursor ?? null);
@@ -777,7 +792,6 @@ function AuthorSearch({
       isFirstPage,
       institutionId = "",
       topicId = "",
-      knownAuthorIds = [],
       searchSessionId: requestSessionId,
     }) => {
       const requestCursor = cursor == null || cursor === "" ? "*" : cursor;
@@ -803,8 +817,10 @@ function AuthorSearch({
           append,
           requestCursor,
           isFirstPage: Boolean(isFirstPage && !append),
-          entityType: type,
         });
+        if (!append) {
+          openDropdown();
+        }
         setInitialLoading(false);
         setLoadingMore(false);
         loadingMoreRef.current = false;
@@ -835,21 +851,17 @@ function AuthorSearch({
           limit: PAGE_SIZE,
           cursor: requestCursor,
           institutionId:
-            (requestSource === SEARCH_SOURCES.OPENALEX ||
-              requestSource === SEARCH_SOURCES.ALL) &&
+            sourceUsesOpenAlexAuthorFilters(requestSource) &&
             type === ENTITY_TYPES.AUTHORS
               ? institutionId
               : "",
           topicId:
-            (requestSource === SEARCH_SOURCES.OPENALEX ||
-              requestSource === SEARCH_SOURCES.ALL) &&
+            sourceUsesOpenAlexAuthorFilters(requestSource) &&
             type === ENTITY_TYPES.AUTHORS
               ? topicId
               : "",
-          knownAuthorIds:
-            type === ENTITY_TYPES.AUTHORS ? knownAuthorIds : [],
           searchSessionId:
-            type === ENTITY_TYPES.WORKS || type === ENTITY_TYPES.GRANTS
+            type === ENTITY_TYPES.GRANTS
               ? requestSessionId || undefined
               : undefined,
           signal: controller.signal,
@@ -859,15 +871,16 @@ function AuthorSearch({
           return;
         }
 
-        searchPageCache.set(cacheKey, payload);
+        setSearchPageCache(cacheKey, payload);
         applyPagePayload({
           payload,
           append,
           requestCursor,
           isFirstPage: Boolean(isFirstPage && !append),
-          entityType: type,
         });
-        setOpen(true);
+        if (!append) {
+          openDropdown();
+        }
       } catch (err) {
         if (
           requestId !== requestIdRef.current ||
@@ -882,7 +895,7 @@ function AuthorSearch({
           setNextCursor(null);
           setHasMore(false);
           setSearchSessionId(null);
-          setOpen(false);
+          closeDropdown();
         }
         setHasSearched(true);
         setError(
@@ -899,7 +912,7 @@ function AuthorSearch({
         }
       }
     },
-    [applyPagePayload],
+    [applyPagePayload, closeDropdown, openDropdown],
   );
 
   const startFirstPageSearch = useCallback(
@@ -915,7 +928,6 @@ function AuthorSearch({
       setNextCursor(null);
       setHasMore(false);
       setSearchSessionId(null);
-      setResultsAreStale(false);
       setValidationMessage(null);
       setError(null);
 
@@ -923,14 +935,12 @@ function AuthorSearch({
         query,
         source: requestSource,
         institutionId:
-          (requestSource === SEARCH_SOURCES.OPENALEX ||
-            requestSource === SEARCH_SOURCES.ALL) &&
+          sourceUsesOpenAlexAuthorFilters(requestSource) &&
           type === ENTITY_TYPES.AUTHORS
             ? institutionId || ""
             : "",
         topicId:
-          (requestSource === SEARCH_SOURCES.OPENALEX ||
-            requestSource === SEARCH_SOURCES.ALL) &&
+          sourceUsesOpenAlexAuthorFilters(requestSource) &&
           type === ENTITY_TYPES.AUTHORS
             ? topicId || ""
             : "",
@@ -939,7 +949,8 @@ function AuthorSearch({
       committedSearchRef.current = committed;
 
       const requestId = ++requestIdRef.current;
-      setOpen(true);
+      allowDropdownOpen();
+      openDropdown();
       fetchPage({
         query,
         type,
@@ -950,11 +961,10 @@ function AuthorSearch({
         isFirstPage: true,
         institutionId: committed.institutionId,
         topicId: committed.topicId,
-        knownAuthorIds: [],
         searchSessionId: null,
       });
     },
-    [cancelActiveRequest, fetchPage],
+    [allowDropdownOpen, cancelActiveRequest, fetchPage, openDropdown],
   );
 
   useEffect(() => {
@@ -976,7 +986,7 @@ function AuthorSearch({
   useEffect(() => {
     if (
       entityType !== ENTITY_TYPES.AUTHORS ||
-      (source !== SEARCH_SOURCES.OPENALEX && source !== SEARCH_SOURCES.ALL)
+      !sourceUsesOpenAlexAuthorFilters(source)
     ) {
       setInstitutionFilter(null);
       setTopicFilter(null);
@@ -1002,7 +1012,7 @@ function AuthorSearch({
 
     if (normalizedQuery.length < minQueryLength) {
       resetResultsState();
-      setOpen(false);
+      closeDropdown();
       return undefined;
     }
 
@@ -1026,7 +1036,8 @@ function AuthorSearch({
         setHasSearched(true);
         setHasMore(false);
         setNextCursor(null);
-        setOpen(true);
+        allowDropdownOpen();
+        openDropdown();
 
         fetchGrantSuggestions({
           q: normalizedQuery,
@@ -1072,14 +1083,12 @@ function AuthorSearch({
       }
 
       const institutionId =
-        (requestSource === SEARCH_SOURCES.OPENALEX ||
-          requestSource === SEARCH_SOURCES.ALL) &&
+        sourceUsesOpenAlexAuthorFilters(requestSource) &&
         type === ENTITY_TYPES.AUTHORS
           ? institutionFilterRef.current?.id || ""
           : "";
       const topicId =
-        (requestSource === SEARCH_SOURCES.OPENALEX ||
-          requestSource === SEARCH_SOURCES.ALL) &&
+        sourceUsesOpenAlexAuthorFilters(requestSource) &&
         type === ENTITY_TYPES.AUTHORS
           ? topicFilterRef.current?.id || ""
           : "";
@@ -1103,14 +1112,16 @@ function AuthorSearch({
     entityType,
     source,
     minQueryLength,
+    allowDropdownOpen,
     cancelActiveRequest,
+    closeDropdown,
+    openDropdown,
     resetResultsState,
     startFirstPageSearch,
   ]);
 
   const loadMore = useCallback(() => {
     if (
-      resultsAreStaleRef.current ||
       !hasMoreRef.current ||
       activeRequestRef.current ||
       loadingMoreRef.current
@@ -1138,7 +1149,6 @@ function AuthorSearch({
       isFirstPage: false,
       institutionId: committed.institutionId || "",
       topicId: committed.topicId || "",
-      knownAuthorIds: optionsRef.current.map(getResultKey).filter(Boolean),
       searchSessionId: searchSessionIdRef.current,
     });
   }, [fetchPage]);
@@ -1156,8 +1166,8 @@ function AuthorSearch({
     cancelActiveRequest();
     setInputValue("");
     resetResultsState();
-    setOpen(false);
-  }, [cancelActiveRequest, resetResultsState]);
+    closeDropdown();
+  }, [cancelActiveRequest, closeDropdown, resetResultsState]);
 
   const openGrant = useCallback(
     (grant) => {
@@ -1175,10 +1185,10 @@ function AuthorSearch({
       cancelActiveRequest();
       setInputValue("");
       resetResultsState();
-      setOpen(false);
+      closeDropdown();
       navigate(path);
     },
-    [cancelActiveRequest, navigate, resetResultsState, source],
+    [cancelActiveRequest, closeDropdown, navigate, resetResultsState, source],
   );
 
   const handleEntityTypeChange = useCallback(
@@ -1186,7 +1196,7 @@ function AuthorSearch({
       const nextType = event.target.value;
       cancelActiveRequest();
       resetResultsState();
-      setOpen(false);
+      closeDropdown();
       if (nextType !== ENTITY_TYPES.AUTHORS) {
         setInstitutionFilter(null);
         setTopicFilter(null);
@@ -1200,6 +1210,7 @@ function AuthorSearch({
     [
       cancelActiveRequest,
       capabilities,
+      closeDropdown,
       onEntityTypeChange,
       resetResultsState,
       source,
@@ -1213,31 +1224,71 @@ function AuthorSearch({
       }
       cancelActiveRequest();
       resetResultsState();
-      setOpen(false);
+      closeDropdown();
       setSource(nextSource);
       // Debounce effect re-runs on source change and searches if query is valid.
     },
-    [cancelActiveRequest, resetResultsState, source],
+    [cancelActiveRequest, closeDropdown, resetResultsState, source],
   );
 
   const handleInstitutionChange = useCallback(
     (next) => {
       setInstitutionFilter(next);
-      if (hasSearched || availableOptions.length > 0 || committedSearch) {
-        markAuthorResultsStale();
+      if (
+        !isAuthors ||
+        !usesAuthorFilters ||
+        normalizedQuery.length < minQueryLength
+      ) {
+        return;
       }
+      startFirstPageSearch({
+        query: normalizedQuery,
+        type: entityType,
+        source,
+        institutionId: next?.id || "",
+        topicId: topicFilter?.id || "",
+      });
     },
-    [availableOptions.length, committedSearch, hasSearched, markAuthorResultsStale],
+    [
+      entityType,
+      isAuthors,
+      minQueryLength,
+      normalizedQuery,
+      source,
+      startFirstPageSearch,
+      topicFilter?.id,
+      usesAuthorFilters,
+    ],
   );
 
   const handleTopicChange = useCallback(
     (next) => {
       setTopicFilter(next);
-      if (hasSearched || availableOptions.length > 0 || committedSearch) {
-        markAuthorResultsStale();
+      if (
+        !isAuthors ||
+        !usesAuthorFilters ||
+        normalizedQuery.length < minQueryLength
+      ) {
+        return;
       }
+      startFirstPageSearch({
+        query: normalizedQuery,
+        type: entityType,
+        source,
+        institutionId: institutionFilter?.id || "",
+        topicId: next?.id || "",
+      });
     },
-    [availableOptions.length, committedSearch, hasSearched, markAuthorResultsStale],
+    [
+      entityType,
+      institutionFilter?.id,
+      isAuthors,
+      minQueryLength,
+      normalizedQuery,
+      source,
+      startFirstPageSearch,
+      usesAuthorFilters,
+    ],
   );
 
   const handleExplicitSearch = useCallback(() => {
@@ -1313,21 +1364,19 @@ function AuthorSearch({
 
   const listboxSlotProps = useMemo(
     () => ({
-      loadingMore: isGrants || resultsAreStale ? false : loadingMore,
+      loadingMore: isGrants ? false : loadingMore,
       showEnd:
         !isGrants &&
-        !resultsAreStale &&
         !hasMore &&
         hasSearched &&
         availableOptions.length > 0 &&
         !initialLoading,
-      onNearEnd: isGrants || resultsAreStale ? undefined : loadMore,
+      onNearEnd: isGrants ? undefined : loadMore,
       playEntranceFade,
       onEntranceFadeEnd: handleEntranceFadeEnd,
     }),
     [
       isGrants,
-      resultsAreStale,
       loadingMore,
       hasMore,
       hasSearched,
@@ -1356,9 +1405,10 @@ function AuthorSearch({
           sx={{
             display: "block !important",
             mx: 0.25,
-            px: 1.25,
-            py: 1.1,
+            px: 1.15,
+            py: 0.95,
             borderRadius: 2,
+            transition: "background-color 120ms ease",
             "&.Mui-focused": {
               bgcolor: "action.selected",
             },
@@ -1389,15 +1439,38 @@ function AuthorSearch({
     [isGrants, selectedInstitutionId, selectedTopicId],
   );
 
+  const sourceStatusLabel =
+    source === SEARCH_SOURCES.ALL
+      ? "All"
+      : source === SEARCH_SOURCES.OPENALEX
+        ? "OpenAlex"
+        : source === SEARCH_SOURCES.ORCID
+          ? "ORCID"
+          : source === SEARCH_SOURCES.ARXIV
+            ? "arXiv"
+            : "selected source";
+
+  const activeFilterLabels = [
+    institutionFilter?.display_name
+      ? `Institution: ${institutionFilter.display_name}`
+      : null,
+    topicFilter?.display_name ? `Research: ${topicFilter.display_name}` : null,
+  ].filter(Boolean);
+
+  const filterStatusSuffix =
+    isAuthors && activeFilterLabels.length > 0
+      ? ` · ${activeFilterLabels.join(" · ")}`
+      : "";
+
   const noResultsMessage = isGrants
     ? isArxiv
       ? "No matching grant numbers found in stored arXiv grant matches."
       : "No matching grant numbers found."
-    : isArxiv
-      ? isAuthors
-        ? ARXIV_AUTHORS_NO_RESULTS_MESSAGE
-        : ARXIV_WORKS_NO_RESULTS_MESSAGE
-      : "No OpenAlex matches found.";
+    : `No matching authors in ${sourceStatusLabel}${filterStatusSuffix}.`;
+
+  const loadingMessage = isGrants
+    ? "Searching…"
+    : `Searching ${sourceStatusLabel}${filterStatusSuffix}…`;
 
   return (
     <Box sx={{ width: "100%", textAlign: "left" }}>
@@ -1408,7 +1481,23 @@ function AuthorSearch({
         onChange={handleSourceChange}
       />
 
-      <Autocomplete
+      <ClickAwayListener
+        onClickAway={(event) => {
+          if (!showDropdown) {
+            return;
+          }
+          const target = event.target;
+          if (
+            target instanceof Element &&
+            target.closest(".MuiAutocomplete-popper")
+          ) {
+            return;
+          }
+          closeDropdown();
+        }}
+      >
+        <Box>
+          <Autocomplete
         fullWidth
         open={showDropdown}
         options={availableOptions}
@@ -1432,14 +1521,14 @@ function AuthorSearch({
         getOptionLabel={(option) => getPrimaryLabel(option)}
         getOptionKey={(option) => getResultKey(option)}
         loadingText={
-          <Box sx={{ py: 1.75, textAlign: "center" }}>
+          <Box sx={{ py: 1.75, px: 1.5, textAlign: "center" }}>
             <Typography variant="body2" color="text.secondary">
-              Searching…
+              {loadingMessage}
             </Typography>
           </Box>
         }
         noOptionsText={
-          <Box sx={{ py: 1.75, textAlign: "center" }}>
+          <Box sx={{ py: 1.75, px: 1.5, textAlign: "center" }}>
             <Typography variant="body2" color="text.secondary">
               {noResultsMessage}
             </Typography>
@@ -1450,20 +1539,30 @@ function AuthorSearch({
             (canSearch || hasSearched) &&
             (initialLoading || hasSearched || availableOptions.length > 0)
           ) {
-            setOpen(true);
+            allowDropdownOpen();
+            openDropdown();
           }
         }}
-        onClose={() => setOpen(false)}
+        onClose={(_event, reason) => {
+          // Keep the popup open while the user interacts with results (select).
+          // Outside click / Escape / toggle should dismiss and stay dismissed
+          // until the next explicit search interaction.
+          if (reason === "selectOption" || reason === "removeOption") {
+            return;
+          }
+          closeDropdown();
+        }}
         onInputChange={(_event, newInputValue, reason) => {
           if (reason === "reset") {
             return;
           }
+          allowDropdownOpen();
           setInputValue(newInputValue);
           setValidationMessage(null);
           if (reason === "clear" || newInputValue.trim().length === 0) {
             cancelActiveRequest();
             resetResultsState();
-            setOpen(false);
+            closeDropdown();
           }
         }}
         onChange={handleResultSelected}
@@ -1489,7 +1588,7 @@ function AuthorSearch({
                 borderRadius: 4,
                 bgcolor: "background.paper",
                 boxShadow: "none",
-                transition: "box-shadow 120ms ease, border-color 120ms ease",
+                transition: "box-shadow 140ms ease, border-color 140ms ease",
                 "&:focus-within": {
                   boxShadow: (theme) =>
                     theme.palette.mode === "dark"
@@ -1519,7 +1618,6 @@ function AuthorSearch({
                 }}
               >
                 <MenuItem value={ENTITY_TYPES.AUTHORS}>Authors</MenuItem>
-                <MenuItem value={ENTITY_TYPES.WORKS}>Works</MenuItem>
                 <MenuItem value={ENTITY_TYPES.GRANTS}>Grants</MenuItem>
               </Select>
 
@@ -1536,7 +1634,7 @@ function AuthorSearch({
 
               <IconButton
                 size="small"
-                aria-label="Search"
+                aria-label="Submit search"
                 onMouseDown={(event) => event.preventDefault()}
                 onClick={handleExplicitSearch}
                 sx={{ color: "text.secondary", flexShrink: 0 }}
@@ -1589,6 +1687,8 @@ function AuthorSearch({
           );
         }}
       />
+        </Box>
+      </ClickAwayListener>
 
       {showAuthorFilters ? (
         <AuthorFilters
@@ -1597,16 +1697,6 @@ function AuthorSearch({
           onInstitutionChange={handleInstitutionChange}
           onTopicChange={handleTopicChange}
         />
-      ) : null}
-
-      {showAuthorFilters && resultsAreStale && hasSearched ? (
-        <Typography
-          variant="caption"
-          color="text.secondary"
-          sx={{ display: "block", mt: 0.75, ml: 0.25 }}
-        >
-          {FILTERS_STALE_MESSAGE}
-        </Typography>
       ) : null}
 
       {validationMessage ? (

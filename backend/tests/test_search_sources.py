@@ -54,6 +54,8 @@ def _reset_arxiv_state(monkeypatch):
     monkeypatch.setenv("PROVIDER_SEARCH_CACHE_ENABLED", "false")
     monkeypatch.setenv("AUTHOR_RESOLUTION_ENABLED", "false")
 
+    from app.services.search.openalex_provider import clear_author_page_cache
+
     async def _empty_orcid(**_kwargs):
         return {
             "query": "",
@@ -67,9 +69,11 @@ def _reset_arxiv_state(monkeypatch):
         "app.services.search.orcid_provider.search_orcid_authors",
         _empty_orcid,
     )
+    clear_author_page_cache()
     reset_arxiv_client_state_for_tests()
     get_settings.cache_clear()
     yield
+    clear_author_page_cache()
     reset_arxiv_client_state_for_tests()
     get_settings.cache_clear()
 
@@ -83,29 +87,26 @@ def test_capabilities_include_openalex_arxiv_and_enabled_all():
     assert by_id["openalex"]["enabled"] is True
     assert set(by_id["openalex"]["supported_entity_types"]) == {
         "authors",
-        "works",
         "grants",
     }
     assert by_id["arxiv"]["enabled"] is True
     assert set(by_id["arxiv"]["supported_entity_types"]) == {
         "authors",
-        "works",
         "grants",
     }
     assert "authors" in by_id["arxiv"]["experimental_entity_types"]
     assert by_id["orcid"]["enabled"] is True
     assert by_id["orcid"]["supported_entity_types"] == ["authors"]
     assert by_id["all"]["enabled"] is True
-    assert by_id["all"]["label"] == "All sources"
+    assert by_id["all"]["label"] == "All"
     assert set(by_id["all"]["supported_entity_types"]) == {
         "authors",
-        "works",
         "grants",
     }
 
 
-def test_openalex_authors_works_grants_remain_routable():
-    """OpenAlex remains available for Authors, Works, and Grants."""
+def test_openalex_authors_and_grants_remain_routable():
+    """OpenAlex remains available for Authors and Grants."""
     with patch(
         "app.services.search.openalex_provider.unified_openalex_search",
         new_callable=AsyncMock,
@@ -124,20 +125,6 @@ def test_openalex_authors_works_grants_remain_routable():
         )
         assert authors.status_code == 200
         assert authors.json()["source"] == "openalex"
-
-        mock_search.return_value = {
-            "query": "quantum",
-            "entity_type": "works",
-            "source": "openalex",
-            "results": [],
-            "next_cursor": None,
-            "has_more": False,
-        }
-        works = client.get(
-            "/api/search",
-            params={"query": "quantum", "entity_type": "works", "source": "openalex"},
-        )
-        assert works.status_code == 200
 
         mock_search.return_value = {
             "query": "R01GM123456",
@@ -174,37 +161,12 @@ def test_openalex_authors_works_grants_remain_routable():
         assert body["results"][0]["matched_grant_number"] == "R01GM123456"
         assert body["results"][0]["grant_match"]["verified"] is True
 
-
-def test_arxiv_works_request_uses_expected_params():
-    captured = {}
-
-    async def fake_fetch(*, search_query, start, max_results):
-        captured["search_query"] = search_query
-        captured["start"] = start
-        captured["max_results"] = max_results
-        return SAMPLE_ATOM
-
-    with patch.object(arxiv_client, "_fetch_arxiv_atom", side_effect=fake_fetch):
-        response = client.get(
+        rejected = client.get(
             "/api/search",
-            params={
-                "query": "quantum computing",
-                "entity_type": "works",
-                "source": "arxiv",
-            },
+            params={"query": "quantum", "entity_type": "works", "source": "openalex"},
         )
+        assert rejected.status_code == 422
 
-    assert response.status_code == 200
-    assert captured["search_query"] == "all:quantum computing"
-    assert captured["start"] == 0
-    assert captured["max_results"] == 20
-    result = response.json()["results"][0]
-    assert result["result_id"] == "arxiv:2401.12345"
-    assert result["source"] == "arxiv"
-    assert result["openalex_id"] is None
-    assert result["cited_by_count"] is None
-    assert result["work_type"] == "preprint"
-    assert result["categories"] == ["cs.AI", "cs.LG"]
 
 
 def test_arxiv_atom_normalizes_and_strips_version():
@@ -329,68 +291,16 @@ def test_provider_registry_routes_only_selected_provider():
     asyncio.run(run())
 
 
-def test_all_source_combines_openalex_and_arxiv_works():
-    with (
-        patch(
-            "app.services.search.openalex_provider.unified_openalex_search",
-            new_callable=AsyncMock,
-            return_value={
-                "query": "quantum",
-                "entity_type": "works",
-                "source": "openalex",
-                "results": [
-                    {
-                        "result_id": "openalex:W1",
-                        "result_type": "work",
-                        "title": "OpenAlex paper",
-                        "source": "openalex",
-                    }
-                ],
-                "next_cursor": None,
-                "has_more": False,
-            },
-        ),
-        patch(
-            "app.services.search.arxiv_provider.search_arxiv_works",
-            new_callable=AsyncMock,
-            return_value={
-                "query": "quantum",
-                "entity_type": "works",
-                "source": "arxiv",
-                "results": [
-                    {
-                        "result_id": "arxiv:2401.12345",
-                        "result_type": "work",
-                        "title": "arXiv paper",
-                        "source": "arxiv",
-                    }
-                ],
-                "next_cursor": None,
-                "has_more": False,
-            },
-        ),
-    ):
-        response = client.get(
-            "/api/search",
-            params={"query": "quantum", "entity_type": "works", "source": "all"},
-        )
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["source"] == "all"
-    sources = [row["source"] for row in payload["results"]]
-    assert sources == ["openalex", "arxiv"]
-
 
 def test_arxiv_pagination_tokens():
     token = build_arxiv_cursor(
-        entity_type="works",
-        query="quantum computing",
+        entity_type="grants",
+        query="R01GM123456",
         next_start=20,
     )
     assert (
         validate_arxiv_cursor(
-            token, entity_type="works", query="quantum computing"
+            token, entity_type="grants", query="R01GM123456"
         )
         == 20
     )
@@ -398,20 +308,20 @@ def test_arxiv_pagination_tokens():
     with pytest.raises(Exception):
         validate_arxiv_cursor(
             "not-a-valid-token",
-            entity_type="works",
-            query="quantum computing",
+            entity_type="grants",
+            query="R01GM123456",
         )
 
     mismatched = build_arxiv_cursor(
-        entity_type="works",
-        query="other",
+        entity_type="grants",
+        query="R01OTHER999",
         next_start=20,
     )
     with pytest.raises(Exception):
         validate_arxiv_cursor(
             mismatched,
-            entity_type="works",
-            query="quantum computing",
+            entity_type="grants",
+            query="R01GM123456",
         )
 
 
@@ -426,16 +336,16 @@ def test_arxiv_pages_are_cached():
         first = client.get(
             "/api/search",
             params={
-                "query": "quantum computing",
-                "entity_type": "works",
+                "query": "R01GM123456",
+                "entity_type": "grants",
                 "source": "arxiv",
             },
         )
         second = client.get(
             "/api/search",
             params={
-                "query": "quantum computing",
-                "entity_type": "works",
+                "query": "R01GM123456",
+                "entity_type": "grants",
                 "source": "arxiv",
             },
         )
@@ -476,8 +386,8 @@ def test_arxiv_rate_control_serializes_uncached_requests(monkeypatch):
         reset_arxiv_client_state_for_tests()
         monkeypatch.setattr(rate_limited_http.httpx, "AsyncClient", FakeClient)
         await asyncio.gather(
-            arxiv_client.search_arxiv_works(query="alpha beta"),
-            arxiv_client.search_arxiv_works(query="gamma delta"),
+            arxiv_client.search_arxiv_grants(query="R01AA111111"),
+            arxiv_client.search_arxiv_grants(query="R01BB222222"),
         )
 
     asyncio.run(run_parallel())
@@ -532,15 +442,15 @@ def test_openalex_not_delayed_by_arxiv_limiter(monkeypatch):
 
             arxiv_task = asyncio.create_task(
                 run_search(
-                    query="quantum computing",
-                    entity_type="works",
+                    query="R01GM123456",
+                    entity_type="grants",
                     source="arxiv",
                 )
             )
             await asyncio.sleep(0.01)
             openalex_result = await run_search(
-                query="quantum",
-                entity_type="works",
+                query="R01GM123456",
+                entity_type="grants",
                 source="openalex",
             )
             await arxiv_task

@@ -23,22 +23,10 @@ class Settings(BaseSettings):
         description="OpenAlex API key; required for live researcher search.",
     )
 
-    # Optional enrichment sources — app works when these are unset/unavailable.
-    semantic_scholar_api_key: str | None = Field(
-        default=None,
-        description="Semantic Scholar API key for optional enrichment.",
-    )
-    orcid_client_id: str | None = Field(
-        default=None,
-        description="ORCID OAuth client ID for optional enrichment (unused for public API reads).",
-    )
-    orcid_client_secret: str | None = Field(
-        default=None,
-        description="ORCID OAuth client secret for optional enrichment (unused for public API reads).",
-    )
+    # ORCID public API (no OAuth client credentials required).
     orcid_enabled: bool = Field(
         default=True,
-        description="When true, the ORCID public API client may be used (not wired into live search yet).",
+        description="When true, the ORCID public API client may be used.",
     )
     orcid_public_base_url: str = Field(
         default="https://pub.orcid.org/v3.0",
@@ -52,15 +40,10 @@ class Settings(BaseSettings):
         description="Descriptive User-Agent for ORCID public API requests.",
     )
 
-    researcher_search_enrichment_enabled: bool = Field(
-        default=True,
-        description="When true, attempt optional enrichment from Semantic Scholar / ORCID.",
-    )
-
     # arXiv Atom API (no API key required).
     arxiv_enabled: bool = Field(
         default=True,
-        description="When true, arXiv is offered as a search source for works/authors.",
+        description="When true, arXiv is offered as a search source for grants/authors.",
     )
     arxiv_base_url: str = Field(
         default="https://export.arxiv.org/api/query",
@@ -295,14 +278,6 @@ class Settings(BaseSettings):
     @property
     def openalex_configured(self) -> bool:
         return bool(self.openalex_api_key)
-
-    @property
-    def semantic_scholar_configured(self) -> bool:
-        return bool(self.semantic_scholar_api_key)
-
-    @property
-    def orcid_oauth_configured(self) -> bool:
-        return bool(self.orcid_client_id and self.orcid_client_secret)
 
     @property
     def orcid_configured(self) -> bool:

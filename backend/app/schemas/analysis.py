@@ -408,6 +408,7 @@ class AuthorInsightsResponse(BaseModel):
         default_factory=AuthorInsightsInstitutionDataQuality
     )
     facets: PublicationFacets = Field(default_factory=PublicationFacets)
+    coverage: dict[str, Any] | None = None
 
 
 class AuthorInsightsPublicationsResponse(BaseModel):
@@ -438,7 +439,7 @@ class AuthorPublicationCorpusStats(BaseModel):
     facets: PublicationFacets = Field(default_factory=PublicationFacets)
     total_matching_publications: int = 0
     total_corpus_publications: int = 0
-    corpus_complete: bool = True
+    corpus_complete: bool = False
 
 
 class AuthorPublicationStatsJobResponse(BaseModel):

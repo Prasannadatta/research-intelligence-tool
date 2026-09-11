@@ -8,7 +8,6 @@ from app.core.config import get_settings
 from app.integrations.arxiv.client import (
     search_arxiv_authors,
     search_arxiv_grants,
-    search_arxiv_works,
 )
 from app.services.search.base import BaseSearchProvider
 
@@ -25,7 +24,7 @@ class ArxivProvider(BaseSearchProvider):
     def supported_entity_types(self) -> tuple[str, ...]:
         if not self.enabled:
             return ()
-        return ("authors", "works", "grants")
+        return ("authors", "grants")
 
     @property
     def experimental_entity_types(self) -> tuple[str, ...]:
@@ -40,20 +39,6 @@ class ArxivProvider(BaseSearchProvider):
         filters: dict[str, Any],
     ) -> dict[str, Any]:
         return await search_arxiv_authors(
-            query=query or "",
-            limit=limit,
-            cursor=cursor,
-        )
-
-    async def search_works(
-        self,
-        *,
-        query: str | None,
-        cursor: str | None,
-        limit: int,
-        filters: dict[str, Any],
-    ) -> dict[str, Any]:
-        return await search_arxiv_works(
             query=query or "",
             limit=limit,
             cursor=cursor,

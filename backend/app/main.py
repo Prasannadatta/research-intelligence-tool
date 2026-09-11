@@ -7,7 +7,6 @@ from app.api.routes.authors import router as authors_router
 from app.api.routes.analysis import router as analysis_router
 from app.api.routes.data_updater import router as data_updater_router
 from app.api.routes.grants import router as grants_router
-from app.api.routes.researchers import router as researchers_router
 from app.api.routes.saved_searches import router as saved_searches_router
 from app.api.routes.search import router as search_router
 
@@ -42,7 +41,6 @@ app.add_middleware(
 )
 
 app.include_router(authors_router)
-app.include_router(researchers_router)
 app.include_router(search_router)
 app.include_router(analysis_router)
 app.include_router(grants_router)

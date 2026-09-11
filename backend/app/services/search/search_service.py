@@ -1,4 +1,4 @@
-"""Unified search service that selects a provider and optionally fans out ORCID authors."""
+"""Unified search: authors via OpenAlex / ORCID / All (OA+ORCID); grants unchanged."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from app.services.search.providers import PROVIDERS, get_provider
 try:
     from app.services.search.diag_timing import enabled as diag_enabled, stage as diag_stage
 except ImportError:  # pragma: no cover
+
     def diag_enabled() -> bool:
         return False
 
@@ -24,6 +25,7 @@ except ImportError:  # pragma: no cover
     @contextmanager
     def diag_stage(_name: str):
         yield
+
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +45,11 @@ async def _resolve_affiliation_hint(
     affiliation: str | None,
     institution_id: str | None,
 ) -> str | None:
+    """Resolve an institution filter into a text affiliation for ORCID queries."""
     text = " ".join((affiliation or "").split())
     if text:
         return text
-    inst = " ".join((institution_id or "").split())
+    inst = " ".join((institution_id or "").strip().split())
     if not inst:
         return None
     from app.integrations.openalex.filters import (
@@ -64,60 +67,43 @@ async def _resolve_affiliation_hint(
     return name
 
 
-def _is_direct_orcid_query(query: str | None) -> bool:
-    return bool(normalize_orcid_id(query))
-
-
-async def _orcid_author_rows(
+def _has_openalex_author_filters(
     *,
-    query: str | None,
-    limit: int,
-    filters: dict[str, Any],
-) -> list[dict[str, Any]]:
-    try:
-        from app.services.search.orcid_provider import search_orcid_author_results
-
-        return await search_orcid_author_results(
-            query=query,
-            limit=limit,
-            filters=filters,
-            enrich=False,
-        )
-    except Exception:
-        logger.warning("orcid_author_sidecar_failed")
-        return []
+    institution_id: str | None,
+    topic_id: str | None,
+) -> bool:
+    return bool(
+        " ".join((institution_id or "").split())
+        or " ".join((topic_id or "").split())
+    )
 
 
-def _append_orcid_rows(
-    payload: dict[str, Any],
-    orcid_rows: list[dict[str, Any]],
-) -> dict[str, Any]:
-    if not orcid_rows:
-        return payload
-    existing = list(payload.get("results") or [])
-    seen: set[str] = set()
-    for row in existing:
-        if isinstance(row, dict) and row.get("source") == "orcid":
-            key = normalize_orcid_id(row.get("orcid"))
-            if key:
-                seen.add(key)
-    extra = []
-    for row in orcid_rows:
-        key = normalize_orcid_id(row.get("orcid"))
-        if not key or key in seen:
+def _drop_orcid_only_when_openalex_filters(
+    results: list[Any],
+    *,
+    openalex_filters_active: bool,
+) -> list[Any]:
+    """
+    When OpenAlex institution/topic filters are active, keep only rows that
+    passed (or merged with) OpenAlex. ORCID-only hits cannot verify those filters.
+    """
+    if not openalex_filters_active:
+        return results
+    out: list[Any] = []
+    for row in results:
+        if not isinstance(row, dict):
+            out.append(row)
             continue
-        seen.add(key)
-        extra.append(row)
-    if not extra:
-        return payload
-    return {**payload, "results": existing + extra}
+        if row.get("source") == "openalex" or row.get("openalex_id"):
+            out.append(row)
+    return out
 
 
 def _apply_openalex_enrichment(
     orcid_row: dict[str, Any],
     openalex_row: dict[str, Any],
 ) -> dict[str, Any]:
-    """Attach OpenAlex identity onto an ORCID-anchored author row."""
+    """Attach OpenAlex fields onto an ORCID row when ORCID iDs match exactly."""
     orcid = normalize_orcid_id(orcid_row.get("orcid"))
     oa_orcid = normalize_orcid_id(openalex_row.get("orcid"))
     if not orcid or orcid != oa_orcid:
@@ -136,6 +122,7 @@ def _apply_openalex_enrichment(
         "alternative_names": openalex_row.get("alternative_names")
         or orcid_row.get("alternative_names")
         or [],
+        # Keep ORCID as anchor; OpenAlex ids live in source_records / openalex_id.
         "source": "orcid",
         "orcid": orcid,
     }
@@ -152,23 +139,24 @@ def _apply_openalex_enrichment(
     return merged
 
 
-def _link_results_by_exact_orcid(results: list[Any]) -> list[Any]:
-    """Dedupe OpenAlex+ORCID rows only when the ORCID iD matches exactly."""
+def merge_authors_by_exact_orcid(results: list[Any]) -> list[Any]:
+    """Deduplicate OpenAlex + ORCID rows using exact ORCID iD only — never by name."""
     rows = [row for row in results if isinstance(row, dict)]
-    merged: dict[str, dict[str, Any]] = {}
+    merged_by_orcid: dict[str, dict[str, Any]] = {}
     for row in rows:
         if row.get("source") != "orcid":
             continue
         key = normalize_orcid_id(row.get("orcid"))
         if key:
-            merged[key] = dict(row)
+            merged_by_orcid[key] = dict(row)
     for row in rows:
         if row.get("source") != "openalex":
             continue
         key = normalize_orcid_id(row.get("orcid"))
-        if key and key in merged:
-            merged[key] = _apply_openalex_enrichment(merged[key], row)
-    seen: set[str] = set()
+        if key and key in merged_by_orcid:
+            merged_by_orcid[key] = _apply_openalex_enrichment(merged_by_orcid[key], row)
+
+    seen_orcid: set[str] = set()
     out: list[Any] = []
     for row in results:
         if not isinstance(row, dict):
@@ -176,112 +164,94 @@ def _link_results_by_exact_orcid(results: list[Any]) -> list[Any]:
             continue
         if row.get("source") == "orcid":
             key = normalize_orcid_id(row.get("orcid"))
-            if not key or key in seen:
+            if not key or key in seen_orcid:
                 continue
-            seen.add(key)
-            out.append(merged[key])
+            seen_orcid.add(key)
+            out.append(merged_by_orcid[key])
             continue
         if row.get("source") == "openalex":
             key = normalize_orcid_id(row.get("orcid"))
-            if key and key in merged:
+            # Drop OpenAlex row when the same ORCID already appears as an ORCID hit.
+            if key and key in merged_by_orcid:
                 continue
         out.append(row)
     return out
 
 
-async def _hydrate_orcid_rows_from_openalex(
-    results: list[Any],
-) -> list[Any]:
-    """Look up missing OpenAlex records by exact ORCID. Never matches by name."""
-    from app.integrations.openalex.unified_search import search_openalex_authors_by_orcid
-
-    known_oa = {
-        normalize_orcid_id(row.get("orcid"))
-        for row in results
-        if isinstance(row, dict)
-        and row.get("source") == "openalex"
-        and row.get("openalex_id")
-        and normalize_orcid_id(row.get("orcid"))
-    }
-
-    async def hydrate(row: Any) -> Any:
-        if not isinstance(row, dict) or row.get("source") != "orcid":
-            return row
-        if row.get("openalex_id"):
-            return row
-        orcid = normalize_orcid_id(row.get("orcid"))
-        if not orcid or orcid in known_oa:
-            return row
-        try:
-            payload = await search_openalex_authors_by_orcid(orcid, limit=5)
-        except Exception:
-            logger.warning("openalex_orcid_enrichment_failed orcid=%s", orcid)
-            return row
-        for oa_row in payload.get("results") or []:
-            if normalize_orcid_id(oa_row.get("orcid")) == orcid:
-                return _apply_openalex_enrichment(row, oa_row)
-        return row
-
-    hydrated = await asyncio.gather(*[hydrate(row) for row in results])
-    return list(hydrated)
-
-
-async def _finalize_author_results(
+async def finalize_author_search_results(
     payload: dict[str, Any],
     *,
-    known_author_ids: list[str] | None,
-    hydrate_openalex: bool = False,
+    openalex_filters_active: bool = False,
 ) -> dict[str, Any]:
+    """
+    Prepare author rows for the UI: exact-ORCID merge, then optional OA-filter drop.
+    Does not write identity rows or call OpenAlex for ORCID hydration (that is selection-time).
+    """
     results = list(payload.get("results") or [])
-    if results:
-        if hydrate_openalex:
-            with diag_stage("orcid_openalex_enrichment"):
-                results = await _hydrate_orcid_rows_from_openalex(results)
-        with diag_stage("exact_orcid_link"):
-            results = _link_results_by_exact_orcid(results)
-        payload = {**payload, "results": results}
-    with diag_stage("canonical_resolution"):
-        return await _maybe_resolve_authors(
-            payload,
-            known_author_ids=known_author_ids,
-        )
+    if not results:
+        return payload
+    with diag_stage("exact_orcid_merge"):
+        results = merge_authors_by_exact_orcid(results)
+    results = _drop_orcid_only_when_openalex_filters(
+        results,
+        openalex_filters_active=openalex_filters_active,
+    )
+    return {**payload, "results": results}
 
 
 async def run_search(
     *,
     query: str | None,
     entity_type: str,
-    source: str = "openalex",
+    source: str = "all",
     limit: int = 20,
     cursor: str | None = None,
     institution_id: str | None = None,
     topic_id: str | None = None,
     search_mode: str = "auto",
-    known_author_ids: list[str] | None = None,
     search_session_id: str | None = None,
     affiliation: str | None = None,
 ) -> dict[str, Any]:
     """
-    Route to one primary provider, or fan out when source=all.
-
-    Author searches also run ORCID in parallel when another source is selected.
-    ORCID failures never fail the overall search.
-    Candidates from different providers are concatenated, then linked only by
-    exact ORCID — never by name.
+    Author sources:
+      - all      → OpenAlex + ORCID in parallel, merged by exact ORCID before return
+      - openalex → OpenAlex only
+      - orcid    → ORCID only (lightweight; OpenAlex linking deferred to selection)
+    arXiv is not part of author All. Identity DB writes happen on selection, not here.
     """
-    provider_name = (source or "openalex").strip().lower()
+    provider_name = (source or "all").strip().lower()
     entity = (entity_type or "").strip().lower()
+    openalex_filters_active = entity == "authors" and _has_openalex_author_filters(
+        institution_id=institution_id,
+        topic_id=topic_id,
+    )
 
+    # ORCID cannot apply OpenAlex institution/topic IDs. Ignore them for ORCID-only.
+    effective_institution_id = institution_id
+    effective_topic_id = topic_id
+    if provider_name == "orcid":
+        effective_institution_id = None
+        effective_topic_id = None
+        openalex_filters_active = False
+
+    # Affiliation text is only useful when ORCID will be queried.
+    # Under All + OpenAlex filters, skip ORCID entirely (cannot verify OA filters).
+    needs_orcid = entity == "authors" and get_settings().orcid_configured and (
+        provider_name == "orcid"
+        or (provider_name == "all" and not openalex_filters_active)
+    )
     affiliation_hint = None
-    if entity == "authors":
+    if needs_orcid:
         affiliation_hint = await _resolve_affiliation_hint(
             affiliation=affiliation,
-            institution_id=institution_id,
+            # Only use OA institution id as a soft ORCID affiliation hint under All
+            # when we are actually querying ORCID without strict OA filters.
+            institution_id=effective_institution_id if provider_name == "all" else None,
         )
 
     filters = {
-        "institution_id": institution_id,
-        "topic_id": topic_id,
+        "institution_id": effective_institution_id,
+        "topic_id": effective_topic_id,
         "search_mode": search_mode,
         "affiliation": affiliation_hint,
     }
@@ -289,18 +259,18 @@ async def run_search(
     if provider_name == "all":
         with diag_stage("provider_fanout:all"):
             payload = await _run_all_sources_search(
-            entity=entity,
-            query=query,
-            cursor=cursor,
-            limit=limit,
-            filters=filters,
-            search_session_id=search_session_id,
-        )
+                entity=entity,
+                query=query,
+                cursor=cursor,
+                limit=limit,
+                filters=filters,
+                search_session_id=search_session_id,
+                include_orcid=needs_orcid,
+            )
         if entity == "authors":
-            payload = await _finalize_author_results(
+            payload = await finalize_author_search_results(
                 payload,
-                known_author_ids=known_author_ids,
-                hydrate_openalex=_is_direct_orcid_query(query),
+                openalex_filters_active=openalex_filters_active,
             )
         return payload
 
@@ -321,8 +291,8 @@ async def run_search(
             status_code=400,
         )
 
-    if entity in ("works", "grants"):
-        return await _run_works_or_grants_search(
+    if entity == "grants":
+        return await _run_grants_search(
             provider=provider,
             provider_name=provider_name,
             entity=entity,
@@ -333,48 +303,25 @@ async def run_search(
             search_session_id=search_session_id,
         )
 
-    run_orcid_sidecar = (
-        entity == "authors"
-        and provider_name != "orcid"
-        and _is_first_page(cursor)
-        and get_settings().orcid_configured
-    )
-
+    # Single author source: openalex | orcid | (legacy arxiv API still allowed).
     try:
-        if run_orcid_sidecar:
-            with diag_stage("provider_fanout:openalex+orcid_sidecar"):
-                primary_payload, orcid_rows = await asyncio.gather(
-                    provider.search(
-                        entity=entity,
-                        query=query,
-                        cursor=cursor,
-                        limit=limit,
-                        filters=filters,
-                    ),
-                    _orcid_author_rows(query=query, limit=limit, filters=filters),
-                )
-        else:
-            with diag_stage(f"provider_search:{provider_name}"):
-                primary_payload = await provider.search(
-                    entity=entity,
-                    query=query,
-                    cursor=cursor,
-                    limit=limit,
-                    filters=filters,
-                )
-            orcid_rows = []
+        with diag_stage(f"provider_search:{provider_name}"):
+            payload = await provider.search(
+                entity=entity,
+                query=query,
+                cursor=cursor,
+                limit=limit,
+                filters=filters,
+            )
     except (OpenAlexApiError, ArxivApiError, OrcidApiError) as exc:
         raise SearchServiceError(str(exc), status_code=exc.status_code) from exc
     except ValueError as exc:
         raise SearchServiceError(str(exc), status_code=400) from exc
 
-    payload = _append_orcid_rows(primary_payload, orcid_rows)
-
     if entity == "authors":
-        payload = await _finalize_author_results(
+        payload = await finalize_author_search_results(
             payload,
-            known_author_ids=known_author_ids,
-            hydrate_openalex=_is_direct_orcid_query(query),
+            openalex_filters_active=openalex_filters_active,
         )
 
     return payload
@@ -410,6 +357,70 @@ async def _safe_provider_search(
         return None
 
 
+async def _run_author_all_sources(
+    *,
+    query: str | None,
+    cursor: str | None,
+    limit: int,
+    filters: dict[str, Any],
+    include_orcid: bool = True,
+) -> dict[str, Any]:
+    """OpenAlex + optional ORCID (no arXiv). Pagination cursor comes from OpenAlex."""
+    openalex_provider = get_provider("openalex")
+    orcid_provider = get_provider("orcid")
+    orcid_enabled = bool(
+        include_orcid
+        and orcid_provider
+        and orcid_provider.supports("authors")
+        and get_settings().orcid_configured
+    )
+
+    async def _none_payload():
+        return None
+
+    oa_coro = (
+        _safe_provider_search(
+            openalex_provider,
+            entity="authors",
+            query=query,
+            cursor=cursor,
+            limit=limit,
+            filters=filters,
+        )
+        if openalex_provider and openalex_provider.supports("authors")
+        else _none_payload()
+    )
+
+    # ORCID only on the first page — later pages paginate OpenAlex only.
+    orcid_coro = (
+        _safe_provider_search(
+            orcid_provider,
+            entity="authors",
+            query=query,
+            cursor=None,
+            limit=limit,
+            filters=filters,
+        )
+        if orcid_enabled and _is_first_page(cursor)
+        else _none_payload()
+    )
+
+    oa_payload, orcid_payload = await asyncio.gather(oa_coro, orcid_coro)
+    oa_results = list((oa_payload or {}).get("results") or [])
+    orcid_list = list((orcid_payload or {}).get("results") or [])
+
+    # OpenAlex first, then ORCID — finalize_author_search_results merges by exact ORCID.
+    combined = oa_results + orcid_list
+    return {
+        "query": normalize_orcid_id(query) or " ".join((query or "").split()),
+        "entity_type": "authors",
+        "source": "all",
+        "results": combined,
+        "next_cursor": (oa_payload or {}).get("next_cursor"),
+        "has_more": bool((oa_payload or {}).get("has_more")),
+    }
+
+
 async def _run_all_sources_search(
     *,
     entity: str,
@@ -418,126 +429,62 @@ async def _run_all_sources_search(
     limit: int,
     filters: dict[str, Any],
     search_session_id: str | None,
+    include_orcid: bool = True,
 ) -> dict[str, Any]:
-    orcid_query = normalize_orcid_id(query) if entity == "authors" else None
+    del search_session_id
+
+    if entity == "authors":
+        return await _run_author_all_sources(
+            query=query,
+            cursor=cursor,
+            limit=limit,
+            filters=filters,
+            include_orcid=include_orcid,
+        )
+
     providers = [
-        provider
-        for provider in PROVIDERS.values()
-        if provider.supports(entity)
-        and not (orcid_query and provider.id == "arxiv")
+        provider for provider in PROVIDERS.values() if provider.supports(entity)
     ]
     if not providers:
         raise SearchServiceError(
             "No search sources are available for this entity.",
             status_code=400,
         )
-
-    if entity in ("works", "grants"):
-        payloads = await asyncio.gather(
-            *[
-                _safe_provider_search(
-                    provider,
-                    entity=entity,
-                    query=query,
-                    cursor=cursor,
-                    limit=limit,
-                    filters=filters,
-                )
-                for provider in providers
-            ]
-        )
-        combined: list[Any] = []
-        next_cursor = None
-        has_more = False
-        for payload in payloads:
-            if not payload:
-                continue
-            combined.extend(payload.get("results") or [])
-            if payload.get("has_more"):
-                has_more = True
-            if next_cursor is None:
-                next_cursor = payload.get("next_cursor")
-        return {
-            "query": " ".join((query or "").split()),
-            "entity_type": entity,
-            "source": "all",
-            "results": combined,
-            "next_cursor": next_cursor,
-            "has_more": has_more,
-        }
-
-    if orcid_query:
-        orcid_provider = get_provider("orcid")
-        openalex_provider = get_provider("openalex")
-        orcid_payload = None
-        if orcid_provider and orcid_provider.supports("authors"):
-            orcid_payload = await _safe_provider_search(
-                orcid_provider,
-                entity="authors",
-                query=orcid_query,
-                cursor=None,
-                limit=limit,
-                filters=filters,
-            )
-        oa_payload = None
-        if openalex_provider and openalex_provider.supports("authors"):
-            oa_payload = await _safe_provider_search(
-                openalex_provider,
-                entity="authors",
-                query=orcid_query,
-                cursor=cursor,
-                limit=limit,
-                filters=filters,
-            )
-        results = list((orcid_payload or {}).get("results") or []) + list(
-            (oa_payload or {}).get("results") or []
-        )
-        return {
-            "query": orcid_query,
-            "entity_type": "authors",
-            "source": "all",
-            "results": results,
-            "next_cursor": (oa_payload or {}).get("next_cursor"),
-            "has_more": bool((oa_payload or {}).get("has_more")),
-        }
-
     payloads = await asyncio.gather(
         *[
             _safe_provider_search(
                 provider,
-                entity="authors",
+                entity=entity,
                 query=query,
-                cursor=cursor if provider.id != "orcid" else None,
+                cursor=cursor,
                 limit=limit,
                 filters=filters,
             )
             for provider in providers
         ]
     )
-    combined_rows: list[Any] = []
+    combined: list[Any] = []
     next_cursor = None
     has_more = False
     for payload in payloads:
         if not payload:
             continue
-        combined_rows.extend(payload.get("results") or [])
-        if payload.get("source") == "openalex":
-            next_cursor = payload.get("next_cursor")
-            has_more = bool(payload.get("has_more"))
-        elif payload.get("has_more") and next_cursor is None:
-            next_cursor = payload.get("next_cursor")
+        combined.extend(payload.get("results") or [])
+        if payload.get("has_more"):
             has_more = True
+        if next_cursor is None:
+            next_cursor = payload.get("next_cursor")
     return {
         "query": " ".join((query or "").split()),
-        "entity_type": "authors",
+        "entity_type": entity,
         "source": "all",
-        "results": combined_rows,
+        "results": combined,
         "next_cursor": next_cursor,
         "has_more": has_more,
     }
 
 
-async def _run_works_or_grants_search(
+async def _run_grants_search(
     *,
     provider: Any,
     provider_name: str,
@@ -612,42 +559,3 @@ async def _run_works_or_grants_search(
     except Exception:
         logger.exception("Work persistence failed; returning provider rows")
         return payload
-
-
-async def _maybe_resolve_authors(
-    payload: dict[str, Any],
-    *,
-    known_author_ids: list[str] | None,
-) -> dict[str, Any]:
-    settings = get_settings()
-    results = list(payload.get("results") or [])
-
-    if not settings.author_resolution_enabled:
-        return payload
-
-    try:
-        from app.db.session import SessionLocal
-        from app.services.author_resolution.service import resolve_author_page
-
-        async with SessionLocal() as session:
-            resolved = await resolve_author_page(
-                session,
-                results,
-                known_canonical_ids=set(known_author_ids or []),
-            )
-    except Exception:
-        logger.exception("Author identity resolution failed; returning provider rows")
-        return payload
-
-    next_cursor = payload.get("next_cursor")
-    has_more = bool(payload.get("has_more"))
-    return {
-        **payload,
-        "results": resolved["results"],
-        "items": resolved["items"],
-        "updates": resolved["updates"],
-        "pagination": {
-            "next_cursor": next_cursor,
-            "has_more": has_more,
-        },
-    }

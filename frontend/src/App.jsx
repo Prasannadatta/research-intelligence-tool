@@ -25,7 +25,6 @@ import LightModeRoundedIcon from "@mui/icons-material/LightModeRounded";
 import DarkModeRoundedIcon from "@mui/icons-material/DarkModeRounded";
 import PersonSearchRoundedIcon from "@mui/icons-material/PersonSearchRounded";
 import PaidRoundedIcon from "@mui/icons-material/PaidRounded";
-import ArticleOutlinedIcon from "@mui/icons-material/ArticleOutlined";
 import BookmarkBorderRoundedIcon from "@mui/icons-material/BookmarkBorderRounded";
 import SyncRoundedIcon from "@mui/icons-material/SyncRounded";
 
@@ -39,6 +38,7 @@ import DataUpdaterPage from "./features/dataUpdater/DataUpdaterPage";
 import GrantPublicationsPage from "./components/grants/GrantPublicationsPage";
 import { toAnalysisAuthorPayload } from "./api/analysisApi";
 import { ENTITY_TYPES } from "./api/searchApi";
+import { resolveAuthorSelection } from "./api/authorResolveApi";
 import {
   buildSearchHomePath,
   clearSelectionsForEntity,
@@ -82,15 +82,11 @@ function AuthorSearchHome({
   setSelectedAuthors,
   selectedWorks,
   setSelectedWorks,
-  selectedGrants,
 }) {
   const navigate = useNavigate();
 
   const activeSelectedItems = useMemo(() => {
-    if (
-      entityType === ENTITY_TYPES.WORKS ||
-      entityType === ENTITY_TYPES.GRANTS
-    ) {
+    if (entityType === ENTITY_TYPES.GRANTS) {
       return selectedWorks;
     }
     return selectedAuthors;
@@ -106,29 +102,50 @@ function AuthorSearchHome({
       return;
     }
 
-    const appendUnique = (current) => {
-      if (current.some((entry) => entry.result_id === item.result_id)) {
+    const appendUnique = (current, nextItem) => {
+      const nextId = nextItem?.result_id;
+      if (!nextId) {
         return current;
       }
-      return [...current, item];
+      if (current.some((entry) => entry.result_id === nextId || entry.id === nextId)) {
+        return current;
+      }
+      // Drop a prior unresolved row for the same provider identity if present.
+      const providerKey =
+        nextItem?.openalex_id ||
+        nextItem?.orcid ||
+        nextItem?.source_records?.[0]?.provider_author_id;
+      const filtered = providerKey
+        ? current.filter((entry) => {
+            const entryKey =
+              entry?.openalex_id ||
+              entry?.orcid ||
+              entry?.source_records?.[0]?.provider_author_id;
+            return entryKey !== providerKey;
+          })
+        : current;
+      return [...filtered, nextItem];
     };
 
-    if (
-      item.result_type === "work" ||
-      entityType === ENTITY_TYPES.WORKS ||
-      entityType === ENTITY_TYPES.GRANTS
-    ) {
-      setSelectedWorks(appendUnique);
+    if (item.result_type === "work" || entityType === ENTITY_TYPES.GRANTS) {
+      setSelectedWorks((current) => appendUnique(current, item));
       return;
     }
-    setSelectedAuthors(appendUnique);
+
+    // Resolve identity on selection (not during typeahead).
+    void (async () => {
+      let resolved = item;
+      try {
+        resolved = await resolveAuthorSelection(item);
+      } catch {
+        resolved = item;
+      }
+      setSelectedAuthors((current) => appendUnique(current, resolved));
+    })();
   };
 
   const handleItemRemoved = (resultId) => {
-    if (
-      entityType === ENTITY_TYPES.WORKS ||
-      entityType === ENTITY_TYPES.GRANTS
-    ) {
+    if (entityType === ENTITY_TYPES.GRANTS) {
       setSelectedWorks((current) =>
         current.filter((item) => item.result_id !== resultId),
       );
@@ -140,10 +157,7 @@ function AuthorSearchHome({
   };
 
   const handleClearAll = () => {
-    if (
-      entityType === ENTITY_TYPES.WORKS ||
-      entityType === ENTITY_TYPES.GRANTS
-    ) {
+    if (entityType === ENTITY_TYPES.GRANTS) {
       setSelectedWorks([]);
       return;
     }
@@ -152,12 +166,6 @@ function AuthorSearchHome({
 
   const handleAnalyze = () => {
     if (entityType !== ENTITY_TYPES.AUTHORS) {
-      console.log("Analyze selection:", {
-        entityType,
-        selectedAuthors,
-        selectedWorks,
-        selectedGrants,
-      });
       return;
     }
 
@@ -249,6 +257,9 @@ function AuthorSearchHome({
           onEntityTypeChange={onEntityTypeChange}
           onResultSelected={handleResultSelected}
           selectedResultIds={activeSelectedIds}
+          selectedAuthors={
+            entityType === ENTITY_TYPES.AUTHORS ? selectedAuthors : []
+          }
         />
       </Box>
 
@@ -293,7 +304,6 @@ function AppShell() {
   });
   const [selectedAuthors, setSelectedAuthors] = useState([]);
   const [selectedWorks, setSelectedWorks] = useState([]);
-  const [selectedGrants] = useState([]);
 
   const { mode, setMode } = useColorScheme();
   const navigate = useNavigate();
@@ -445,17 +455,6 @@ function AppShell() {
           </ListItemButton>
 
           <ListItemButton
-            selected={activeMenuEntity === ENTITY_TYPES.WORKS}
-            onClick={() => navigateToSearchEntity(ENTITY_TYPES.WORKS)}
-            sx={navItemSx}
-          >
-            <ListItemIcon>
-              <ArticleOutlinedIcon />
-            </ListItemIcon>
-            <ListItemText primary="Works / Publications" />
-          </ListItemButton>
-
-          <ListItemButton
             selected={savedSearchesSelected}
             onClick={() => navigate("/saved-searches")}
             sx={navItemSx}
@@ -535,7 +534,6 @@ function AppShell() {
                 setSelectedAuthors={setSelectedAuthors}
                 selectedWorks={selectedWorks}
                 setSelectedWorks={setSelectedWorks}
-                selectedGrants={selectedGrants}
               />
             }
           />
@@ -551,7 +549,6 @@ function AppShell() {
                 setSelectedAuthors={setSelectedAuthors}
                 selectedWorks={selectedWorks}
                 setSelectedWorks={setSelectedWorks}
-                selectedGrants={selectedGrants}
               />
             }
           />

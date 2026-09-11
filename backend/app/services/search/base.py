@@ -59,7 +59,6 @@ class BaseSearchProvider(ABC):
 
         method = {
             "authors": self.search_authors,
-            "works": self.search_works,
             "grants": self.search_grants,
         }.get(entity_key)
         if method is None:
@@ -74,17 +73,6 @@ class BaseSearchProvider(ABC):
 
     @abstractmethod
     async def search_authors(
-        self,
-        *,
-        query: str | None,
-        cursor: str | None,
-        limit: int,
-        filters: dict[str, Any],
-    ) -> dict[str, Any]:
-        raise NotImplementedError
-
-    @abstractmethod
-    async def search_works(
         self,
         *,
         query: str | None,

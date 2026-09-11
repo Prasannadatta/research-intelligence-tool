@@ -37,11 +37,13 @@ from app.services.analysis.insights_jobs import (
     enqueue_insights_job,
     serialize_analysis_job,
 )
+from app.services.analysis.author_work_sync import AuthorWorkSyncService
 from app.services.analysis.publication_stats_jobs import (
     PublicationStatsJobService,
     enqueue_publication_stats_job,
     serialize_publication_stats_job,
 )
+from app.services.analysis.sync_job_errors import incomplete_sync_failure
 from app.services.analysis.author_publications import (
     build_author_publication_facets,
     search_author_publication_grants,
@@ -198,11 +200,25 @@ async def author_insights_dashboard(
     request_started = time.perf_counter()
     author_payloads = [author.model_dump() for author in body.authors]
     try:
+        sync_stats = await AuthorWorkSyncService(session).synchronize_selected_authors(
+            author_payloads
+        )
+        incomplete = incomplete_sync_failure(sync_stats, context="insights")
+        if incomplete:
+            raise AuthorAnalysisError(
+                incomplete["error_message"],
+                status_code=409,
+            )
         result = await AuthorInsightsService(session).build_dashboard(
             authors=author_payloads,
             filters=body.filters.model_dump() if body.filters else None,
             excluded_work_ids=body.excluded_work_ids,
         )
+        result["coverage"] = {
+            "verified": True,
+            "corpus_complete": True,
+            "source": "stored_complete_corpus",
+        }
     except AuthorAnalysisError as exc:
         log_insights_timing(
             "total_request",

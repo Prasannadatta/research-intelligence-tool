@@ -1,12 +1,9 @@
-"""OpenAlex author autocomplete and detail retrieval."""
+"""OpenAlex author detail retrieval helpers."""
 
 from __future__ import annotations
 
 import re
-import time
-from collections import OrderedDict
 from datetime import UTC, datetime
-from threading import Lock
 from typing import Any
 
 import httpx
@@ -15,7 +12,6 @@ from app.core.config import get_settings
 from app.integrations.rate_limited_http import provider_get
 
 OPENALEX_AUTHORS_URL = "https://api.openalex.org/authors"
-OPENALEX_AUTOCOMPLETE_AUTHORS_URL = "https://api.openalex.org/autocomplete/authors"
 OPENALEX_ID_PREFIX = "https://openalex.org/"
 ORCID_URL_PREFIX = "https://orcid.org/"
 USER_AGENT = (
@@ -25,11 +21,7 @@ USER_AGENT = (
 REQUEST_TIMEOUT_SECONDS = 12.0
 MAX_INSTITUTIONS = 3
 MAX_TOPICS = 5
-MAX_AUTOCOMPLETE_RESULTS = 10
 AUTHOR_ID_PATTERN = re.compile(r"^A\d+$")
-
-AUTOCOMPLETE_CACHE_TTL_SECONDS = 12 * 60 * 60
-AUTOCOMPLETE_CACHE_MAX_ENTRIES = 1000
 
 
 class OpenAlexApiError(Exception):
@@ -38,48 +30,6 @@ class OpenAlexApiError(Exception):
     def __init__(self, message: str, *, status_code: int = 502) -> None:
         super().__init__(message)
         self.status_code = status_code
-
-
-class _TtlCache:
-    """Simple in-memory TTL cache with a hard entry cap."""
-
-    def __init__(self, *, ttl_seconds: int, max_entries: int) -> None:
-        self._ttl_seconds = ttl_seconds
-        self._max_entries = max_entries
-        self._store: OrderedDict[str, tuple[float, Any]] = OrderedDict()
-        self._lock = Lock()
-
-    def get(self, key: str) -> Any | None:
-        now = time.monotonic()
-        with self._lock:
-            item = self._store.get(key)
-            if item is None:
-                return None
-            expires_at, value = item
-            if expires_at <= now:
-                self._store.pop(key, None)
-                return None
-            self._store.move_to_end(key)
-            return value
-
-    def set(self, key: str, value: Any) -> None:
-        expires_at = time.monotonic() + self._ttl_seconds
-        with self._lock:
-            if key in self._store:
-                self._store.move_to_end(key)
-            self._store[key] = (expires_at, value)
-            while len(self._store) > self._max_entries:
-                self._store.popitem(last=False)
-
-
-_autocomplete_cache = _TtlCache(
-    ttl_seconds=AUTOCOMPLETE_CACHE_TTL_SECONDS,
-    max_entries=AUTOCOMPLETE_CACHE_MAX_ENTRIES,
-)
-
-
-def normalize_autocomplete_query(query: str) -> str:
-    return re.sub(r"\s+", " ", query.strip().lower())
 
 
 def is_valid_openalex_author_id(openalex_id: str) -> bool:
@@ -300,40 +250,6 @@ def normalize_openalex_author(author: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def normalize_autocomplete_author(item: dict[str, Any]) -> dict[str, Any] | None:
-    openalex_id = _short_openalex_id(item.get("id"))
-    if not openalex_id or not is_valid_openalex_author_id(openalex_id):
-        return None
-
-    display_name = item.get("display_name")
-    if display_name is None or not str(display_name).strip():
-        return None
-
-    hint = item.get("hint")
-    hint_text = str(hint).strip() if hint is not None and str(hint).strip() else None
-
-    external_id = item.get("external_id")
-    orcid = None
-    if external_id is not None:
-        external_text = str(external_id).strip()
-        if "orcid.org" in external_text.lower() or re.fullmatch(
-            r"\d{4}-\d{4}-\d{4}-\d{3}[\dX]",
-            external_text,
-        ):
-            orcid = _normalize_orcid(external_text)
-
-    return {
-        "candidate_id": f"openalex:{openalex_id}",
-        "openalex_id": openalex_id,
-        "display_name": str(display_name).strip(),
-        "hint": hint_text,
-        "orcid": orcid,
-        "works_count": _as_optional_int(item.get("works_count")),
-        "cited_by_count": _as_optional_int(item.get("cited_by_count")),
-        "source": "openalex",
-        "details_loaded": False,
-    }
-
 
 async def _openalex_get(url: str, *, params: dict[str, Any]) -> httpx.Response:
     headers = {
@@ -358,56 +274,6 @@ async def _openalex_get(url: str, *, params: dict[str, Any]) -> httpx.Response:
             "OpenAlex author search is temporarily unavailable."
         ) from exc
 
-
-async def autocomplete_openalex_authors(query: str) -> list[dict]:
-    """Lightweight OpenAlex autocomplete for typeahead suggestions."""
-    normalized_query = normalize_autocomplete_query(query)
-    if len(normalized_query) < 3:
-        return []
-
-    cached = _autocomplete_cache.get(normalized_query)
-    if cached is not None:
-        return cached
-
-    api_key = _require_api_key()
-    response = await _openalex_get(
-        OPENALEX_AUTOCOMPLETE_AUTHORS_URL,
-        params={"q": normalized_query, "api_key": api_key},
-    )
-
-    if response.status_code >= 500:
-        raise OpenAlexApiError(
-            "OpenAlex author search is temporarily unavailable."
-        )
-    if response.status_code >= 400:
-        raise OpenAlexApiError(
-            "OpenAlex rejected the author autocomplete request.",
-            status_code=502,
-        )
-
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise OpenAlexApiError(
-            "OpenAlex returned an invalid response."
-        ) from exc
-
-    results = payload.get("results") if isinstance(payload, dict) else None
-    if not isinstance(results, list):
-        normalized: list[dict] = []
-    else:
-        normalized = []
-        for item in results:
-            if not isinstance(item, dict):
-                continue
-            candidate = normalize_autocomplete_author(item)
-            if candidate is not None:
-                normalized.append(candidate)
-            if len(normalized) >= MAX_AUTOCOMPLETE_RESULTS:
-                break
-
-    _autocomplete_cache.set(normalized_query, normalized)
-    return normalized
 
 
 async def fetch_openalex_author_payload(openalex_id: str) -> dict[str, Any]:
@@ -469,54 +335,3 @@ async def get_openalex_author(openalex_id: str) -> dict:
     return normalized
 
 
-async def search_openalex_authors(query: str, limit: int = 10) -> list[dict]:
-    """
-    Full OpenAlex author search (legacy / non-typeahead use).
-
-    Typeahead should use autocomplete_openalex_authors instead.
-    """
-    cleaned_query = query.strip()
-    if not cleaned_query:
-        return []
-
-    api_key = _require_api_key()
-    per_page = max(1, min(limit, 20))
-    response = await _openalex_get(
-        OPENALEX_AUTHORS_URL,
-        params={
-            "search": cleaned_query,
-            "per_page": per_page,
-            "api_key": api_key,
-        },
-    )
-
-    if response.status_code >= 500:
-        raise OpenAlexApiError(
-            "OpenAlex author search is temporarily unavailable."
-        )
-    if response.status_code >= 400:
-        raise OpenAlexApiError(
-            "OpenAlex rejected the author search request.",
-            status_code=502,
-        )
-
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise OpenAlexApiError(
-            "OpenAlex returned an invalid response."
-        ) from exc
-
-    results = payload.get("results") if isinstance(payload, dict) else None
-    if not isinstance(results, list):
-        return []
-
-    normalized: list[dict] = []
-    for author in results:
-        if not isinstance(author, dict):
-            continue
-        candidate = normalize_openalex_author(author)
-        if candidate is not None:
-            normalized.append(candidate)
-
-    return normalized

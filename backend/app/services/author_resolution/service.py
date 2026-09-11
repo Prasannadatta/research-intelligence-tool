@@ -396,10 +396,11 @@ async def resolve_author_page(
     known_canonical_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     """
-    Resolve a provider author page into insert/replace operations.
+    Resolve provider author rows into insert/replace operations.
 
-    A duplicate discovered on a later page updates the existing canonical author
-    and does not create another list card.
+    Already-linked OpenAlex/ORCID identities are reused from a single batch
+    lookup (no re-scoring / institution rewrite). New identities still go
+    through full resolution in one shared transaction.
     """
     service = AuthorResolutionService(session)
     known = set(known_canonical_ids or [])
@@ -408,13 +409,31 @@ async def resolve_author_page(
     results: list[dict[str, Any]] = []
     seen_page_ids: set[str] = set()
 
+    prepared: list[AuthorCandidate] = []
     for raw in provider_results:
         candidate = candidate_from_provider_result(raw)
-        if candidate is None:
-            continue
+        if candidate is not None:
+            prepared.append(candidate)
 
+    existing_by_key = await service.repo.get_provider_records_by_keys(
+        [(row.provider, row.provider_author_id) for row in prepared]
+    )
+
+    for candidate in prepared:
+        key = (
+            str(candidate.provider or "").strip().lower(),
+            str(candidate.provider_author_id or "").strip(),
+        )
+        existing = existing_by_key.get(key)
         try:
-            author, _created = await service.resolve_candidate(candidate)
+            if (
+                existing is not None
+                and existing.canonical_author_id is not None
+                and existing.canonical_author is not None
+            ):
+                author = serialize_canonical_author(existing.canonical_author)
+            else:
+                author, _created = await service.resolve_candidate(candidate)
         except Exception:
             if candidate.provider == "orcid":
                 logger.warning(

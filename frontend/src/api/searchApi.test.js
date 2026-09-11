@@ -23,12 +23,8 @@ describe("searchApi ORCID and default source helpers", () => {
     expect(normalizeSearchQuery("Lin Lin", ENTITY_TYPES.AUTHORS)).toBe("lin lin");
   });
 
-  it("defaults Author Search to All sources and keeps an explicit OpenAlex choice", () => {
+  it("defaults Author Search to All sources (OpenAlex + ORCID)", () => {
     expect(FALLBACK_CAPABILITIES.default_source).toBe(SEARCH_SOURCES.ALL);
-    const all = FALLBACK_CAPABILITIES.sources.find((item) => item.id === SEARCH_SOURCES.ALL);
-    expect(all.enabled).toBe(true);
-    expect(all.supported_entity_types).toContain("authors");
-
     expect(
       resolveCompatibleSource(
         FALLBACK_CAPABILITIES,
@@ -46,7 +42,14 @@ describe("searchApi ORCID and default source helpers", () => {
     expect(
       resolveCompatibleSource(
         FALLBACK_CAPABILITIES,
-        ENTITY_TYPES.WORKS,
+        ENTITY_TYPES.AUTHORS,
+        SEARCH_SOURCES.ARXIV,
+      ),
+    ).toBe(SEARCH_SOURCES.ALL);
+    expect(
+      resolveCompatibleSource(
+        FALLBACK_CAPABILITIES,
+        ENTITY_TYPES.GRANTS,
         SEARCH_SOURCES.OPENALEX,
       ),
     ).toBe(SEARCH_SOURCES.OPENALEX);

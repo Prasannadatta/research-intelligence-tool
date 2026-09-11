@@ -12,18 +12,19 @@ describe("searchNavigation", () => {
   it("parses valid entity query values", () => {
     expect(parseEntityParam("authors")).toBe(ENTITY_TYPES.AUTHORS);
     expect(parseEntityParam("grants")).toBe(ENTITY_TYPES.GRANTS);
-    expect(parseEntityParam("works")).toBe(ENTITY_TYPES.WORKS);
   });
 
-  it("defaults invalid or missing entity values to authors", () => {
+  it("defaults invalid, missing, or legacy works values to authors", () => {
     expect(parseEntityParam(null)).toBe(ENTITY_TYPES.AUTHORS);
     expect(parseEntityParam("invalid")).toBe(ENTITY_TYPES.AUTHORS);
     expect(parseEntityParam("")).toBe(ENTITY_TYPES.AUTHORS);
+    expect(parseEntityParam("works")).toBe(ENTITY_TYPES.AUTHORS);
   });
 
   it("builds search home paths with entity query", () => {
     expect(buildSearchHomePath("grants")).toBe("/?entity=grants");
     expect(buildSearchHomePath("bogus")).toBe("/?entity=authors");
+    expect(buildSearchHomePath("works")).toBe("/?entity=authors");
   });
 
   it("resolves active menu entity from routes and query", () => {
@@ -35,10 +36,10 @@ describe("searchNavigation", () => {
     ).toBe(ENTITY_TYPES.GRANTS);
     expect(
       getActiveSearchMenuEntity("/works/abc-123", new URLSearchParams()),
-    ).toBe(ENTITY_TYPES.WORKS);
+    ).toBe(null);
     expect(
       getActiveSearchMenuEntity("/", new URLSearchParams("entity=works")),
-    ).toBe(ENTITY_TYPES.WORKS);
+    ).toBe(ENTITY_TYPES.AUTHORS);
     expect(
       getActiveSearchMenuEntity("/search", new URLSearchParams("entity=grants")),
     ).toBe(ENTITY_TYPES.GRANTS);

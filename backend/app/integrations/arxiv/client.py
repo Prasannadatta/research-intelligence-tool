@@ -197,10 +197,15 @@ async def _fetch_arxiv_atom(*, search_query: str, start: int, max_results: int) 
     finally:
         _last_uncached_request_at = time.monotonic()
 
-    if response.status_code in {429, 503}:
+    if response.status_code == 429:
+        raise ArxivApiError(
+            "arXiv rate limit reached.",
+            status_code=429,
+        )
+    if response.status_code == 503:
         raise ArxivApiError(
             "arXiv search is temporarily unavailable. Please try again.",
-            status_code=502,
+            status_code=503,
         )
     if response.status_code >= 500:
         raise ArxivApiError(
@@ -248,56 +253,6 @@ def _page_has_more(
     if total_results is not None:
         return (start + returned_count) < total_results
     return returned_count >= PAGE_SIZE
-
-
-async def search_arxiv_works(
-    *,
-    query: str,
-    limit: int = PAGE_SIZE,
-    cursor: str | None = None,
-) -> dict[str, Any]:
-    cleaned = normalize_arxiv_query(query)
-    if len(cleaned) < 3:
-        raise ArxivApiError(
-            "Query must be at least 3 characters after trimming.",
-            status_code=422,
-        )
-
-    page_size = max(1, min(int(limit or PAGE_SIZE), PAGE_SIZE))
-    start = validate_arxiv_cursor(cursor, entity_type="works", query=cleaned)
-    search_query = f"all:{cleaned}"
-
-    parsed = await _get_parsed_page(
-        entity_type="works",
-        query=cleaned,
-        search_query=search_query,
-        start=start,
-    )
-    works = list(parsed.get("works") or [])[:page_size]
-    total_results = parsed.get("total_results")
-    has_more = _page_has_more(
-        start=start,
-        returned_count=len(works),
-        total_results=total_results if isinstance(total_results, int) else None,
-    )
-    next_cursor = (
-        build_arxiv_cursor(
-            entity_type="works",
-            query=cleaned,
-            next_start=start + page_size,
-        )
-        if has_more
-        else None
-    )
-
-    return {
-        "query": cleaned,
-        "entity_type": "works",
-        "source": "arxiv",
-        "results": works,
-        "next_cursor": next_cursor,
-        "has_more": has_more,
-    }
 
 
 async def search_arxiv_authors(
@@ -470,6 +425,7 @@ async def search_arxiv_publications_by_authors(
         else None
     )
 
+    count = total_results if isinstance(total_results, int) and total_results >= 0 else None
     return {
         "query": query_key,
         "entity_type": "works",
@@ -478,6 +434,7 @@ async def search_arxiv_publications_by_authors(
         "results": results[:page_size],
         "next_cursor": next_cursor,
         "has_more": has_more,
+        "count": count,
     }
 
 

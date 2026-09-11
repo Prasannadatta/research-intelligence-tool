@@ -101,6 +101,7 @@ async def test_insights_job_syncs_new_author_then_builds_dashboard(session_facto
             "results": [_work_row("NW1", "Fresh Paper", [("NA1", "New Author")])],
             "has_more": False,
             "next_cursor": None,
+            "count": 1,
         },
     ) as mock_fetch:
         created = client.post(
@@ -219,6 +220,7 @@ async def test_insights_job_refreshes_stale_author(session_factory, monkeypatch)
             "results": [_work_row("SW1", "Refreshed", [("SA1", "Stale Author")])],
             "has_more": False,
             "next_cursor": None,
+            "count": 1,
         },
     ) as mock_fetch:
         created = client.post(
@@ -278,6 +280,7 @@ async def test_partial_sync_is_retried_and_not_treated_as_complete(session_facto
             ],
             "has_more": False,
             "next_cursor": None,
+            "count": 2,
         },
     ) as mock_fetch:
         created = client.post(
@@ -372,6 +375,7 @@ async def test_mixed_fresh_and_stale_authors(session_factory, monkeypatch):
             "results": [_work_row(f"W-{author_id}", f"Paper {author_id}", [(author_id, "X")])],
             "has_more": False,
             "next_cursor": None,
+            "count": 1,
         }
 
     with patch(
@@ -413,11 +417,13 @@ async def test_insights_job_progress_includes_author_and_counts(session_factory,
             "results": [_work_row("MHG-W1", "One", [("MHG1", "Martin Head-Gordon")])],
             "has_more": True,
             "next_cursor": "c2",
+            "count": 2,
         },
         {
             "results": [_work_row("MHG-W2", "Two", [("MHG1", "Martin Head-Gordon")])],
             "has_more": False,
             "next_cursor": None,
+            "count": 2,
         },
     ]
 
@@ -434,8 +440,8 @@ async def test_insights_job_progress_includes_author_and_counts(session_factory,
 
         async def run_and_sample():
             task = asyncio.create_task(run_insights_job(job_id))
-            for _ in range(40):
-                await asyncio.sleep(0.01)
+            for _ in range(100):
+                await asyncio.sleep(0.02)
                 row = client.get(f"/api/analysis/authors/insights/jobs/{job_id}").json()
                 progress_events.append(
                     {

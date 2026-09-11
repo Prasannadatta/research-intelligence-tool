@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from typing import Any, Sequence
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -50,6 +50,51 @@ class AuthorIdentityRepository:
         )
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
+
+    async def get_provider_records_by_keys(
+        self,
+        keys: Sequence[tuple[str, str]],
+    ) -> dict[tuple[str, str], ProviderAuthorRecord]:
+        """Batch-load provider records keyed by (provider, provider_author_id)."""
+        unique_keys = list(dict.fromkeys(
+            (str(provider or "").strip().lower(), str(provider_author_id or "").strip())
+            for provider, provider_author_id in keys
+            if str(provider or "").strip() and str(provider_author_id or "").strip()
+        ))
+        if not unique_keys:
+            return {}
+
+        conditions = [
+            and_(
+                ProviderAuthorRecord.provider == provider,
+                ProviderAuthorRecord.provider_author_id == provider_author_id,
+            )
+            for provider, provider_author_id in unique_keys
+        ]
+        stmt = (
+            select(ProviderAuthorRecord)
+            .where(or_(*conditions))
+            .options(
+                selectinload(ProviderAuthorRecord.canonical_author).selectinload(
+                    CanonicalAuthor.aliases
+                ),
+                selectinload(ProviderAuthorRecord.canonical_author).selectinload(
+                    CanonicalAuthor.provider_records
+                ).selectinload(ProviderAuthorRecord.institutions),
+                selectinload(ProviderAuthorRecord.canonical_author).selectinload(
+                    CanonicalAuthor.provider_records
+                ).selectinload(ProviderAuthorRecord.works),
+            )
+        )
+        result = await self.session.execute(stmt)
+        out: dict[tuple[str, str], ProviderAuthorRecord] = {}
+        for record in result.scalars().all():
+            key = (
+                str(record.provider or "").strip().lower(),
+                str(record.provider_author_id or "").strip(),
+            )
+            out[key] = record
+        return out
 
     async def upsert_provider_record(
         self,

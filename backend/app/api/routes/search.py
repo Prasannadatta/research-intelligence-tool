@@ -82,13 +82,13 @@ async def unified_search(
     ),
     entity_type: str | None = Query(
         None,
-        description="Entity type: authors | works | grants (alias: entity).",
-        pattern="^(authors|works|grants)$",
+        description="Entity type: authors | grants (alias: entity).",
+        pattern="^(authors|grants)$",
     ),
     entity: str | None = Query(
         None,
         description="Alias for entity_type.",
-        pattern="^(authors|works|grants)$",
+        pattern="^(authors|grants)$",
     ),
     source: str | None = Query(
         None,
@@ -102,7 +102,7 @@ async def unified_search(
     ),
     search_mode: str = Query(
         "auto",
-        description="OpenAlex authors/works only: auto | keywords | grant_number.",
+        description="OpenAlex authors only: auto | keywords | grant_number.",
         pattern="^(auto|keywords|grant_number)$",
     ),
     limit: int = Query(20, ge=1, le=20, description="Page size (max 20)"),
@@ -125,37 +125,23 @@ async def unified_search(
         None,
         description="OpenAlex topic ID filter (authors only), e.g. T123.",
     ),
-    known_author_ids: str | None = Query(
-        None,
-        description=(
-            "Comma-separated canonical author UUIDs already shown in this search "
-            "session. Used so later pages can emit replace updates instead of "
-            "duplicate cards."
-        ),
-    ),
     search_session_id: str | None = Query(
         None,
         description=(
-            "Opaque search session UUID for works/grants infinite scroll. "
+            "Opaque search session UUID for grants infinite scroll. "
             "Omit on the first page; reuse the returned id on later pages."
         ),
     ),
 ) -> UnifiedSearchResponse:
     resolved_query = query if query is not None else q
     resolved_entity = entity_type or entity
-    resolved_provider = source or provider or "openalex"
+    resolved_provider = source or provider or "all"
 
     if not resolved_entity:
         raise HTTPException(
             status_code=422,
             detail="entity_type (or entity) is required.",
         )
-
-    known_ids = [
-        part.strip()
-        for part in (known_author_ids or "").split(",")
-        if part.strip()
-    ]
 
     try:
         from app.services.search.diag_timing import enabled as diag_enabled, log_summary, reset
@@ -172,7 +158,6 @@ async def unified_search(
             institution_id=institution_id,
             topic_id=topic_id,
             search_mode=search_mode,
-            known_author_ids=known_ids,
             search_session_id=search_session_id,
             affiliation=affiliation,
         )

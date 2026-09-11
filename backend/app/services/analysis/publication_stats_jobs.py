@@ -7,6 +7,7 @@ import logging
 import uuid
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -28,6 +29,7 @@ from app.services.analysis.publication_filters import (
     build_dependent_publication_facets,
     normalize_filters,
 )
+from app.services.analysis.sync_job_errors import incomplete_sync_failure
 
 logger = logging.getLogger(__name__)
 
@@ -83,28 +85,33 @@ def _format_sync_stage(detail: dict[str, Any]) -> str:
     phase = str(detail.get("phase") or "").strip().lower()
     if phase == "checking":
         return STAGE_CHECKING
+    if detail.get("rate_limited"):
+        provider = str(detail.get("provider") or "Provider").strip() or "Provider"
+        label = provider[:1].upper() + provider[1:]
+        return f"{label} rate limit reached"
     author = str(detail.get("current_author") or "").strip()
     processed = detail.get("publications_processed")
     total = detail.get("publications_total")
     if author and processed is not None and total is not None:
         try:
             return (
-                f"Building complete publication statistics — "
+                f"Syncing publications for {author} — "
                 f"{int(processed):,} / {int(total):,}"
             )
         except (TypeError, ValueError):
-            return f"Building complete publication statistics — {processed} / {total}"
+            return f"Syncing publications for {author} — {processed} / {total}"
     if processed is not None and total is not None:
         try:
-            return (
-                f"Building complete publication statistics — "
-                f"{int(processed):,} / {int(total):,}"
-            )
+            return f"Syncing publications — {int(processed):,} / {int(total):,}"
         except (TypeError, ValueError):
-            return f"Building complete publication statistics — {processed} / {total}"
+            return f"Syncing publications — {processed} / {total}"
     if author:
-        return f"Building complete publication statistics for {author}"
-    return STAGE_BUILDING
+        return f"Syncing publications for {author}"
+    return STAGE_SYNCING
+
+
+def _incomplete_sync_failure(stats: list[dict[str, Any]]) -> dict[str, Any] | None:
+    return incomplete_sync_failure(stats, context="publication_stats")
 
 
 def _sync_percent(detail: dict[str, Any]) -> int:
@@ -125,34 +132,6 @@ def _sync_percent(detail: dict[str, Any]) -> int:
     except (TypeError, ValueError):
         page_fraction = 0.0
     return min(base + int((author_fraction + page_fraction) * span), 70)
-
-
-def _incomplete_sync_message(stats: list[dict[str, Any]]) -> str | None:
-    problems = [
-        row
-        for row in stats
-        if str(row.get("status") or "").lower()
-        not in {STATUS_COMPLETE, "fresh", "success"}
-    ]
-    if not problems:
-        return None
-    parts: list[str] = []
-    for row in problems:
-        name = row.get("display_name") or row.get("canonical_author_id") or "Selected author"
-        provider = row.get("provider") or "provider"
-        status = row.get("status") or STATUS_FAILED
-        detail = row.get("error_message")
-        if detail:
-            parts.append(f"{name} ({provider}): {status} — {detail}")
-        else:
-            parts.append(f"{name} ({provider}): {status}")
-    joined = "; ".join(parts[:3])
-    if len(parts) > 3:
-        joined = f"{joined}; +{len(parts) - 3} more"
-    return (
-        "Complete publication statistics are unavailable because coverage sync "
-        f"did not finish. {joined}"
-    )
 
 
 async def build_publication_corpus_stats(
@@ -198,7 +177,12 @@ async def build_publication_corpus_stats(
         "facets": facets,
         "total_matching_publications": len(filtered),
         "total_corpus_publications": len(filter_items),
-        "corpus_complete": True,
+        # Caller must explicitly set True only after verified sync completeness.
+        "corpus_complete": False,
+        "coverage": {
+            "verified": False,
+            "source": "stored_corpus",
+        },
     }
 
 
@@ -277,6 +261,7 @@ class PublicationStatsJobService:
                         "publications_total": detail.get("publications_total"),
                         "provider": detail.get("provider"),
                         "sync_status": detail.get("sync_status") or detail.get("status"),
+                        "rate_limited": bool(detail.get("rate_limited")),
                     },
                 )
 
@@ -284,9 +269,13 @@ class PublicationStatsJobService:
                 authors,
                 on_progress=on_sync_progress,
             )
-            incomplete = _incomplete_sync_message(sync_stats)
+            incomplete = _incomplete_sync_failure(sync_stats)
             if incomplete:
-                await self._fail(job_uuid, incomplete)
+                await self._fail(
+                    job_uuid,
+                    incomplete["error_message"],
+                    detail=incomplete,
+                )
                 return
 
             await on_progress(
@@ -299,6 +288,33 @@ class PublicationStatsJobService:
                 authors=authors,
                 filters=payload.get("filters"),
             )
+            # Hard gate: never label complete unless every blocking sync stat is verified.
+            from app.services.analysis.sync_job_errors import _blocking_sync_problems
+
+            if _blocking_sync_problems(sync_stats):
+                await self._fail(
+                    job_uuid,
+                    "Complete publication statistics are unavailable because coverage "
+                    "was not verified complete.",
+                    detail={"sync_status": STATUS_FAILED, "rate_limited": False},
+                )
+                return
+            result["corpus_complete"] = True
+            result["coverage"] = {
+                "verified": True,
+                "source": "stored_complete_corpus",
+            }
+            result["sync_stats"] = [
+                {
+                    "canonical_author_id": row.get("canonical_author_id"),
+                    "provider": row.get("provider"),
+                    "stored_work_count": row.get("stored_work_count_after"),
+                    "provider_work_count": row.get("provider_work_count"),
+                    "status": row.get("status"),
+                    "coverage_verified": bool(row.get("coverage_verified")),
+                }
+                for row in sync_stats
+            ]
         except AuthorAnalysisError as exc:
             await self._fail(job_uuid, str(exc))
             return
@@ -321,6 +337,7 @@ class PublicationStatsJobService:
             "phase": "completed",
             "job_kind": JOB_KIND,
             "sync_status": STATUS_COMPLETE,
+            "corpus_complete": True,
             "total_matching_publications": result.get("total_matching_publications"),
         }
         current.error_message = None
@@ -328,28 +345,74 @@ class PublicationStatsJobService:
         current.updated_at = current.completed_at
         await self.session.commit()
 
-    async def _fail(self, job_id: uuid.UUID, message: str) -> None:
+    async def _fail(
+        self,
+        job_id: uuid.UUID,
+        message: str,
+        *,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
         job = await self.get_job(job_id)
         if job is None:
             return
         job.status = STATUS_FAILED_JOB
         job.error_message = message
         job.progress_stage = STAGE_FAILED
+        extra = detail or {}
         job.progress_detail = {
             "phase": "failed",
             "job_kind": JOB_KIND,
-            "sync_status": STATUS_FAILED,
+            "sync_status": extra.get("sync_status") or STATUS_FAILED,
             "error_message": message,
+            "rate_limited": bool(extra.get("rate_limited")),
+            "provider": extra.get("provider"),
+            "providers": list(extra.get("providers") or []),
+            "corpus_complete": False,
         }
         job.completed_at = utc_now()
         job.updated_at = job.completed_at
         await self.session.commit()
 
 
+def _author_fingerprint(payload: dict[str, Any]) -> str:
+    authors = payload.get("authors") or []
+    ids = sorted(
+        {
+            str(row.get("canonical_author_id") or "").strip()
+            for row in authors
+            if isinstance(row, dict) and row.get("canonical_author_id")
+        }
+    )
+    filters = payload.get("filters")
+    return f"{','.join(ids)}|{filters!r}"
+
+
 async def enqueue_publication_stats_job(
     session: AsyncSession,
     payload: dict[str, Any],
 ) -> dict[str, Any]:
+    """Create a stats job, reusing an in-flight job for the same author/filter set."""
+    fingerprint = _author_fingerprint(payload)
+    existing_rows = (
+        await session.execute(
+            select(AnalysisJob)
+            .where(AnalysisJob.status.in_([STATUS_QUEUED, STATUS_RUNNING]))
+            .order_by(AnalysisJob.created_at.desc())
+            .limit(25)
+        )
+    ).scalars().all()
+    for existing in existing_rows:
+        request = existing.request_payload if isinstance(existing.request_payload, dict) else {}
+        if request.get("job_kind") != JOB_KIND:
+            continue
+        if _author_fingerprint(request) == fingerprint:
+            logger.info(
+                "publication_stats_job_reused job_id=%s fingerprint=%s",
+                existing.id,
+                fingerprint,
+            )
+            return serialize_publication_stats_job(existing)
+
     job = await PublicationStatsJobService(session).create_job(payload)
     schedule_publication_stats_job(str(job.id))
     return serialize_publication_stats_job(job)

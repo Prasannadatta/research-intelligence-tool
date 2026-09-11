@@ -1,4 +1,4 @@
-"""Live author-search wiring for ORCID alongside OpenAlex and arXiv."""
+"""Author-search wiring for ORCID alongside OpenAlex (All = OA + ORCID)."""
 
 from __future__ import annotations
 
@@ -26,6 +26,10 @@ def _search_settings(monkeypatch):
     monkeypatch.setenv("PROVIDER_SEARCH_CACHE_ENABLED", "false")
     monkeypatch.setenv("ORCID_ENABLED", "true")
 
+    from app.services.search.openalex_provider import clear_author_page_cache
+
+    clear_author_page_cache()
+
     async def _empty_oa_orcid(**_kwargs):
         return {
             "query": "",
@@ -42,6 +46,7 @@ def _search_settings(monkeypatch):
     )
     get_settings.cache_clear()
     yield
+    clear_author_page_cache()
     get_settings.cache_clear()
 
 
@@ -287,26 +292,13 @@ def test_orcid_outage_does_not_break_openalex_or_arxiv():
     assert arxiv.json()["results"][0]["source"] == "arxiv"
 
 
-def test_openalex_author_search_appends_orcid_without_name_merge():
+def test_openalex_name_search_does_not_call_orcid():
+    orcid_called = False
+
     async def fake_orcid(**_kwargs):
-        return {
-            "query": "Lin Lin",
-            "source": "orcid",
-            "results": [
-                _orcid_candidate(
-                    LIN_A,
-                    display_name="Lin Lin",
-                    institution="University of California Berkeley",
-                ),
-                _orcid_candidate(
-                    LIN_B,
-                    display_name="Lin Lin",
-                    institution="Shanghai Normal University",
-                ),
-            ],
-            "num_found": 2,
-            "has_more": False,
-        }
+        nonlocal orcid_called
+        orcid_called = True
+        return {"query": "Lin Lin", "source": "orcid", "results": [], "num_found": 0, "has_more": False}
 
     openalex_row = {
         "result_id": "openalex:A9",
@@ -343,15 +335,12 @@ def test_openalex_author_search_appends_orcid_without_name_merge():
 
     assert response.status_code == 200
     rows = response.json()["results"]
-    sources = [row["source"] for row in rows]
-    assert sources == ["orcid", "orcid"]
-    by_orcid = {row["orcid"]: row for row in rows}
-    assert by_orcid[LIN_A]["openalex_id"] == "A9"
-    assert by_orcid[LIN_A]["source"] == "orcid"
-    assert by_orcid[LIN_A]["works_count"] == 40
-    assert by_orcid[LIN_B].get("openalex_id") in (None, "")
-    assert by_orcid[LIN_A]["result_id"] != by_orcid[LIN_B]["result_id"]
-    assert by_orcid[LIN_A]["display_name"] == by_orcid[LIN_B]["display_name"] == "Lin Lin"
+    assert [row["source"] for row in rows] == ["openalex"]
+    assert rows[0]["openalex_id"] == "A9"
+    assert rows[0]["orcid"] == LIN_A
+    assert orcid_called is False
+    assert "items" not in response.json() or response.json().get("items") in (None, [])
+
 
 
 def test_orcid_id_search_returns_berkeley_profile():
@@ -398,8 +387,11 @@ def test_orcid_id_search_returns_berkeley_profile():
     assert rows[0]["primary_institution"]["name"] == "University of California Berkeley"
 
 
-def test_orcid_row_hydrates_openalex_by_exact_orcid(monkeypatch):
-    async def fake_orcid(**_kwargs):
+def test_orcid_search_does_not_hydrate_openalex_at_search_time(monkeypatch):
+    oa_orcid_calls: list[str] = []
+
+    async def fake_orcid(**kwargs):
+        assert kwargs.get("enrich") is False
         return {
             "query": LIN_A,
             "source": "orcid",
@@ -415,9 +407,9 @@ def test_orcid_row_hydrates_openalex_by_exact_orcid(monkeypatch):
         }
 
     async def fake_oa_by_orcid(orcid, **_kwargs):
-        assert orcid == LIN_A
+        oa_orcid_calls.append(orcid)
         return {
-            "query": LIN_A,
+            "query": orcid,
             "entity_type": "authors",
             "source": "openalex",
             "results": [
@@ -427,9 +419,8 @@ def test_orcid_row_hydrates_openalex_by_exact_orcid(monkeypatch):
                     "openalex_id": "A501",
                     "display_name": "Lin Lin",
                     "source": "openalex",
-                    "orcid": LIN_A,
+                    "orcid": orcid,
                     "works_count": 200,
-                    "cited_by_count": 12,
                 }
             ],
             "next_cursor": None,
@@ -454,8 +445,8 @@ def test_orcid_row_hydrates_openalex_by_exact_orcid(monkeypatch):
     row = response.json()["results"][0]
     assert row["source"] == "orcid"
     assert row["orcid"] == LIN_A
-    assert row["openalex_id"] == "A501"
-    assert row["works_count"] == 200
+    assert row.get("openalex_id") in (None, "")
+    assert oa_orcid_calls == []
 
 
 def test_all_sources_orcid_id_enriches_matching_openalex():
@@ -518,8 +509,12 @@ def test_all_sources_orcid_id_enriches_matching_openalex():
     assert rows[0]["primary_institution"]["name"] == "University of California Berkeley"
 
 
-def test_openalex_without_orcid_stays_separate_from_same_name_orcid_profiles():
+def test_openalex_name_search_does_not_append_orcid_profiles():
+    orcid_called = False
+
     async def fake_orcid(**_kwargs):
+        nonlocal orcid_called
+        orcid_called = True
         return {
             "query": "Lin Lin",
             "source": "orcid",
@@ -574,13 +569,16 @@ def test_openalex_without_orcid_stays_separate_from_same_name_orcid_profiles():
 
     assert response.status_code == 200
     rows = response.json()["results"]
-    assert [row["source"] for row in rows] == ["openalex", "orcid", "orcid"]
-    assert {row["orcid"] for row in rows if row["source"] == "orcid"} == {LIN_A, LIN_B}
+    assert [row["source"] for row in rows] == ["openalex"]
     assert rows[0]["openalex_id"] == "A0"
     assert rows[0].get("orcid") in (None, "")
+    assert orcid_called is False
 
 
-def test_all_sources_name_search_keeps_same_name_orcid_profiles_separate():
+def test_all_sources_name_search_merges_exact_orcid_excludes_arxiv():
+    """All = OpenAlex + ORCID; exact ORCID merge; never arXiv; never name-only merge."""
+    arxiv_called = False
+
     async def fake_orcid(**_kwargs):
         return {
             "query": "Lin Lin",
@@ -601,6 +599,18 @@ def test_all_sources_name_search_keeps_same_name_orcid_profiles_separate():
             "has_more": False,
         }
 
+    async def fake_arxiv(**_kwargs):
+        nonlocal arxiv_called
+        arxiv_called = True
+        return {
+            "query": "Lin Lin",
+            "entity_type": "authors",
+            "source": "arxiv",
+            "results": [],
+            "next_cursor": None,
+            "has_more": False,
+        }
+
     with (
         patch(
             "app.services.search.orcid_provider.search_orcid_authors",
@@ -615,13 +625,22 @@ def test_all_sources_name_search_keeps_same_name_orcid_profiles_separate():
                 "source": "openalex",
                 "results": [
                     {
+                        "result_id": "openalex:A501",
+                        "result_type": "author",
+                        "openalex_id": "A501",
+                        "display_name": "Lin Lin",
+                        "source": "openalex",
+                        "orcid": LIN_A,
+                        "works_count": 90,
+                    },
+                    {
                         "result_id": "openalex:A0",
                         "result_type": "author",
                         "openalex_id": "A0",
                         "display_name": "Lin Lin",
                         "source": "openalex",
                         "orcid": None,
-                    }
+                    },
                 ],
                 "next_cursor": None,
                 "has_more": False,
@@ -629,15 +648,7 @@ def test_all_sources_name_search_keeps_same_name_orcid_profiles_separate():
         ),
         patch(
             "app.services.search.arxiv_provider.search_arxiv_authors",
-            new_callable=AsyncMock,
-            return_value={
-                "query": "Lin Lin",
-                "entity_type": "authors",
-                "source": "arxiv",
-                "results": [],
-                "next_cursor": None,
-                "has_more": False,
-            },
+            side_effect=fake_arxiv,
         ),
     ):
         response = client.get(
@@ -647,8 +658,68 @@ def test_all_sources_name_search_keeps_same_name_orcid_profiles_separate():
 
     assert response.status_code == 200
     rows = response.json()["results"]
-    assert [row["source"] for row in rows] == ["openalex", "orcid", "orcid"]
-    assert {row["orcid"] for row in rows if row["source"] == "orcid"} == {LIN_A, LIN_B}
+    assert arxiv_called is False
+    # OA without ORCID kept; matching ORCID merged into ORCID-anchored row; other ORCID kept.
+    sources = [row["source"] for row in rows]
+    assert sources.count("openalex") == 1
+    assert sources.count("orcid") == 2
+    assert len(rows) == 3
+    by_orcid = {row.get("orcid"): row for row in rows if row.get("orcid")}
+    assert by_orcid[LIN_A]["source"] == "orcid"
+    assert by_orcid[LIN_A]["openalex_id"] == "A501"
+    assert by_orcid[LIN_A]["works_count"] == 90
+    assert by_orcid[LIN_B]["openalex_id"] is None
+    # Name-only OpenAlex row is not merged into either ORCID profile.
+    oa_only = next(row for row in rows if row["source"] == "openalex")
+    assert oa_only["openalex_id"] == "A0"
+    assert oa_only.get("orcid") in (None, "")
+
+
+def test_merge_authors_by_exact_orcid_never_merges_by_name():
+    from app.services.search.search_service import merge_authors_by_exact_orcid
+
+    oa_named = {
+        "result_id": "openalex:A0",
+        "source": "openalex",
+        "openalex_id": "A0",
+        "display_name": "Lin Lin",
+        "orcid": None,
+    }
+    orcid_row = {
+        "result_id": f"orcid:{LIN_B}",
+        "source": "orcid",
+        "orcid": LIN_B,
+        "display_name": "Lin Lin",
+        "openalex_id": None,
+    }
+    oa_linked = {
+        "result_id": "openalex:A501",
+        "source": "openalex",
+        "openalex_id": "A501",
+        "display_name": "Lin Lin",
+        "orcid": LIN_A,
+        "works_count": 10,
+    }
+    orcid_linked = {
+        "result_id": f"orcid:{LIN_A}",
+        "source": "orcid",
+        "orcid": LIN_A,
+        "display_name": "Lin Lin",
+        "openalex_id": None,
+        "works_count": None,
+    }
+    merged = merge_authors_by_exact_orcid(
+        [oa_named, oa_linked, orcid_linked, orcid_row]
+    )
+    assert len(merged) == 3
+    by_key = {
+        (row.get("source"), row.get("orcid") or row.get("openalex_id")): row
+        for row in merged
+    }
+    assert by_key[("orcid", LIN_A)]["openalex_id"] == "A501"
+    assert by_key[("orcid", LIN_A)]["works_count"] == 10
+    assert by_key[("openalex", "A0")]["orcid"] is None
+    assert by_key[("orcid", LIN_B)]["openalex_id"] is None
 
 
 def test_orcid_identifier_is_not_treated_as_grant_number():
@@ -659,19 +730,7 @@ def test_orcid_identifier_is_not_treated_as_grant_number():
     assert looks_like_grant_number("R01GM123456") is True
 
 
-def test_name_search_skips_openalex_orcid_hydration(monkeypatch):
-    hydrate_called = False
-
-    async def fake_hydrate(results):
-        nonlocal hydrate_called
-        hydrate_called = True
-        return results
-
-    monkeypatch.setattr(
-        "app.services.search.search_service._hydrate_orcid_rows_from_openalex",
-        fake_hydrate,
-    )
-
+def test_openalex_only_does_not_call_orcid_enrich():
     enrich_flags: list[bool | None] = []
 
     async def fake_orcid(**kwargs):
@@ -714,29 +773,16 @@ def test_name_search_skips_openalex_orcid_hydration(monkeypatch):
         )
 
     assert response.status_code == 200
-    assert enrich_flags == [False]
-    assert hydrate_called is False
+    assert enrich_flags == []
 
 
-def test_direct_orcid_search_still_hydrates_openalex(monkeypatch):
-    hydrate_called = False
-
-    async def fake_hydrate(results):
-        nonlocal hydrate_called
-        hydrate_called = True
-        return results
-
-    monkeypatch.setattr(
-        "app.services.search.search_service._hydrate_orcid_rows_from_openalex",
-        fake_hydrate,
-    )
-
+def test_orcid_name_and_id_search_always_pass_enrich_false():
     enrich_flags: list[bool | None] = []
 
     async def fake_orcid(**kwargs):
         enrich_flags.append(kwargs.get("enrich"))
         return {
-            "query": LIN_A,
+            "query": kwargs.get("query"),
             "source": "orcid",
             "results": [
                 _orcid_candidate(
@@ -753,12 +799,270 @@ def test_direct_orcid_search_still_hydrates_openalex(monkeypatch):
         "app.services.search.orcid_provider.search_orcid_authors",
         side_effect=fake_orcid,
     ):
-        response = client.get(
+        name = client.get(
+            "/api/search",
+            params={"query": "Liu Liu", "entity_type": "authors", "source": "orcid"},
+        )
+        by_id = client.get(
             "/api/search",
             params={"query": LIN_A, "entity_type": "authors", "source": "orcid"},
         )
 
-    assert response.status_code == 200
-    assert enrich_flags == [True]
-    assert hydrate_called is True
+    assert name.status_code == 200
+    assert by_id.status_code == 200
+    assert enrich_flags == [False, False]
+    assert name.json()["results"][0]["orcid"] == LIN_A
 
+def test_source_all_calls_openalex_and_orcid():
+    calls = {"orcid": 0, "openalex": 0}
+
+    async def fake_orcid(**_kwargs):
+        calls["orcid"] += 1
+        return {
+            "query": "Lin Lin",
+            "source": "orcid",
+            "results": [
+                _orcid_candidate(
+                    LIN_B,
+                    display_name="Lin Lin",
+                    institution="Shanghai Normal University",
+                )
+            ],
+            "num_found": 1,
+            "has_more": False,
+        }
+
+    async def fake_oa(**_kwargs):
+        calls["openalex"] += 1
+        return {
+            "query": "Lin Lin",
+            "entity_type": "authors",
+            "source": "openalex",
+            "results": [
+                {
+                    "result_id": "openalex:A0",
+                    "result_type": "author",
+                    "openalex_id": "A0",
+                    "display_name": "Lin Lin",
+                    "source": "openalex",
+                    "orcid": None,
+                }
+            ],
+            "next_cursor": None,
+            "has_more": False,
+        }
+
+    with (
+        patch(
+            "app.services.search.orcid_provider.search_orcid_authors",
+            side_effect=fake_orcid,
+        ),
+        patch(
+            "app.services.search.openalex_provider.unified_openalex_search",
+            side_effect=fake_oa,
+        ),
+    ):
+        response = client.get(
+            "/api/search",
+            params={"query": "Lin Lin", "entity_type": "authors", "source": "all"},
+        )
+
+    assert response.status_code == 200
+    assert calls == {"orcid": 1, "openalex": 1}
+    sources = {row["source"] for row in response.json()["results"]}
+    assert sources == {"openalex", "orcid"}
+
+
+def test_source_orcid_does_not_call_openalex_name_search():
+    oa_called = False
+
+    async def fake_orcid(**_kwargs):
+        return {
+            "query": "Lin Lin",
+            "source": "orcid",
+            "results": [
+                _orcid_candidate(
+                    LIN_A,
+                    display_name="Lin Lin",
+                    institution="University of California Berkeley",
+                )
+            ],
+            "num_found": 1,
+            "has_more": False,
+        }
+
+    async def fake_oa(**_kwargs):
+        nonlocal oa_called
+        oa_called = True
+        return {
+            "query": "Lin Lin",
+            "entity_type": "authors",
+            "source": "openalex",
+            "results": [],
+            "next_cursor": None,
+            "has_more": False,
+        }
+
+    with (
+        patch(
+            "app.services.search.orcid_provider.search_orcid_authors",
+            side_effect=fake_orcid,
+        ),
+        patch(
+            "app.services.search.openalex_provider.unified_openalex_search",
+            side_effect=fake_oa,
+        ),
+    ):
+        response = client.get(
+            "/api/search",
+            params={"query": "Lin Lin", "entity_type": "authors", "source": "orcid"},
+        )
+
+    assert response.status_code == 200
+    assert oa_called is False
+    assert all(row["source"] == "orcid" for row in response.json()["results"])
+
+
+def test_all_with_institution_filter_skips_orcid_and_keeps_openalex_only():
+    orcid_called = False
+    captured = {}
+
+    async def fake_orcid(**_kwargs):
+        nonlocal orcid_called
+        orcid_called = True
+        return {
+            "query": "Lin Lin",
+            "source": "orcid",
+            "results": [
+                _orcid_candidate(
+                    LIN_B,
+                    display_name="Lin Lin",
+                    institution="Shanghai Normal University",
+                )
+            ],
+            "num_found": 1,
+            "has_more": False,
+        }
+
+    async def fake_oa(**kwargs):
+        captured.update(kwargs)
+        return {
+            "query": "Lin Lin",
+            "entity_type": "authors",
+            "source": "openalex",
+            "results": [
+                {
+                    "result_id": "openalex:A501",
+                    "result_type": "author",
+                    "openalex_id": "A501",
+                    "display_name": "Lin Lin",
+                    "source": "openalex",
+                    "orcid": LIN_A,
+                }
+            ],
+            "next_cursor": None,
+            "has_more": False,
+        }
+
+    with (
+        patch(
+            "app.services.search.orcid_provider.search_orcid_authors",
+            side_effect=fake_orcid,
+        ),
+        patch(
+            "app.services.search.openalex_provider.unified_openalex_search",
+            side_effect=fake_oa,
+        ),
+    ):
+        response = client.get(
+            "/api/search",
+            params={
+                "query": "Lin Lin",
+                "entity_type": "authors",
+                "source": "all",
+                "institution_id": "I123456789",
+            },
+        )
+
+    assert response.status_code == 200
+    assert orcid_called is False
+    assert captured.get("institution_id") == "I123456789"
+    rows = response.json()["results"]
+    assert [row["source"] for row in rows] == ["openalex"]
+    assert all(row.get("openalex_id") for row in rows)
+
+
+def test_openalex_topic_filter_is_forwarded():
+    captured = {}
+
+    async def fake_oa(**kwargs):
+        captured.update(kwargs)
+        return {
+            "query": "Lin Lin",
+            "entity_type": "authors",
+            "source": "openalex",
+            "results": [],
+            "next_cursor": None,
+            "has_more": False,
+        }
+
+    with patch(
+        "app.services.search.openalex_provider.unified_openalex_search",
+        side_effect=fake_oa,
+    ):
+        response = client.get(
+            "/api/search",
+            params={
+                "query": "Lin Lin",
+                "entity_type": "authors",
+                "source": "openalex",
+                "topic_id": "T987654321",
+            },
+        )
+
+    assert response.status_code == 200
+    assert captured.get("topic_id") == "T987654321"
+
+
+def test_all_plus_filters_drops_orcid_only_even_if_orcid_returned():
+    """Safety net: ORCID-only rows never survive active OpenAlex filters."""
+    import asyncio
+
+    from app.services.search import search_service
+
+    payload = {
+        "query": "Lin Lin",
+        "entity_type": "authors",
+        "source": "all",
+        "results": [
+            {
+                "result_id": "openalex:A1",
+                "source": "openalex",
+                "openalex_id": "A1",
+                "orcid": LIN_A,
+            },
+            {
+                "result_id": f"orcid:{LIN_B}",
+                "source": "orcid",
+                "orcid": LIN_B,
+                "openalex_id": None,
+            },
+            {
+                "result_id": f"orcid:{LIN_A}",
+                "source": "orcid",
+                "orcid": LIN_A,
+                "openalex_id": None,
+            },
+        ],
+    }
+
+    finalized = asyncio.run(
+        search_service.finalize_author_search_results(
+            payload,
+            openalex_filters_active=True,
+        )
+    )
+    rows = finalized["results"]
+    assert len(rows) == 1
+    assert rows[0]["orcid"] == LIN_A
+    assert rows[0]["openalex_id"] == "A1"

@@ -72,10 +72,13 @@ class _TtlCache:
 
 
 _response_cache = _TtlCache(ttl_seconds=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
+# Assembled search payloads (name / iD → candidate list). Separate from raw HTTP cache.
+_search_payload_cache = _TtlCache(ttl_seconds=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 
 
 def reset_orcid_client_state_for_tests() -> None:
     _response_cache.clear()
+    _search_payload_cache.clear()
 
 
 def orcid_configured() -> bool:
@@ -261,10 +264,45 @@ async def _enrich_hit(
     )
 
 
+def _search_payload_cache_key(
+    *,
+    query_key: str,
+    affiliation: str | None,
+    limit: int,
+    start: int,
+    enrich: bool,
+) -> str:
+    aff = " ".join((affiliation or "").split()).lower()
+    return f"orcid-search|{query_key}|{aff}|{limit}|{start}|{int(bool(enrich))}"
+
+
+def _cached_search_payload(cache_key: str) -> dict[str, Any] | None:
+    cached = _search_payload_cache.get(cache_key)
+    if not isinstance(cached, dict):
+        return None
+    # Shallow-copy so callers cannot mutate the cached list/dict structure.
+    return {
+        **cached,
+        "results": list(cached.get("results") or []),
+    }
+
+
+def _store_search_payload(cache_key: str, payload: dict[str, Any]) -> dict[str, Any]:
+    stored = {
+        **payload,
+        "results": list(payload.get("results") or []),
+    }
+    _search_payload_cache.set(cache_key, stored)
+    return {
+        **stored,
+        "results": list(stored["results"]),
+    }
+
+
 async def _search_orcid_by_id(
     orcid: str,
     *,
-    enrich: bool = True,
+    enrich: bool = False,
     client: OrcidClient | None = None,
 ) -> dict[str, Any]:
     """Fetch one ORCID person record by iD. Does not use name search."""
@@ -272,13 +310,25 @@ async def _search_orcid_by_id(
         logger.info("orcid_id_lookup_skipped reason=not_configured")
         return _empty_search_result(query=orcid)
 
+    cache_key = _search_payload_cache_key(
+        query_key=f"id|{orcid}",
+        affiliation=None,
+        limit=1,
+        start=0,
+        enrich=enrich,
+    )
+    cached = _cached_search_payload(cache_key)
+    if cached is not None:
+        return cached
+
     client = client or OrcidClient()
     hit = {"orcid-id": orcid}
     try:
         person = await client.get_person(orcid)
     except OrcidApiError as exc:
         if exc.status_code == 404:
-            return _empty_search_result(query=orcid)
+            # Cache misses so repeated invalid iDs do not re-hit ORCID.
+            return _store_search_payload(cache_key, _empty_search_result(query=orcid))
         logger.warning("orcid_id_lookup_failed orcid=%s", orcid)
         return _empty_search_result(query=orcid)
 
@@ -292,15 +342,18 @@ async def _search_orcid_by_id(
         )
     if candidate is None:
         return _empty_search_result(query=orcid)
-    return {
-        "query": orcid,
-        "affiliation": None,
-        "entity_type": "authors",
-        "source": "orcid",
-        "results": [candidate],
-        "num_found": 1,
-        "has_more": False,
-    }
+    return _store_search_payload(
+        cache_key,
+        {
+            "query": orcid,
+            "affiliation": None,
+            "entity_type": "authors",
+            "source": "orcid",
+            "results": [candidate],
+            "num_found": 1,
+            "has_more": False,
+        },
+    )
 
 
 async def search_orcid_authors(
@@ -309,11 +362,14 @@ async def search_orcid_authors(
     affiliation: str | None = None,
     limit: int = DEFAULT_SEARCH_ROWS,
     start: int = 0,
-    enrich: bool = True,
+    enrich: bool = False,
     client: OrcidClient | None = None,
 ) -> dict[str, Any]:
     """
     Search ORCID authors via expanded-search, or fetch a record by ORCID iD.
+
+    Default enrich=False: name search uses expanded-search only; iD lookup uses
+    /person only. Pass enrich=True for employments/works (selection-time use).
 
     Failures return an empty result set so callers can keep using OpenAlex/arXiv.
     Candidates are keyed by ORCID iD and are never merged by display name.
@@ -335,12 +391,24 @@ async def search_orcid_authors(
         logger.info("orcid_search_skipped reason=not_configured")
         return _empty_search_result(query=solr_query, affiliation=affiliation)
 
-    client = client or OrcidClient()
     page_size = max(1, min(int(limit or DEFAULT_SEARCH_ROWS), MAX_SEARCH_ROWS))
+    cache_key = _search_payload_cache_key(
+        query_key=f"q|{solr_query}",
+        affiliation=affiliation,
+        limit=page_size,
+        start=start,
+        enrich=enrich,
+    )
+    cached = _cached_search_payload(cache_key)
+    if cached is not None:
+        return cached
+
+    client = client or OrcidClient()
     try:
         payload = await client.expanded_search(solr_query, rows=page_size, start=start)
     except OrcidApiError:
         logger.warning("orcid_search_failed query=%s", solr_query)
+        # Do not cache transport/API failures — allow retry on next search.
         return _empty_search_result(query=solr_query, affiliation=affiliation)
 
     hits = payload.get("expanded-result") or payload.get("result") or []
@@ -368,12 +436,15 @@ async def search_orcid_authors(
             continue
         results.append(candidate)
 
-    return {
-        "query": solr_query,
-        "affiliation": affiliation,
-        "entity_type": "authors",
-        "source": "orcid",
-        "results": results,
-        "num_found": num_found,
-        "has_more": (start + len(hits)) < num_found if num_found else False,
-    }
+    return _store_search_payload(
+        cache_key,
+        {
+            "query": solr_query,
+            "affiliation": affiliation,
+            "entity_type": "authors",
+            "source": "orcid",
+            "results": results,
+            "num_found": num_found,
+            "has_more": (start + len(hits)) < num_found if num_found else False,
+        },
+    )

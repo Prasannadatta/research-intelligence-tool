@@ -53,6 +53,16 @@ function jobProgressSnapshot(job = {}) {
 export function formatInsightsJobProgressMessage(progress) {
   const detail = progress?.detail || {};
   const phase = String(detail.phase || "").toLowerCase();
+  if (detail.rate_limited || detail.rateLimited) {
+    const provider = String(detail.provider || "OpenAlex");
+    const label =
+      provider.toLowerCase() === "openalex"
+        ? "OpenAlex"
+        : provider.toLowerCase() === "arxiv"
+          ? "arXiv"
+          : provider;
+    return `${label} rate limit reached. Your existing data is safe; please try again shortly.`;
+  }
   const authorName = String(detail.author_name || detail.authorName || "").trim();
   const processed = detail.publications_processed ?? detail.publicationsProcessed;
   const total = detail.publications_total ?? detail.publicationsTotal;
@@ -78,6 +88,9 @@ export function formatInsightsJobProgressMessage(progress) {
   const stage = String(progress?.stage || "Preparing")
     .replace(/[.…]+\s*$/, "")
     .trim() || "Preparing";
+  if (stage.toLowerCase().includes("rate limit")) {
+    return `${stage}. Your existing data is safe; please try again shortly.`;
+  }
   const percent = Number.isFinite(Number(progress?.percent))
     ? Math.round(Number(progress.percent))
     : 0;
@@ -92,9 +105,20 @@ function emitInsightsProgress(entry, job) {
 }
 
 function insightsJobFailure(job) {
-  const error = new Error(
-    job?.error_message || job?.errorMessage || "Unable to load author insights.",
-  );
+  const detail = job?.progress_detail || job?.progressDetail || {};
+  let message =
+    job?.error_message || job?.errorMessage || "Unable to load author insights.";
+  if (detail.rate_limited || detail.rateLimited || /rate limit/i.test(String(message))) {
+    const provider = String(detail.provider || "openalex");
+    const label =
+      provider.toLowerCase() === "openalex"
+        ? "OpenAlex"
+        : provider.toLowerCase() === "arxiv"
+          ? "arXiv"
+          : provider;
+    message = `${label} rate limit reached. Your existing data is safe; please try again shortly.`;
+  }
+  const error = new Error(message);
   error.insightsJob = job;
   return error;
 }

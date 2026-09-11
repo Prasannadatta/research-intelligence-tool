@@ -26,17 +26,25 @@ def get_search_capabilities() -> dict[str, Any]:
     for provider in PROVIDERS.values():
         if provider.enabled:
             supported.update(provider.supported_entity_types)
-    sources.append(
-        {
-            "id": "all",
-            "label": "All sources",
-            "enabled": bool(supported),
-            "supported_entity_types": sorted(supported),
-        }
-    )
+    # Author UI expects All → OpenAlex → ORCID ordering.
+    all_source = {
+        "id": "all",
+        "label": "All",
+        "enabled": bool(supported),
+        "supported_entity_types": sorted(supported),
+    }
+    ordered: list[dict[str, Any]] = [all_source]
+    for provider_id in ("openalex", "orcid", "arxiv"):
+        match = next((row for row in sources if row.get("id") == provider_id), None)
+        if match is not None:
+            ordered.append(match)
+    for row in sources:
+        if row.get("id") not in {"openalex", "orcid", "arxiv"}:
+            ordered.append(row)
     return {
-        "default_source": "all" if supported else "openalex",
-        "sources": sources,
+        # Author search defaults to All (OpenAlex + ORCID).
+        "default_source": "all",
+        "sources": ordered,
     }
 
 
@@ -44,16 +52,16 @@ FALLBACK_CAPABILITIES: dict[str, Any] = {
     "default_source": "all",
     "sources": [
         {
+            "id": "all",
+            "label": "All",
+            "enabled": True,
+            "supported_entity_types": ["authors", "grants"],
+        },
+        {
             "id": "openalex",
             "label": "OpenAlex",
             "enabled": True,
-            "supported_entity_types": ["authors", "works", "grants"],
-        },
-        {
-            "id": "arxiv",
-            "label": "arXiv",
-            "enabled": False,
-            "supported_entity_types": [],
+            "supported_entity_types": ["authors", "grants"],
         },
         {
             "id": "orcid",
@@ -62,10 +70,11 @@ FALLBACK_CAPABILITIES: dict[str, Any] = {
             "supported_entity_types": ["authors"],
         },
         {
-            "id": "all",
-            "label": "All sources",
-            "enabled": True,
-            "supported_entity_types": ["authors", "works", "grants"],
+            "id": "arxiv",
+            "label": "arXiv",
+            "enabled": False,
+            # Author-search UI hides arXiv; grants remain when the provider is enabled.
+            "supported_entity_types": ["grants"],
         },
     ],
 }

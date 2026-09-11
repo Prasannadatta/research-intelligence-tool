@@ -2,7 +2,6 @@ import apiClient from "./client";
 
 export const ENTITY_TYPES = {
   AUTHORS: "authors",
-  WORKS: "works",
   GRANTS: "grants",
 };
 
@@ -15,13 +14,11 @@ export const SEARCH_SOURCES = {
 
 export const ENTITY_PLACEHOLDERS = {
   authors: "Search authors by name, ORCID, or grant number",
-  works: "Search papers by title, topic, author, or grant number",
   grants: "Enter a grant or award number",
 };
 
 export const MIN_QUERY_LENGTH = {
   authors: 3,
-  works: 3,
   grants: 2,
 };
 
@@ -29,28 +26,29 @@ export const FALLBACK_CAPABILITIES = {
   default_source: SEARCH_SOURCES.ALL,
   sources: [
     {
+      id: SEARCH_SOURCES.ALL,
+      label: "All",
+      enabled: true,
+      supported_entity_types: ["authors", "grants"],
+    },
+    {
       id: SEARCH_SOURCES.OPENALEX,
       label: "OpenAlex",
       enabled: true,
-      supported_entity_types: ["authors", "works", "grants"],
+      supported_entity_types: ["authors", "grants"],
     },
     {
       id: SEARCH_SOURCES.ARXIV,
       label: "arXiv",
       enabled: false,
-      supported_entity_types: [],
+      // Author search UI never offers arXiv; grants may when enabled.
+      supported_entity_types: ["grants"],
     },
     {
       id: SEARCH_SOURCES.ORCID,
       label: "ORCID",
       enabled: true,
       supported_entity_types: ["authors"],
-    },
-    {
-      id: SEARCH_SOURCES.ALL,
-      label: "All sources",
-      enabled: true,
-      supported_entity_types: ["authors", "works", "grants"],
     },
   ],
 };
@@ -67,7 +65,7 @@ export function looksLikeOrcidQuery(query) {
 
 /**
  * Normalize search query for requests and cache keys.
- * Grants preserve letter case; authors/works use lowercase.
+ * Grants preserve letter case; authors use lowercase.
  */
 export function normalizeSearchQuery(query, entityType = ENTITY_TYPES.AUTHORS) {
   const collapsed = String(query || "")
@@ -87,8 +85,19 @@ export function minQueryLengthForEntity(entityType) {
   return MIN_QUERY_LENGTH[entityType] ?? 3;
 }
 
+export function sourceUsesOpenAlexAuthorFilters(source) {
+  return source === SEARCH_SOURCES.OPENALEX || source === SEARCH_SOURCES.ALL;
+}
+
 export function isSourceCompatible(sourceCapability, entityType) {
   if (!sourceCapability?.enabled) {
+    return false;
+  }
+  // Author search UI never uses arXiv (name aggregates are not identities).
+  if (
+    entityType === ENTITY_TYPES.AUTHORS &&
+    sourceCapability.id === SEARCH_SOURCES.ARXIV
+  ) {
     return false;
   }
   const supported = Array.isArray(sourceCapability.supported_entity_types)
@@ -124,7 +133,7 @@ export function resolveCompatibleSource(capabilities, entityType, preferredSourc
  * Build a session-cache key. Cursor is opaque and never decoded.
  */
 export function buildSearchCacheKey({
-  source = SEARCH_SOURCES.OPENALEX,
+  source = SEARCH_SOURCES.ALL,
   entityType,
   query,
   cursor = "*",
@@ -134,7 +143,7 @@ export function buildSearchCacheKey({
   const normalizedQuery = normalizeSearchQuery(query, entityType);
   const pageCursor = cursor == null || cursor === "" ? "*" : String(cursor);
   return [
-    source || SEARCH_SOURCES.OPENALEX,
+    source || SEARCH_SOURCES.ALL,
     entityType,
     normalizedQuery,
     institutionId || "",
@@ -175,7 +184,6 @@ export async function unifiedSearch({
   cursor,
   institutionId,
   topicId,
-  knownAuthorIds = [],
   searchSessionId,
   signal,
 } = {}) {
@@ -189,8 +197,6 @@ export async function unifiedSearch({
       entity_type: entityType,
       source: sourceId,
       results: [],
-      items: [],
-      updates: [],
       next_cursor: null,
       has_more: false,
       search_session_id: null,
@@ -204,69 +210,45 @@ export async function unifiedSearch({
     entity_type: entityType,
     entity: entityType,
     query: cleanedQuery,
-    q: cleanedQuery,
     limit,
   };
 
   if (cursor != null && cursor !== "") {
     params.cursor = cursor;
   }
-
   if (
-    (sourceId === SEARCH_SOURCES.OPENALEX || sourceId === SEARCH_SOURCES.ALL) &&
+    sourceUsesOpenAlexAuthorFilters(sourceId) &&
     entityType === ENTITY_TYPES.AUTHORS &&
     institutionId
   ) {
     params.institution_id = institutionId;
   }
   if (
-    (sourceId === SEARCH_SOURCES.OPENALEX || sourceId === SEARCH_SOURCES.ALL) &&
+    sourceUsesOpenAlexAuthorFilters(sourceId) &&
     entityType === ENTITY_TYPES.AUTHORS &&
     topicId
   ) {
     params.topic_id = topicId;
   }
-
   if (
-    entityType === ENTITY_TYPES.AUTHORS &&
-    Array.isArray(knownAuthorIds) &&
-    knownAuthorIds.length > 0
-  ) {
-    params.known_author_ids = knownAuthorIds.filter(Boolean).join(",");
-  }
-
-  if (
-    (entityType === ENTITY_TYPES.WORKS || entityType === ENTITY_TYPES.GRANTS) &&
-    searchSessionId
+    searchSessionId &&
+    entityType === ENTITY_TYPES.GRANTS
   ) {
     params.search_session_id = searchSessionId;
   }
 
-  const started = performance.now();
   const response = await apiClient.get("/search", {
     params,
     timeout: 30000,
     signal,
   });
-  console.info("[search-timing] unified_search_done", {
-    ms: Math.round(performance.now() - started),
-    source: sourceId,
-    entityType,
-    query: cleanedQuery,
-    resultCount: Array.isArray(response.data?.results) ? response.data.results.length : 0,
-  });
-
   const data = response.data || {};
   const results = Array.isArray(data.results) ? data.results.slice(0, 20) : [];
-
   return {
     query: data.query || cleanedQuery,
     entity_type: data.entity_type || entityType,
     source: data.source || sourceId,
     results,
-    items: Array.isArray(data.items) ? data.items : [],
-    updates: Array.isArray(data.updates) ? data.updates : [],
-    pagination: data.pagination || null,
     next_cursor: data.next_cursor ?? data.pagination?.next_cursor ?? null,
     has_more: Boolean(data.has_more ?? data.pagination?.has_more),
     search_session_id: data.search_session_id || null,
