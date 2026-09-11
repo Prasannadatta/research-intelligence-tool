@@ -9,6 +9,7 @@ from app.db.session import get_db_session
 from app.schemas.saved_searches import (
     SavedSearchCreate,
     SavedSearchListResponse,
+    SavedSearchLookupResponse,
     SavedSearchPatch,
     SavedSearchResponse,
     SavedSearchSortBy,
@@ -28,6 +29,7 @@ async def list_saved_searches(
     type: str | None = Query(None, pattern="^(authors|grant)$"),
     sort_by: SavedSearchSortBy = "last_viewed_at",
     sort_direction: SortDirection = "desc",
+    q: str | None = Query(None, max_length=256),
     session: AsyncSession = Depends(get_db_session),
 ) -> SavedSearchListResponse:
     try:
@@ -35,6 +37,7 @@ async def list_saved_searches(
             search_type=type,
             sort_by=sort_by,
             sort_direction=sort_direction,
+            q=q,
         )
     except SavedSearchError as exc:
         _raise_saved_search_error(exc)
@@ -51,6 +54,19 @@ async def create_saved_search(
     except SavedSearchError as exc:
         _raise_saved_search_error(exc)
     return SavedSearchResponse.model_validate(item)
+
+
+@router.post("/lookup", response_model=SavedSearchLookupResponse)
+async def lookup_saved_search(
+    body: SavedSearchCreate,
+    session: AsyncSession = Depends(get_db_session),
+) -> SavedSearchLookupResponse:
+    """Return the existing saved search for this exact configuration, if any."""
+    try:
+        item = await SavedSearchService(session).lookup(body)
+    except SavedSearchError as exc:
+        _raise_saved_search_error(exc)
+    return SavedSearchLookupResponse(item=item)
 
 
 @router.get("/{saved_search_id}", response_model=SavedSearchResponse)

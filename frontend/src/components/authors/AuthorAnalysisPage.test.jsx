@@ -171,7 +171,12 @@ describe("AuthorAnalysisPage", () => {
         return result;
       },
     );
-    vi.spyOn(savedSearchesApi, "saveSavedSearch").mockResolvedValue({ id: "saved-1" });
+    vi.spyOn(savedSearchesApi, "saveSavedSearch").mockResolvedValue({
+      id: "saved-1",
+      outcome: "created",
+    });
+    vi.spyOn(savedSearchesApi, "lookupSavedSearch").mockResolvedValue(null);
+    vi.spyOn(savedSearchesApi, "deleteSavedSearch").mockResolvedValue();
   });
 
   afterEach(() => {
@@ -231,6 +236,9 @@ describe("AuthorAnalysisPage", () => {
   it("saves the current author search definition", async () => {
     renderPage();
     await waitFor(() => expect(analysisApi.fetchAuthorPublications).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(savedSearchesApi.lookupSavedSearch).toHaveBeenCalled(),
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "Save search" }));
 
@@ -252,7 +260,37 @@ describe("AuthorAnalysisPage", () => {
         }),
       );
     });
-    expect(await screen.findByText("Saved")).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Saved" })).toBeInTheDocument();
+  });
+
+  it("unsaves when the current configuration is already saved", async () => {
+    savedSearchesApi.lookupSavedSearch.mockResolvedValue({
+      id: "saved-1",
+      display_name: "John Smith + Jane Doe",
+    });
+    renderPage();
+    await waitFor(() => expect(analysisApi.fetchAuthorPublications).toHaveBeenCalled());
+    expect(await screen.findByRole("button", { name: "Saved" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Saved" }));
+    await waitFor(() => {
+      expect(savedSearchesApi.deleteSavedSearch).toHaveBeenCalledWith("saved-1");
+    });
+    expect(await screen.findByText("Unsaved")).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Save search" })).toBeInTheDocument();
+  });
+
+  it("shows already saved when save hits an existing configuration", async () => {
+    savedSearchesApi.saveSavedSearch.mockResolvedValueOnce({
+      id: "saved-existing",
+      outcome: "already_exists",
+      display_name: "Existing",
+    });
+    renderPage();
+    await waitFor(() => expect(analysisApi.fetchAuthorPublications).toHaveBeenCalled());
+    fireEvent.click(await screen.findByRole("button", { name: "Save search" }));
+    expect(await screen.findByText("Already saved")).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Saved" })).toBeInTheDocument();
   });
 
   it("saves only currently checked authors when an author is unchecked", async () => {
@@ -461,7 +499,7 @@ describe("AuthorAnalysisPage", () => {
     renderPage();
     const actions = await screen.findByTestId("author-analysis-page-actions");
     expect(within(actions).getByTestId("download-csv-button")).toBeInTheDocument();
-    expect(within(actions).getByRole("button", { name: "Save search" })).toBeInTheDocument();
+    expect(within(actions).getByRole("button", { name: /Save search|Saved/ })).toBeInTheDocument();
     expect(within(actions).getByTestId("open-author-insights")).toBeInTheDocument();
   });
 

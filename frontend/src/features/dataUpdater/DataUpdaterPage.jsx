@@ -1,14 +1,10 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Alert,
-  Autocomplete,
   Box,
   Button,
-  Divider,
   LinearProgress,
-  MenuItem,
   Stack,
-  TextField,
   Typography,
 } from "@mui/material";
 import CancelRoundedIcon from "@mui/icons-material/CancelRounded";
@@ -20,14 +16,9 @@ import { analysisPageLayoutSx } from "../../layout/pageLayout";
 import {
   cancelDataUpdateJob,
   fetchDataUpdateJob,
-  fetchDataUpdaterSavedSearches,
   pauseDataUpdateJob,
   resumeDataUpdateJob,
-  searchDataUpdateTargets,
-  startAllSavedSearchesDataUpdate,
   startDataUpdate,
-  startEntityDataUpdate,
-  startSavedSearchDataUpdate,
 } from "./dataUpdaterApi";
 import {
   clearStoredDataUpdateJobId,
@@ -42,10 +33,67 @@ const TERMINAL_STATUSES = new Set([
   "failed",
   "cancelled",
 ]);
+const BUSY_STATUSES = new Set([
+  "queued",
+  "running",
+  "pause_requested",
+  "cancel_requested",
+  "paused",
+]);
 
-const DATASET_LABELS = {
-  authors: "Authors",
-  publications: "Publications",
+const STATUS_LABELS = {
+  queued: "Running",
+  running: "Running",
+  pause_requested: "Running",
+  cancel_requested: "Running",
+  paused: "Paused",
+  cancelled: "Cancelled",
+  succeeded: "Completed",
+  completed_with_errors: "Completed",
+  failed: "Failed",
+};
+
+/** Explicit update scopes wired to existing POST /data-updater/refresh jobs. */
+export const UPDATE_ACTIONS = [
+  {
+    id: "authors",
+    label: "Update Author Data",
+    description: "Refresh author names, ORCID, topics, and profile details.",
+    request: { mode: "dataset", dataset: "authors", stale_only: true },
+  },
+  {
+    id: "publications",
+    label: "Update Publication Data",
+    description: "Refresh titles, venues, DOIs, and publication records.",
+    request: { mode: "dataset", dataset: "publications", stale_only: true },
+  },
+  {
+    id: "grants",
+    label: "Update Grant Data",
+    description: "Refresh funding awards and grant links on publications.",
+    request: { mode: "dataset", dataset: "grant_funding", stale_only: true },
+  },
+  {
+    id: "journals",
+    label: "Update Journal Metrics",
+    description: "Refresh journal and venue details stored on publications.",
+    // Closest existing dataset: OpenAlex publication/source metadata (no separate journal-metrics job).
+    request: { mode: "dataset", dataset: "publication_metadata", stale_only: true },
+  },
+  {
+    id: "everything",
+    label: "Update Everything",
+    description: "Refresh all stale author, publication, grant, and cache data.",
+    request: { mode: "all_stale", stale_only: true },
+    primary: true,
+  },
+];
+
+const buttonSx = {
+  textTransform: "none",
+  "&.Mui-disabled": {
+    opacity: 0.45,
+  },
 };
 
 function progressPercent(job) {
@@ -55,94 +103,79 @@ function progressPercent(job) {
   return Math.min(100, Math.round((job.processed_records / job.total_records) * 100));
 }
 
+function statusLabel(job) {
+  if (!job?.status) {
+    return "Idle";
+  }
+  return STATUS_LABELS[job.status] || job.status;
+}
+
 function formatDate(value) {
   if (!value) {
-    return "Not updated yet";
+    return null;
   }
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) {
-    return "Not updated yet";
+    return null;
   }
-  return `Last updated: ${date.toLocaleDateString(undefined, {
+  return date.toLocaleDateString(undefined, {
     month: "short",
     day: "numeric",
     year: "numeric",
-  })}`;
+  });
 }
 
-function updateTitle(job) {
+function updateTitle(job, actionLabel) {
+  if (job?.metadata?.title) {
+    return job.metadata.title;
+  }
+  if (actionLabel) {
+    return actionLabel.replace(/^Update /, "Updating ");
+  }
   if (!job) {
     return "";
   }
-  return job.metadata?.title || "Updating research data";
-}
-
-function groupedProgress(job) {
-  const idsByDataset = job?.metadata?.record_ids_by_dataset;
-  if (!idsByDataset || typeof idsByDataset !== "object") {
-    return [];
+  if (job.mode === "all_stale") {
+    return "Updating everything";
   }
-  const records = Array.isArray(job.records) ? job.records : [];
-  return Object.entries(DATASET_LABELS)
-    .map(([dataset, label]) => {
-      const ids = Array.isArray(idsByDataset[dataset]) ? idsByDataset[dataset] : [];
-      if (!ids.length) {
-        return null;
-      }
-      const checked = records.filter((record) => record.dataset === dataset).length;
-      return { dataset, label, checked, total: ids.length };
-    })
-    .filter(Boolean);
+  if (job.dataset === "authors") {
+    return "Updating author data";
+  }
+  if (job.dataset === "publications") {
+    return "Updating publication data";
+  }
+  if (job.dataset === "grant_funding") {
+    return "Updating grant data";
+  }
+  if (job.dataset === "publication_metadata") {
+    return "Updating journal metrics";
+  }
+  return "Updating research data";
 }
 
-function technicalFailures(job) {
-  const records = Array.isArray(job?.records) ? job.records : [];
-  return records.filter((record) => record.status === "failed" && record.message);
+function progressSummary(job, pct) {
+  if (!job) {
+    return "No update in progress";
+  }
+  const processed = job.processed_records ?? 0;
+  const total = job.total_records ?? 0;
+  if (!total) {
+    return `${pct}%`;
+  }
+  return `${pct}% · ${processed} / ${total} items checked`;
+}
+
+function lastUpdatedLabel(job) {
+  const stamp = formatDate(job?.completed_at || job?.updated_at || job?.started_at);
+  return stamp ? `Last updated ${stamp}` : "Not updated yet";
 }
 
 export default function DataUpdaterPage() {
-  const [savedSearches, setSavedSearches] = useState([]);
-  const [selectedSavedSearch, setSelectedSavedSearch] = useState("");
-  const [targetOptions, setTargetOptions] = useState([]);
-  const [targetSearch, setTargetSearch] = useState("");
-  const [selectedTarget, setSelectedTarget] = useState(null);
   const [job, setJob] = useState(null);
-  const [loadingSavedSearches, setLoadingSavedSearches] = useState(false);
-  const [loadingTargets, setLoadingTargets] = useState(false);
+  const [activeActionLabel, setActiveActionLabel] = useState("");
   const [starting, setStarting] = useState(false);
   const [controlling, setControlling] = useState(false);
   const [error, setError] = useState(null);
-
-  const selectedSavedSearchItem = useMemo(
-    () => savedSearches.find((item) => item.id === selectedSavedSearch) || null,
-    [savedSearches, selectedSavedSearch],
-  );
-
-  const loadSavedSearches = useCallback(async ({ signal } = {}) => {
-    setLoadingSavedSearches(true);
-    try {
-      const items = await fetchDataUpdaterSavedSearches({ signal });
-      setSavedSearches(items);
-      setSelectedSavedSearch((current) => current || items[0]?.id || "");
-    } catch (err) {
-      if (err?.name !== "CanceledError" && err?.code !== "ERR_CANCELED") {
-        setError("Could not load saved searches.");
-      }
-    } finally {
-      setLoadingSavedSearches(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => {
-      loadSavedSearches({ signal: controller.signal });
-    }, 0);
-    return () => {
-      clearTimeout(timer);
-      controller.abort();
-    };
-  }, [loadSavedSearches]);
 
   useEffect(() => {
     const rememberedJobId = currentStoredDataUpdateJobId();
@@ -172,60 +205,59 @@ export default function DataUpdaterPage() {
   }, []);
 
   useEffect(() => {
-    if (targetSearch.trim().length < 2) {
-      return undefined;
-    }
-    const controller = new AbortController();
-    const timer = setTimeout(async () => {
-      setLoadingTargets(true);
-      try {
-        const items = await searchDataUpdateTargets(targetSearch, {
-          signal: controller.signal,
-        });
-        setTargetOptions(items);
-      } catch (err) {
-        if (err?.name !== "CanceledError" && err?.code !== "ERR_CANCELED") {
-          setError("Could not search update targets.");
-        }
-      } finally {
-        setLoadingTargets(false);
-      }
-    }, 250);
-    return () => {
-      clearTimeout(timer);
-      controller.abort();
-    };
-  }, [targetSearch]);
-
-  useEffect(() => {
     if (!job?.id || !ACTIVE_STATUSES.has(job.status)) {
       return undefined;
     }
     const controller = new AbortController();
-    const timer = setInterval(async () => {
+    let cancelled = false;
+
+    const refreshJob = async () => {
       try {
         const nextJob = await fetchDataUpdateJob(job.id, {
           signal: controller.signal,
         });
+        if (cancelled) {
+          return;
+        }
         setJob(nextJob);
         rememberDataUpdateJob(nextJob);
+
+        if (nextJob.status === "cancel_requested") {
+          const updatedAt = nextJob.updated_at ? Date.parse(nextJob.updated_at) : 0;
+          const ageMs = Number.isFinite(updatedAt) ? Date.now() - updatedAt : 0;
+          if (ageMs >= 8_000) {
+            const finalized = await cancelDataUpdateJob(nextJob.id);
+            if (!cancelled) {
+              setJob(finalized);
+              rememberDataUpdateJob(finalized);
+            }
+          }
+        }
       } catch (err) {
         if (err?.name !== "CanceledError" && err?.code !== "ERR_CANCELED") {
           setError("Could not refresh update status.");
         }
       }
-    }, 1200);
+    };
+
+    const timer = setInterval(refreshJob, 1200);
+    refreshJob();
     return () => {
+      cancelled = true;
       clearInterval(timer);
       controller.abort();
     };
   }, [job?.id, job?.status]);
 
   const startJob = async (action) => {
+    if (starting || controlling || (job && BUSY_STATUSES.has(job.status))) {
+      return;
+    }
     setStarting(true);
     setError(null);
+    setActiveActionLabel(action.label);
     try {
-      const nextJob = await action();
+      const nextJob = await startDataUpdate(action.request);
       setJob(nextJob);
       rememberDataUpdateJob(nextJob);
     } catch (err) {
@@ -236,7 +268,7 @@ export default function DataUpdaterPage() {
   };
 
   const controlJob = async (action) => {
-    if (!job?.id) {
+    if (!job?.id || controlling) {
       return;
     }
     setControlling(true);
@@ -247,59 +279,35 @@ export default function DataUpdaterPage() {
       rememberDataUpdateJob(nextJob);
     } catch (err) {
       setError(err?.response?.data?.detail || "Could not update the job status.");
+      try {
+        const fresh = await fetchDataUpdateJob(job.id);
+        setJob(fresh);
+        rememberDataUpdateJob(fresh);
+      } catch {
+        // Keep the previous error message; status refresh is best-effort.
+      }
     } finally {
       setControlling(false);
     }
   };
 
-  const handleUpdateAll = () => {
-    startJob(() =>
-      startDataUpdate({
-        mode: "all_stale",
-        stale_only: true,
-      }),
-    );
-  };
-
-  const handleUpdateSavedSearch = () => {
-    if (!selectedSavedSearch) {
-      setError("Choose a saved search to update.");
-      return;
-    }
-    startJob(() => startSavedSearchDataUpdate(selectedSavedSearch));
-  };
-
-  const handleUpdateAllSavedSearches = () => {
-    startJob(() => startAllSavedSearchesDataUpdate());
-  };
-
-  const handleUpdateTarget = () => {
-    if (!selectedTarget) {
-      setError("Choose an author, publication, or institution to update.");
-      return;
-    }
-    startJob(() =>
-      startEntityDataUpdate({
-        type: selectedTarget.type,
-        id: selectedTarget.id,
-        stale_only: false,
-      }),
-    );
-  };
-
   const pct = progressPercent(job);
-  const groups = groupedProgress(job);
-  const failures = technicalFailures(job);
-  const canControl = job?.id && !TERMINAL_STATUSES.has(job.status);
-  const paused = job?.status === "paused";
+  const jobBusy = Boolean(job && BUSY_STATUSES.has(job.status));
+  const startDisabled = starting || controlling || jobBusy;
+  const status = job?.status || null;
+  const canPause = status === "queued" || status === "running";
+  const canResume = status === "paused";
+  const canCancel = Boolean(status && !TERMINAL_STATUSES.has(status));
+  const isActive = Boolean(job && ACTIVE_STATUSES.has(job.status));
+  const displayStatus = statusLabel(job);
 
   return (
-    <Box sx={{ ...analysisPageLayoutSx, maxWidth: 980 }}>
-      <Typography variant="h4" component="h1" fontWeight={700} sx={{ mb: 0.75 }}>
+    <Box sx={{ ...analysisPageLayoutSx, maxWidth: 720 }}>
+      <Typography variant="h4" component="h1" fontWeight={700} sx={{ mb: 0.5 }}>
         Data Updater
       </Typography>
-      <Typography color="text.secondary" sx={{ mb: 3, lineHeight: 1.6 }}>
-        Keep your research data current.
+      <Typography color="text.secondary" sx={{ mb: 3 }}>
+        Choose what to refresh. Updates run in the background so you can pause or cancel anytime.
       </Typography>
 
       {error ? (
@@ -308,231 +316,107 @@ export default function DataUpdaterPage() {
         </Alert>
       ) : null}
 
-      <Stack spacing={3}>
-        <Box>
-          <Button
-            startIcon={<RefreshRoundedIcon />}
-            variant="contained"
-            disableElevation
-            onClick={handleUpdateAll}
-            disabled={starting}
-            sx={{ textTransform: "none" }}
-          >
-            Update All Data
-          </Button>
-        </Box>
-
-        <Divider />
-
-        <Box>
-          <Typography variant="h6" component="h2" fontWeight={700} sx={{ mb: 1.25 }}>
-            Update Saved Search
-          </Typography>
-          <Stack direction={{ xs: "column", sm: "row" }} spacing={1.25} alignItems="stretch">
-            <TextField
-              select
-              size="small"
-              label="Saved Searches"
-              value={selectedSavedSearch}
-              onChange={(event) => setSelectedSavedSearch(event.target.value)}
-              disabled={loadingSavedSearches || savedSearches.length === 0}
-              sx={{ minWidth: { sm: 320 } }}
-            >
-              {savedSearches.map((item) => (
-                <MenuItem key={item.id} value={item.id}>
-                  {item.name}
-                </MenuItem>
-              ))}
-            </TextField>
-            <Button
-              startIcon={<RefreshRoundedIcon />}
-              variant="outlined"
-              color="inherit"
-              onClick={handleUpdateSavedSearch}
-              disabled={starting || !selectedSavedSearch}
-              sx={{ textTransform: "none" }}
-            >
-              Update This Saved Search
-            </Button>
-            <Button
-              variant="text"
-              color="inherit"
-              onClick={handleUpdateAllSavedSearches}
-              disabled={starting || savedSearches.length === 0}
-              sx={{ textTransform: "none" }}
-            >
-              Update All Saved Searches
-            </Button>
-          </Stack>
-          {selectedSavedSearchItem ? (
-            <Typography variant="body2" color="text.secondary" sx={{ mt: 0.75 }}>
-              {formatDate(selectedSavedSearchItem.updated_at)}
-            </Typography>
-          ) : null}
-        </Box>
-
-        <Divider />
-
-        <Box>
-          <Typography variant="h6" component="h2" fontWeight={700} sx={{ mb: 1.25 }}>
-            Update Specific Item
-          </Typography>
-          <Stack direction={{ xs: "column", sm: "row" }} spacing={1.25} alignItems="stretch">
-            <Autocomplete
-              fullWidth
-              size="small"
-              options={targetOptions}
-              value={selectedTarget}
-              inputValue={targetSearch}
-              loading={loadingTargets}
-              onInputChange={(_event, value) => {
-                setTargetSearch(value);
-                if (value.trim().length < 2) {
-                  setTargetOptions([]);
-                }
-              }}
-              onChange={(_event, value) => setSelectedTarget(value)}
-              getOptionLabel={(option) => option?.title || ""}
-              isOptionEqualToValue={(option, value) =>
-                option.id === value.id && option.type === value.type
-              }
-              noOptionsText={
-                targetSearch.trim().length < 2
-                  ? "Type to search"
-                  : "No matching authors, publications, or institutions"
-              }
-              renderInput={(params) => (
-                <TextField
-                  {...params}
-                  label="Search authors, publications, or institutions"
-                />
-              )}
-              renderOption={(props, option) => (
-                <Box component="li" {...props}>
-                  <Box>
-                    <Typography variant="body2" fontWeight={700}>
-                      {option.title}
-                    </Typography>
-                    <Typography variant="caption" color="text.secondary">
-                      {option.subtitle} · {formatDate(option.last_updated)}
-                    </Typography>
-                  </Box>
-                </Box>
-              )}
-            />
-            <Button
-              startIcon={<RefreshRoundedIcon />}
-              variant="outlined"
-              color="inherit"
-              onClick={handleUpdateTarget}
-              disabled={starting || !selectedTarget}
-              sx={{ textTransform: "none", minWidth: 116 }}
-            >
-              Update
-            </Button>
-          </Stack>
-        </Box>
-
-        {job ? (
-          <>
-            <Divider />
-            <Box data-testid="data-update-progress">
-              <Typography variant="h6" component="h2" fontWeight={700} sx={{ mb: 0.5 }}>
-                Current Update
+      <Stack spacing={2.5}>
+        <Stack spacing={1.5} data-testid="data-update-actions">
+          {UPDATE_ACTIONS.map((action) => (
+            <Box key={action.id}>
+              <Button
+                startIcon={<RefreshRoundedIcon />}
+                variant={action.primary ? "contained" : "outlined"}
+                disableElevation={Boolean(action.primary)}
+                onClick={() => startJob(action)}
+                disabled={startDisabled}
+                sx={buttonSx}
+              >
+                {action.label}
+              </Button>
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                {action.description}
               </Typography>
-              <Typography fontWeight={700}>{updateTitle(job)}</Typography>
-              <LinearProgress
-                variant="determinate"
-                value={pct}
-                sx={{ height: 8, borderRadius: 999, my: 1.25, maxWidth: 520 }}
-              />
-              <Typography color="text.secondary" sx={{ mb: 1 }}>
-                {pct}% · {job.processed_records} / {job.total_records} items checked
-              </Typography>
-              {groups.length ? (
-                <Stack spacing={0.25} sx={{ mb: 1 }}>
-                  {groups.map((group) => (
-                    <Typography key={group.dataset} variant="body2" color="text.secondary">
-                      {group.label}: {group.checked} / {group.total}
-                    </Typography>
-                  ))}
-                </Stack>
-              ) : null}
-              <Typography variant="body2" color="text.secondary">
-                Updated: {job.updated_count} · Unchanged: {job.unchanged_count} · Retrying:{" "}
-                {job.retrying_count}
-                {job.failed_count ? ` · ${job.failed_count} could not be updated` : ""}
-              </Typography>
-              {job.status === "paused" ? (
-                <Alert severity="info" sx={{ mt: 1.5, maxWidth: 520 }}>
-                  This update is paused.
-                </Alert>
-              ) : null}
-              {job.error ? (
-                <Alert severity="error" sx={{ mt: 1.5, maxWidth: 520 }}>
-                  The update stopped before it finished.
-                </Alert>
-              ) : null}
-              <Stack direction="row" spacing={1} sx={{ mt: 1.5 }}>
-                {paused ? (
-                  <Button
-                    startIcon={<PlayArrowRoundedIcon />}
-                    variant="outlined"
-                    color="inherit"
-                    onClick={() => controlJob(resumeDataUpdateJob)}
-                    disabled={controlling}
-                    sx={{ textTransform: "none" }}
-                  >
-                    Resume
-                  </Button>
-                ) : (
-                  <Button
-                    startIcon={<PauseRoundedIcon />}
-                    variant="outlined"
-                    color="inherit"
-                    onClick={() => controlJob(pauseDataUpdateJob)}
-                    disabled={controlling || !canControl}
-                    sx={{ textTransform: "none" }}
-                  >
-                    Pause
-                  </Button>
-                )}
-                <Button
-                  startIcon={<CancelRoundedIcon />}
-                  variant="outlined"
-                  color="inherit"
-                  onClick={() => controlJob(cancelDataUpdateJob)}
-                  disabled={controlling || !canControl}
-                  sx={{ textTransform: "none" }}
-                >
-                  Cancel
-                </Button>
-              </Stack>
-              {failures.length ? (
-                <Box
-                  component="details"
-                  sx={{
-                    mt: 1.5,
-                    maxWidth: 720,
-                    color: "text.secondary",
-                    "& summary": { cursor: "pointer" },
-                  }}
-                >
-                  <Typography component="summary" variant="body2">
-                    Technical details
-                  </Typography>
-                  <Stack spacing={0.5} sx={{ mt: 1 }}>
-                    {failures.slice(0, 6).map((record) => (
-                      <Typography key={record.id} variant="caption">
-                        {record.dataset}: {record.message}
-                      </Typography>
-                    ))}
-                  </Stack>
-                </Box>
-              ) : null}
             </Box>
-          </>
-        ) : null}
+          ))}
+        </Stack>
+
+        <Box data-testid="data-update-progress">
+          <Stack
+            direction="row"
+            spacing={1}
+            alignItems="baseline"
+            justifyContent="space-between"
+            sx={{ mb: 1 }}
+          >
+            <Typography
+              data-testid="data-update-status"
+              variant="subtitle1"
+              fontWeight={700}
+            >
+              {displayStatus}
+            </Typography>
+            <Typography variant="body2" color="text.secondary">
+              {progressSummary(job, pct)}
+            </Typography>
+          </Stack>
+
+          <LinearProgress
+            variant={isActive && !job?.total_records ? "indeterminate" : "determinate"}
+            value={pct}
+            sx={{ height: 6, borderRadius: 1, mb: 1 }}
+          />
+
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 0.75 }}>
+            {job
+              ? updateTitle(job, activeActionLabel)
+              : "No update selected yet."}
+            {job?.failed_count ? ` · ${job.failed_count} could not be updated` : ""}
+          </Typography>
+          <Typography
+            variant="caption"
+            color="text.secondary"
+            data-testid="data-update-last-updated"
+            sx={{ display: "block", mb: 1.5 }}
+          >
+            {lastUpdatedLabel(job)}
+          </Typography>
+
+          {job?.error && job.status === "failed" ? (
+            <Alert severity="error" sx={{ mb: 1.5 }}>
+              The update stopped before it finished.
+            </Alert>
+          ) : null}
+
+          <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+            {canResume ? (
+              <Button
+                startIcon={<PlayArrowRoundedIcon />}
+                variant="outlined"
+                onClick={() => controlJob(resumeDataUpdateJob)}
+                disabled={controlling}
+                sx={buttonSx}
+              >
+                Resume
+              </Button>
+            ) : (
+              <Button
+                startIcon={<PauseRoundedIcon />}
+                variant="outlined"
+                onClick={() => controlJob(pauseDataUpdateJob)}
+                disabled={controlling || !canPause}
+                sx={buttonSx}
+              >
+                Pause
+              </Button>
+            )}
+            <Button
+              startIcon={<CancelRoundedIcon />}
+              variant="outlined"
+              onClick={() => controlJob(cancelDataUpdateJob)}
+              disabled={controlling || !canCancel}
+              sx={buttonSx}
+            >
+              Cancel
+            </Button>
+          </Stack>
+        </Box>
       </Stack>
     </Box>
   );

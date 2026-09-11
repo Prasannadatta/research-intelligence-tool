@@ -17,6 +17,8 @@ import {
 import ArrowBackRoundedIcon from "@mui/icons-material/ArrowBackRounded";
 import InsightsOutlinedIcon from "@mui/icons-material/InsightsOutlined";
 import BookmarkAddRoundedIcon from "@mui/icons-material/BookmarkAddRounded";
+import BookmarkAddedRoundedIcon from "@mui/icons-material/BookmarkAddedRounded";
+import BookmarkRemoveRoundedIcon from "@mui/icons-material/BookmarkRemoveRounded";
 
 import {
   analysisModeForAuthors,
@@ -68,7 +70,12 @@ import {
 } from "./publicationSorting";
 import { getWorkDate, getWorkId } from "./authorPublicationHelpers";
 import PublicationExclusionManager from "../../features/authorAnalysis/components/PublicationExclusionManager";
-import { saveSavedSearch } from "../../features/savedSearches/savedSearchesApi";
+import { buildAuthorSavedSearchBody } from "../../features/savedSearches/savedSearchDisplay";
+import {
+  deleteSavedSearch,
+  lookupSavedSearch,
+  saveSavedSearch,
+} from "../../features/savedSearches/savedSearchesApi";
 import { analysisPageLayoutSx } from "../../layout/pageLayout";
 import * as publicationStatsRequest from "./publicationStatsRequest";
 
@@ -269,6 +276,7 @@ function AuthorAnalysisPage() {
     message: null,
     severity: "success",
   });
+  const [matchedSavedSearch, setMatchedSavedSearch] = useState(null);
 
   const requestIdRef = useRef(0);
   const resetAbortRef = useRef(null);
@@ -883,49 +891,88 @@ function AuthorAnalysisPage() {
     [excludedWorkIds],
   );
 
+  const authorsForSavedSearch = useMemo(
+    () => (activeAuthors.length > 0 ? activeAuthors : originalAuthors),
+    [activeAuthors, originalAuthors],
+  );
+
+  const savedSearchLookupBody = useMemo(
+    () =>
+      buildAuthorSavedSearchBody({
+        authors: authorsForSavedSearch,
+        filters: appliedFiltersPayload,
+        excludedWorkIds: excludedWorkIdList,
+        mode,
+      }),
+    [appliedFiltersPayload, authorsForSavedSearch, excludedWorkIdList, mode],
+  );
+
+  useEffect(() => {
+    if (authorsForSavedSearch.length === 0) {
+      setMatchedSavedSearch(null);
+      return undefined;
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(async () => {
+      try {
+        const match = await lookupSavedSearch(savedSearchLookupBody, {
+          signal: controller.signal,
+        });
+        setMatchedSavedSearch(match);
+      } catch (err) {
+        if (err?.name === "CanceledError" || err?.code === "ERR_CANCELED") {
+          return;
+        }
+        setMatchedSavedSearch(null);
+      }
+    }, 250);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [authorsForSavedSearch.length, savedSearchLookupBody]);
+
   const handleSaveSearch = useCallback(async () => {
-    if (saveStatus.saving || originalAuthors.length === 0) {
+    if (saveStatus.saving || authorsForSavedSearch.length === 0) {
       return;
     }
+    if (matchedSavedSearch?.id) {
+      setSaveStatus({ saving: true, message: null, severity: "success" });
+      try {
+        await deleteSavedSearch(matchedSavedSearch.id);
+        setMatchedSavedSearch(null);
+        setSaveStatus({ saving: false, message: "Unsaved", severity: "success" });
+      } catch (err) {
+        setSaveStatus({
+          saving: false,
+          message: err?.response?.data?.detail || "Could not unsave search.",
+          severity: "error",
+        });
+      }
+      return;
+    }
+
     setSaveStatus({ saving: true, message: null, severity: "success" });
     try {
-      const authorsToSave = activeAuthors.length > 0 ? activeAuthors : originalAuthors;
-      const activeIdsToSave = authorsToSave
-        .map((author) => author.canonical_author_id)
-        .filter(Boolean);
-      const providerContext = {
-        providers: [
-          ...new Set(
-            authorsToSave
-              .map((author) => String(author.provider || "").toLowerCase())
-              .filter(Boolean),
-          ),
-        ],
-        mode,
-      };
-      await saveSavedSearch({
-        search_type: "authors",
-        payload: {
-          authors: authorsToSave.map((author) => ({
-            canonical_author_id: author.canonical_author_id,
-            display_name: author.display_name,
-            provider: author.provider,
-            provider_author_id: author.provider_author_id,
-          })),
-          active_author_ids: activeIdsToSave,
+      const result = await saveSavedSearch(
+        buildAuthorSavedSearchBody({
+          authors: authorsForSavedSearch,
           filters: appliedFiltersPayload,
-          excluded_work_ids: excludedWorkIdList,
-          provider_context: providerContext,
-        },
-        applied_filters: appliedFiltersPayload,
-        provider_context: providerContext,
-        excluded_work_ids: excludedWorkIdList,
-        metadata: {
-          author_count: authorsToSave.length,
-          active_author_count: authorsToSave.length,
-        },
-      });
-      setSaveStatus({ saving: false, message: "Saved", severity: "success" });
+          excludedWorkIds: excludedWorkIdList,
+          mode,
+        }),
+      );
+      if (result?.outcome === "already_exists") {
+        setMatchedSavedSearch(result);
+        setSaveStatus({
+          saving: false,
+          message: "Already saved",
+          severity: "info",
+        });
+      } else {
+        setMatchedSavedSearch(result);
+        setSaveStatus({ saving: false, message: "Saved", severity: "success" });
+      }
     } catch (err) {
       setSaveStatus({
         saving: false,
@@ -934,11 +981,11 @@ function AuthorAnalysisPage() {
       });
     }
   }, [
-    activeAuthors,
     appliedFiltersPayload,
+    authorsForSavedSearch,
     excludedWorkIdList,
+    matchedSavedSearch,
     mode,
-    originalAuthors,
     saveStatus.saving,
   ]);
 
@@ -1256,14 +1303,33 @@ function AuthorAnalysisPage() {
             {!unsupported ? (
               <Button
                 size="small"
-                variant="outlined"
-                color="inherit"
-                startIcon={<BookmarkAddRoundedIcon fontSize="small" />}
+                variant={matchedSavedSearch ? "contained" : "outlined"}
+                color={matchedSavedSearch ? "primary" : "inherit"}
+                disableElevation
+                startIcon={
+                  matchedSavedSearch ? (
+                    saveStatus.saving ? (
+                      <BookmarkRemoveRoundedIcon fontSize="small" />
+                    ) : (
+                      <BookmarkAddedRoundedIcon fontSize="small" />
+                    )
+                  ) : (
+                    <BookmarkAddRoundedIcon fontSize="small" />
+                  )
+                }
                 onClick={handleSaveSearch}
-                disabled={saveStatus.saving || originalAuthors.length === 0}
-                sx={{ textTransform: "none", whiteSpace: "nowrap" }}
+                disabled={
+                  saveStatus.saving || authorsForSavedSearch.length === 0
+                }
+                sx={{ textTransform: "none", whiteSpace: "nowrap", flexShrink: 0 }}
               >
-                {saveStatus.saving ? "Saving..." : "Save search"}
+                {saveStatus.saving
+                  ? matchedSavedSearch
+                    ? "Unsaving..."
+                    : "Saving..."
+                  : matchedSavedSearch
+                    ? "Saved"
+                    : "Save search"}
               </Button>
             ) : null}
           </Box>

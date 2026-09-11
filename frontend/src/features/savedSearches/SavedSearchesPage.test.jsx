@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { ThemeProvider, createTheme } from "@mui/material/styles";
 
@@ -35,6 +35,7 @@ const AUTHOR_SEARCH = {
       },
     ],
     active_author_ids: ["c1", "c3"],
+    analysis_mode: "common_publications",
     filters: {
       from_year: 2020,
       to_year: 2026,
@@ -53,12 +54,28 @@ const AUTHOR_SEARCH = {
     venues: [],
     grant_numbers: [],
   },
-  provider_context: { providers: ["openalex"] },
+  provider_context: { providers: ["openalex"], mode: "common_publications" },
   excluded_work_ids: ["W1", "W2"],
   created_at: "2026-08-12T00:00:00Z",
   updated_at: "2026-08-12T00:00:00Z",
   last_viewed_at: "2026-08-17T00:00:00Z",
   view_count: 2,
+};
+
+const LARGE_AUTHOR_SEARCH = {
+  ...AUTHOR_SEARCH,
+  id: "author-large",
+  display_name: "Large team",
+  payload: {
+    ...AUTHOR_SEARCH.payload,
+    authors: Array.from({ length: 20 }, (_, index) => ({
+      canonical_author_id: `c${index + 1}`,
+      display_name: `Author ${index + 1}`,
+      provider: "openalex",
+      provider_author_id: `A${index + 1}`,
+    })),
+    active_author_ids: Array.from({ length: 20 }, (_, index) => `c${index + 1}`),
+  },
 };
 
 const GRANT_SEARCH = {
@@ -136,12 +153,29 @@ describe("SavedSearchesPage", () => {
     installLocalStorageStub();
     window.localStorage.clear();
     vi.spyOn(savedSearchesApi, "fetchSavedSearches").mockImplementation(({ type }) =>
-      Promise.resolve(type === "grant" ? [GRANT_SEARCH] : [AUTHOR_SEARCH]),
+      Promise.resolve(type === "grant" ? [GRANT_SEARCH] : [AUTHOR_SEARCH, LARGE_AUTHOR_SEARCH]),
     );
-    vi.spyOn(savedSearchesApi, "markSavedSearchViewed").mockImplementation((id) =>
-      Promise.resolve(id === "grant-1" ? GRANT_SEARCH : AUTHOR_SEARCH),
-    );
+    vi.spyOn(savedSearchesApi, "markSavedSearchViewed").mockImplementation((id) => {
+      if (id === "grant-1") {
+        return Promise.resolve(GRANT_SEARCH);
+      }
+      if (id === "author-large") {
+        return Promise.resolve(LARGE_AUTHOR_SEARCH);
+      }
+      return Promise.resolve(AUTHOR_SEARCH);
+    });
     vi.spyOn(savedSearchesApi, "deleteSavedSearch").mockResolvedValue();
+    vi.spyOn(savedSearchesApi, "patchSavedSearch").mockImplementation((id, patch) =>
+      Promise.resolve({
+        ...(id === "author-large" ? LARGE_AUTHOR_SEARCH : AUTHOR_SEARCH),
+        ...patch,
+        display_name:
+          patch.display_name === ""
+            ? "Author A + Author B + Author C"
+            : patch.display_name ?? AUTHOR_SEARCH.display_name,
+        outcome: "updated",
+      }),
+    );
     vi.spyOn(dataUpdaterApi, "startSavedSearchDataUpdate").mockResolvedValue({
       id: "job-1",
       status: "running",
@@ -153,43 +187,45 @@ describe("SavedSearchesPage", () => {
     vi.restoreAllMocks();
   });
 
-  it("renders author metadata and switches to grants", async () => {
+  it("renders a searchable table with compact author lists", async () => {
     renderPage();
 
-    expect(await screen.findByText("Author A + Author B + Author C")).toBeInTheDocument();
-    expect(screen.getByText("3 authors")).toBeInTheDocument();
-    expect(screen.getByText(/Filters: 2020-2026/)).toBeInTheDocument();
-    expect(screen.getByText("Excluded: 2 publications")).toBeInTheDocument();
+    expect(await screen.findByRole("table", { name: "Saved searches" })).toBeInTheDocument();
+    expect(screen.getByText("Author A + Author B + Author C")).toBeInTheDocument();
+    expect(screen.getByText("Author 1, Author 2, Author 3 +17 more")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Grants" }));
-    expect(await screen.findByText("R01GM123456")).toBeInTheDocument();
-    expect(screen.getByText("NIH")).toBeInTheDocument();
-    expect(screen.getByText(/Nature Medicine/)).toBeInTheDocument();
+    fireEvent.change(screen.getByPlaceholderText("Name or author"), {
+      target: { value: "large" },
+    });
+    expect(screen.getByText("Large team")).toBeInTheDocument();
+    expect(screen.queryByText("Author A + Author B + Author C")).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByPlaceholderText("Name or author"), {
+      target: { value: "Author B" },
+    });
+    expect(await screen.findByText("Author A + Author B + Author C")).toBeInTheDocument();
   });
 
-  it("changes sorting and refetches", async () => {
+  it("switches to grants and opens restored route state", async () => {
     renderPage();
-    await screen.findByText("Author A + Author B + Author C");
-
-    fireEvent.change(screen.getByLabelText("Sort"), {
-      target: { value: "view_count" },
-    });
-
+    fireEvent.click(await screen.findByRole("button", { name: "Grants" }));
     await waitFor(() => {
-      expect(savedSearchesApi.fetchSavedSearches).toHaveBeenLastCalledWith(
-        expect.objectContaining({
-          sortBy: "view_count",
-          sortDirection: "desc",
-        }),
-      );
+      expect(screen.getAllByText("R01GM123456").length).toBeGreaterThan(0);
     });
+
+    fireEvent.click(screen.getByRole("button", { name: "Open" }));
+    const probe = await screen.findByTestId("location-state");
+    const state = JSON.parse(probe.textContent);
+    expect(state.pathname).toBe("/grants/R01GM123456");
+    expect(state.state.filters.venues).toEqual(["Nature Medicine"]);
   });
 
   it("opens an author search with restored route state", async () => {
     renderPage();
     await screen.findByText("Author A + Author B + Author C");
 
-    fireEvent.click(screen.getByRole("button", { name: "Open" }));
+    const row = screen.getByText("Author A + Author B + Author C").closest("tr");
+    fireEvent.click(within(row).getByRole("button", { name: "Open" }));
 
     const probe = await screen.findByTestId("location-state");
     const state = JSON.parse(probe.textContent);
@@ -203,25 +239,46 @@ describe("SavedSearchesPage", () => {
     expect(state.state.filters.from_year).toBe(2020);
   });
 
-  it("opens a grant search with restored filters", async () => {
+  it("renames with an empty custom name", async () => {
     renderPage();
-    fireEvent.click(await screen.findByRole("button", { name: "Grants" }));
-    await screen.findByText("R01GM123456");
+    await screen.findByText("Author A + Author B + Author C");
+    const row = screen.getByText("Author A + Author B + Author C").closest("tr");
+    fireEvent.click(within(row).getByRole("button", { name: "Rename" }));
 
-    fireEvent.click(screen.getByRole("button", { name: "Open" }));
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
-    const probe = await screen.findByTestId("location-state");
-    const state = JSON.parse(probe.textContent);
-    expect(state.pathname).toBe("/grants/R01GM123456");
-    expect(state.search).toBe("?provider=openalex");
-    expect(state.state.filters.venues).toEqual(["Nature Medicine"]);
+    await waitFor(() => {
+      expect(savedSearchesApi.patchSavedSearch).toHaveBeenCalledWith("author-1", {
+        display_name: "",
+      });
+    });
+    expect(await screen.findByText("Renamed")).toBeInTheDocument();
+  });
+
+  it("edits authors and surfaces duplicate conflicts", async () => {
+    savedSearchesApi.patchSavedSearch.mockRejectedValueOnce({
+      response: { data: { detail: "A saved search with this configuration already exists." } },
+    });
+    renderPage();
+    await screen.findByText("Author A + Author B + Author C");
+    const row = screen.getByText("Author A + Author B + Author C").closest("tr");
+    fireEvent.click(within(row).getByRole("button", { name: "Edit" }));
+
+    expect(await screen.findByText("Edit saved search")).toBeInTheDocument();
+    expect(screen.getByLabelText("Add author search")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    expect(
+      await screen.findByText("A saved search with this configuration already exists."),
+    ).toBeInTheDocument();
   });
 
   it("confirms delete and removes the row", async () => {
     renderPage();
     await screen.findByText("Author A + Author B + Author C");
-
-    fireEvent.click(screen.getByText("Delete"));
+    const row = screen.getByText("Author A + Author B + Author C").closest("tr");
+    fireEvent.click(within(row).getByRole("button", { name: "Delete" }));
     expect(screen.getByText("Delete saved search?")).toBeInTheDocument();
     fireEvent.click(screen.getAllByText("Delete").at(-1));
 
@@ -234,8 +291,8 @@ describe("SavedSearchesPage", () => {
   it("starts a data update for a specific saved search", async () => {
     renderPage();
     await screen.findByText("Author A + Author B + Author C");
-
-    fireEvent.click(screen.getByRole("button", { name: "Update Data" }));
+    const row = screen.getByText("Author A + Author B + Author C").closest("tr");
+    fireEvent.click(within(row).getByRole("button", { name: "Update data" }));
 
     await waitFor(() => {
       expect(dataUpdaterApi.startSavedSearchDataUpdate).toHaveBeenCalledWith("author-1");

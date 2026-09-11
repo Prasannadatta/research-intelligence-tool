@@ -8,7 +8,7 @@ from pathlib import Path
 from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.core.config import get_settings
@@ -18,12 +18,19 @@ from app.db.session import get_db_session
 from app.main import app
 
 
-def _author_payload(order: tuple[str, str] = ("c1", "c2")) -> dict:
+def _author_payload(
+    order: tuple[str, str] = ("c1", "c2"),
+    *,
+    filters: dict | None = None,
+    display_name: str | None = None,
+    excluded_work_ids: list[str] | None = None,
+) -> dict:
     names = {
         "c1": ("John Smith", "A1"),
         "c2": ("Jane Doe", "A2"),
+        "c3": ("Alex Roe", "A3"),
     }
-    return {
+    body = {
         "search_type": "authors",
         "payload": {
             "authors": [
@@ -36,14 +43,21 @@ def _author_payload(order: tuple[str, str] = ("c1", "c2")) -> dict:
                 for author_id in order
             ],
             "active_author_ids": list(order),
-            "filters": {
+            "filters": filters
+            if filters is not None
+            else {
                 "from_year": 2020,
                 "sources": ["OpenAlex"],
                 "institutions": ["UC Berkeley"],
             },
-            "excluded_work_ids": ["W2", "W1"],
+            "excluded_work_ids": excluded_work_ids
+            if excluded_work_ids is not None
+            else ["W2", "W1"],
         },
     }
+    if display_name is not None:
+        body["display_name"] = display_name
+    return body
 
 
 def _grant_payload(grant_number: str = "R01GM123456", filters: dict | None = None) -> dict:
@@ -84,7 +98,7 @@ def _client(tmp_path, monkeypatch):
     return client, engine
 
 
-def test_save_author_search_and_duplicate_order_upserts(tmp_path, monkeypatch):
+def test_same_authors_reordered_are_duplicates(tmp_path, monkeypatch):
     client, engine = _client(tmp_path, monkeypatch)
     try:
         first = client.post("/api/saved-searches", json=_author_payload(("c1", "c2")))
@@ -92,13 +106,237 @@ def test_save_author_search_and_duplicate_order_upserts(tmp_path, monkeypatch):
 
         assert first.status_code == 200
         assert second.status_code == 200
+        assert first.json()["outcome"] == "created"
+        assert second.json()["outcome"] == "already_exists"
         assert first.json()["id"] == second.json()["id"]
-        assert second.json()["excluded_work_ids"] == ["W1", "W2"]
-        assert second.json()["payload"]["filters"]["institutions"] == ["UC Berkeley"]
+        assert first.json()["payload"]["analysis_mode"] == "common_publications"
 
         listing = client.get("/api/saved-searches", params={"type": "authors"})
         assert listing.status_code == 200
         assert len(listing.json()["items"]) == 1
+    finally:
+        app.dependency_overrides.clear()
+        asyncio.run(engine.dispose())
+
+
+def test_same_authors_same_filters_are_duplicates(tmp_path, monkeypatch):
+    client, engine = _client(tmp_path, monkeypatch)
+    try:
+        first = client.post(
+            "/api/saved-searches",
+            json=_author_payload(display_name="Lab team"),
+        )
+        second = client.post(
+            "/api/saved-searches",
+            json=_author_payload(display_name="Different name"),
+        )
+        assert first.json()["id"] == second.json()["id"]
+        assert second.json()["outcome"] == "already_exists"
+        # Name does not determine identity and duplicate save must not overwrite.
+        assert second.json()["display_name"] == "Lab team"
+    finally:
+        app.dependency_overrides.clear()
+        asyncio.run(engine.dispose())
+
+
+def test_same_authors_different_filters_allowed(tmp_path, monkeypatch):
+    client, engine = _client(tmp_path, monkeypatch)
+    try:
+        one = client.post(
+            "/api/saved-searches",
+            json=_author_payload(filters={"from_year": 2020}),
+        )
+        two = client.post(
+            "/api/saved-searches",
+            json=_author_payload(filters={"from_year": 2021}),
+        )
+        assert one.status_code == 200
+        assert two.status_code == 200
+        assert one.json()["id"] != two.json()["id"]
+        assert two.json()["outcome"] == "created"
+    finally:
+        app.dependency_overrides.clear()
+        asyncio.run(engine.dispose())
+
+
+def test_excluded_works_do_not_affect_identity(tmp_path, monkeypatch):
+    client, engine = _client(tmp_path, monkeypatch)
+    try:
+        one = client.post(
+            "/api/saved-searches",
+            json=_author_payload(excluded_work_ids=["W1"]),
+        )
+        two = client.post(
+            "/api/saved-searches",
+            json=_author_payload(excluded_work_ids=["W9"]),
+        )
+        assert one.json()["id"] == two.json()["id"]
+        assert two.json()["outcome"] == "already_exists"
+    finally:
+        app.dependency_overrides.clear()
+        asyncio.run(engine.dispose())
+
+
+def test_rename_keeps_same_saved_search(tmp_path, monkeypatch):
+    client, engine = _client(tmp_path, monkeypatch)
+    try:
+        created = client.post("/api/saved-searches", json=_author_payload()).json()
+        renamed = client.patch(
+            f"/api/saved-searches/{created['id']}",
+            json={"display_name": "Custom label"},
+        )
+        assert renamed.status_code == 200
+        assert renamed.json()["id"] == created["id"]
+        assert renamed.json()["canonical_key"] == created["canonical_key"]
+        assert renamed.json()["display_name"] == "Custom label"
+        assert renamed.json()["outcome"] == "updated"
+
+        cleared = client.patch(
+            f"/api/saved-searches/{created['id']}",
+            json={"display_name": ""},
+        )
+        assert cleared.status_code == 200
+        assert cleared.json()["canonical_key"] == created["canonical_key"]
+        assert cleared.json()["display_name"] == "John Smith + Jane Doe"
+    finally:
+        app.dependency_overrides.clear()
+        asyncio.run(engine.dispose())
+
+
+def test_add_and_remove_author_via_patch(tmp_path, monkeypatch):
+    client, engine = _client(tmp_path, monkeypatch)
+    try:
+        created = client.post(
+            "/api/saved-searches",
+            json=_author_payload(("c1", "c2")),
+        ).json()
+        assert created["payload"]["analysis_mode"] == "common_publications"
+
+        removed = client.patch(
+            f"/api/saved-searches/{created['id']}",
+            json={
+                "authors": [
+                    {
+                        "canonical_author_id": "c1",
+                        "display_name": "John Smith",
+                        "provider": "openalex",
+                        "provider_author_id": "A1",
+                    }
+                ]
+            },
+        )
+        assert removed.status_code == 200
+        assert removed.json()["canonical_key"] != created["canonical_key"]
+        assert removed.json()["payload"]["analysis_mode"] == "single_author"
+        assert [a["canonical_author_id"] for a in removed.json()["payload"]["authors"]] == ["c1"]
+
+        added = client.patch(
+            f"/api/saved-searches/{created['id']}",
+            json={
+                "authors": [
+                    {
+                        "canonical_author_id": "c1",
+                        "display_name": "John Smith",
+                        "provider": "openalex",
+                        "provider_author_id": "A1",
+                    },
+                    {
+                        "canonical_author_id": "c3",
+                        "display_name": "Alex Roe",
+                        "provider": "openalex",
+                        "provider_author_id": "A3",
+                    },
+                ]
+            },
+        )
+        assert added.status_code == 200
+        ids = [a["canonical_author_id"] for a in added.json()["payload"]["authors"]]
+        assert ids == ["c1", "c3"]
+    finally:
+        app.dependency_overrides.clear()
+        asyncio.run(engine.dispose())
+
+
+def test_edit_into_existing_configuration_rejected(tmp_path, monkeypatch):
+    client, engine = _client(tmp_path, monkeypatch)
+    try:
+        first = client.post(
+            "/api/saved-searches",
+            json=_author_payload(("c1", "c2"), filters={"from_year": 2020}),
+        ).json()
+        second = client.post(
+            "/api/saved-searches",
+            json=_author_payload(("c1", "c2"), filters={"from_year": 2021}),
+        ).json()
+        assert first["id"] != second["id"]
+
+        conflict = client.patch(
+            f"/api/saved-searches/{second['id']}",
+            json={"filters": {"from_year": 2020}},
+        )
+        assert conflict.status_code == 409
+        assert "already exists" in conflict.json()["detail"].lower()
+
+        listing = client.get("/api/saved-searches", params={"type": "authors"})
+        assert len(listing.json()["items"]) == 2
+    finally:
+        app.dependency_overrides.clear()
+        asyncio.run(engine.dispose())
+
+
+def test_lookup_and_delete_support_save_unsave(tmp_path, monkeypatch):
+    client, engine = _client(tmp_path, monkeypatch)
+    try:
+        payload = _author_payload()
+        missing = client.post("/api/saved-searches/lookup", json=payload)
+        assert missing.status_code == 200
+        assert missing.json()["item"] is None
+
+        created = client.post("/api/saved-searches", json=payload).json()
+        found = client.post("/api/saved-searches/lookup", json=payload)
+        assert found.json()["item"]["id"] == created["id"]
+
+        assert client.delete(f"/api/saved-searches/{created['id']}").status_code == 204
+        after = client.post("/api/saved-searches/lookup", json=payload)
+        assert after.json()["item"] is None
+    finally:
+        app.dependency_overrides.clear()
+        asyncio.run(engine.dispose())
+
+
+def test_list_search_by_name_and_author(tmp_path, monkeypatch):
+    client, engine = _client(tmp_path, monkeypatch)
+    try:
+        client.post(
+            "/api/saved-searches",
+            json=_author_payload(("c1", "c2"), display_name="Berkeley lab"),
+        )
+        client.post(
+            "/api/saved-searches",
+            json=_author_payload(("c3",), filters={"from_year": 2019}, display_name="Solo"),
+        )
+
+        by_name = client.get("/api/saved-searches", params={"type": "authors", "q": "berkeley"})
+        assert len(by_name.json()["items"]) == 1
+        assert by_name.json()["items"][0]["display_name"] == "Berkeley lab"
+
+        by_author = client.get("/api/saved-searches", params={"type": "authors", "q": "alex"})
+        assert len(by_author.json()["items"]) == 1
+        assert by_author.json()["items"][0]["display_name"] == "Solo"
+    finally:
+        app.dependency_overrides.clear()
+        asyncio.run(engine.dispose())
+
+
+def test_empty_custom_name_uses_author_label(tmp_path, monkeypatch):
+    client, engine = _client(tmp_path, monkeypatch)
+    try:
+        created = client.post(
+            "/api/saved-searches",
+            json=_author_payload(display_name=""),
+        )
+        assert created.status_code == 200
+        assert created.json()["display_name"] == "John Smith + Jane Doe"
     finally:
         app.dependency_overrides.clear()
         asyncio.run(engine.dispose())
@@ -113,8 +351,9 @@ def test_save_grant_search_normalizes_duplicates_and_keeps_metadata(tmp_path, mo
         assert first.status_code == 200
         assert second.status_code == 200
         assert first.json()["id"] == second.json()["id"]
-        assert second.json()["display_name"] == "r01gm123456"
-        assert second.json()["metadata"] == {"funder_name": "NIH"}
+        assert second.json()["outcome"] == "already_exists"
+        assert second.json()["display_name"] == "R01 GM-123456"
+        assert first.json()["metadata"] == {"funder_name": "NIH"}
 
         listing = client.get("/api/saved-searches", params={"type": "grant"})
         assert len(listing.json()["items"]) == 1
@@ -198,15 +437,18 @@ def test_saved_searches_migration_runs(tmp_path, monkeypatch):
     )
     command.upgrade(config, "008_saved_searches")
 
-    async def assert_table_exists() -> None:
-        engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
-        try:
-            async with engine.connect() as conn:
-                rows = await conn.execute(
-                    select(SavedSearch.__table__.c.search_type).select_from(SavedSearch.__table__)
-                )
-                assert rows.all() == []
-        finally:
-            await engine.dispose()
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
 
-    asyncio.run(assert_table_exists())
+    async def check() -> None:
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                text(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='saved_searches'"
+                )
+            )
+            assert result.scalar_one() == "saved_searches"
+
+    try:
+        asyncio.run(check())
+    finally:
+        asyncio.run(engine.dispose())

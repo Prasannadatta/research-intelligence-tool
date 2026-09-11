@@ -349,7 +349,9 @@ class DataUpdaterService:
             await self.repo.mark_job_cancelled(job)
             await self.session.commit()
         elif job.status == "cancel_requested":
-            pass
+            # Worker may be dead or stuck mid-record; a repeat cancel finalizes.
+            await self.repo.mark_job_cancelled(job)
+            await self.session.commit()
         elif job.status != "cancelled":
             raise DataUpdaterError("This update job cannot be cancelled.", 409)
         return await self.get_job(str(job.id), include_records=False)
@@ -480,6 +482,8 @@ class DataUpdaterService:
             completed_keys = await self.repo.completed_record_keys(job.id)
             remaining = 0
             for dataset in datasets:
+                if await self._stop_if_requested(job):
+                    return
                 definition = DATASET_BY_KEY[dataset]
                 targets = await self.repo.list_refresh_targets(
                     dataset,
@@ -495,8 +499,17 @@ class DataUpdaterService:
                 targets_by_dataset[dataset] = targets
                 remaining += len(targets)
             total = max(job.total_records or 0, job.processed_records + remaining)
-            await self.repo.mark_job_started(job, total=total)
+            # Close any open worker snapshot before the start transition so a
+            # concurrent pause/cancel commit is visible to the conditional UPDATE.
             await self.session.commit()
+            if await self._stop_if_requested(job):
+                return
+            started = await self.repo.mark_job_started(job, total=total)
+            await self.session.commit()
+            if not started:
+                if await self._stop_if_requested(job):
+                    return
+                return
 
             for dataset in datasets:
                 if await self._stop_if_requested(job):
@@ -521,11 +534,19 @@ class DataUpdaterService:
             logger.exception("Data update job failed job_id=%s", job_id)
             await self.session.rollback()
             job = await self.repo.get_job(job_id)
-            if job is not None:
+            if job is not None and job.status not in {
+                "paused",
+                "cancelled",
+                "pause_requested",
+                "cancel_requested",
+            }:
                 await self.repo.mark_job_failed(job, str(exc))
                 await self.session.commit()
 
     async def _stop_if_requested(self, job: DataUpdateJob) -> bool:
+        # Commit first so the next SELECT is not stuck on a stale SQLite snapshot
+        # and can see pause/cancel committed by the API session.
+        await self.session.commit()
         await self.session.refresh(job)
         if job.status == "pause_requested":
             await self.repo.mark_job_paused(job)

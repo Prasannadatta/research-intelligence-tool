@@ -17,6 +17,22 @@ SavedSearchSortBy = Literal[
     "view_count",
 ]
 SortDirection = Literal["asc", "desc"]
+SavedSearchOutcome = Literal["created", "already_exists", "updated"]
+
+
+class SavedSearchAuthorInput(BaseModel):
+    canonical_author_id: str = Field(min_length=1, max_length=128)
+    display_name: str = Field(min_length=1, max_length=512)
+    provider: str | None = Field(None, max_length=64)
+    provider_author_id: str | None = Field(None, max_length=256)
+
+    @field_validator("canonical_author_id", "display_name", "provider", "provider_author_id")
+    @classmethod
+    def _clean_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = " ".join(str(value).split())
+        return text or None
 
 
 class SavedSearchCreate(BaseModel):
@@ -46,7 +62,16 @@ class SavedSearchCreate(BaseModel):
 
 
 class SavedSearchPatch(BaseModel):
+    """Patch metadata and/or author-search content.
+
+    display_name may be set to empty/null to regenerate an author-based label.
+    authors/filters changes recompute the fingerprint; conflicts return 409.
+    """
+
     display_name: str | None = Field(None, max_length=512)
+    authors: list[SavedSearchAuthorInput] | None = None
+    filters: dict[str, Any] | None = None
+    excluded_work_ids: list[str] | None = None
     is_pinned: bool | None = None
     notes: str | None = Field(None, max_length=4000)
     metadata: dict[str, Any] | None = None
@@ -78,7 +103,12 @@ class SavedSearchResponse(BaseModel):
     is_pinned: bool
     notes: str | None = None
     metadata: dict[str, Any] | None = None
+    outcome: SavedSearchOutcome | None = None
 
 
 class SavedSearchListResponse(BaseModel):
     items: list[SavedSearchResponse] = Field(default_factory=list)
+
+
+class SavedSearchLookupResponse(BaseModel):
+    item: SavedSearchResponse | None = None

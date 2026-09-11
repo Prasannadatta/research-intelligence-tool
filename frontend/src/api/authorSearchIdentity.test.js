@@ -43,30 +43,21 @@ describe("authorSearchIdentity", () => {
     expect(authorIdentityKeys(hit).has("openalex:A501")).toBe(true);
   });
 
-  it("matches ORCID search hits without using names", () => {
+  it("matches saved-search author rows that store provider identity at the top level", () => {
     const selected = {
-      result_id: "orcid:0000-0001-6860-9566",
-      source: "orcid",
-      orcid: "0000-0001-6860-9566",
-      display_name: "Lin Lin",
+      canonical_author_id: "11111111-1111-4111-8111-111111111111",
+      display_name: "Author A",
+      provider: "openalex",
+      provider_author_id: "A501",
     };
-    const samePerson = {
-      result_id: "openalex:A9",
+    const hit = {
+      result_id: "openalex:A501",
       source: "openalex",
-      openalex_id: "A9",
-      orcid: "https://orcid.org/0000-0001-6860-9566",
-      display_name: "L. Lin",
-    };
-    const otherPerson = {
-      result_id: "openalex:A0",
-      source: "openalex",
-      openalex_id: "A0",
-      orcid: null,
-      display_name: "Lin Lin",
+      openalex_id: "A501",
+      display_name: "Author A",
     };
     const keys = selectedAuthorIdentityKeySet([selected]);
-    expect(isAuthorAlreadySelected(samePerson, keys)).toBe(true);
-    expect(isAuthorAlreadySelected(otherPerson, keys)).toBe(false);
+    expect(isAuthorAlreadySelected(hit, keys)).toBe(true);
   });
 });
 

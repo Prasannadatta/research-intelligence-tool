@@ -6,17 +6,17 @@ export const SAVED_SEARCH_TYPES = {
 };
 
 export const SAVED_SEARCH_SORT_OPTIONS = [
-  { value: "last_viewed_at", label: "Last viewed", defaultDirection: "desc" },
-  { value: "created_at", label: "Recently saved", defaultDirection: "desc" },
-  { value: "updated_at", label: "Recently updated", defaultDirection: "desc" },
+  { value: "updated_at", label: "Updated", defaultDirection: "desc" },
+  { value: "created_at", label: "Saved", defaultDirection: "desc" },
   { value: "display_name", label: "Name", defaultDirection: "asc" },
-  { value: "view_count", label: "Most viewed", defaultDirection: "desc" },
+  { value: "last_viewed_at", label: "Last viewed", defaultDirection: "desc" },
 ];
 
 export async function fetchSavedSearches({
   type = SAVED_SEARCH_TYPES.AUTHORS,
-  sortBy = "last_viewed_at",
+  sortBy = "updated_at",
   sortDirection = "desc",
+  q = "",
   signal,
 } = {}) {
   const response = await apiClient.get("/saved-searches", {
@@ -24,6 +24,7 @@ export async function fetchSavedSearches({
       type,
       sort_by: sortBy,
       sort_direction: sortDirection,
+      ...(q ? { q } : {}),
     },
     signal,
   });
@@ -33,6 +34,16 @@ export async function fetchSavedSearches({
 
 export async function saveSavedSearch(payload) {
   const response = await apiClient.post("/saved-searches", payload);
+  return response.data || {};
+}
+
+export async function lookupSavedSearch(payload, { signal } = {}) {
+  const response = await apiClient.post("/saved-searches/lookup", payload, { signal });
+  return response.data?.item || null;
+}
+
+export async function patchSavedSearch(id, patch) {
+  const response = await apiClient.patch(`/saved-searches/${encodeURIComponent(id)}`, patch);
   return response.data || {};
 }
 

@@ -621,6 +621,8 @@ function AuthorSearch({
   onResultSelected,
   selectedResultIds = [],
   selectedAuthors = [],
+  /** Compact author-only picker for dialogs (reuses the same search pipeline). */
+  embedded = false,
 }) {
   const navigate = useNavigate();
   const [inputValue, setInputValue] = useState("");
@@ -696,13 +698,13 @@ function AuthorSearch({
 
   const normalizedQuery = normalizeSearchQuery(inputValue, entityType);
   normalizedQueryRef.current = normalizedQuery;
-  const isAuthors = entityType === ENTITY_TYPES.AUTHORS;
-  const isGrants = entityType === ENTITY_TYPES.GRANTS;
-  const usesAuthorFilters = sourceUsesOpenAlexAuthorFilters(source);
+  const isAuthors = embedded || entityType === ENTITY_TYPES.AUTHORS;
+  const isGrants = !embedded && entityType === ENTITY_TYPES.GRANTS;
+  const usesAuthorFilters = !embedded && sourceUsesOpenAlexAuthorFilters(source);
   const isArxiv = source === SEARCH_SOURCES.ARXIV;
   const minQueryLength = minQueryLengthForEntity(entityType);
   const canSearch = normalizedQuery.length >= minQueryLength;
-  // Institution/topic filters are OpenAlex-only; hide for ORCID-only source.
+  // Institution/topic filters are OpenAlex-only; hide for ORCID-only source and embedded picker.
   const showAuthorFilters = isAuthors && usesAuthorFilters;
 
 
@@ -1520,6 +1522,13 @@ function AuthorSearch({
         }}
         slotProps={{
           listbox: listboxSlotProps,
+          ...(embedded
+            ? {
+                popper: {
+                  sx: { zIndex: (theme) => theme.zIndex.modal + 2 },
+                },
+              }
+            : {}),
         }}
         isOptionEqualToValue={(option, value) =>
           getResultKey(option) === getResultKey(value)
@@ -1587,11 +1596,11 @@ function AuthorSearch({
                 display: "flex",
                 alignItems: "center",
                 width: "100%",
-                px: 1.25,
-                py: 1.1,
+                px: embedded ? 1 : 1.25,
+                py: embedded ? 0.85 : 1.1,
                 border: "1px solid",
                 borderColor: "divider",
-                borderRadius: 4,
+                borderRadius: embedded ? 2 : 4,
                 bgcolor: "background.paper",
                 boxShadow: "none",
                 transition: "box-shadow 140ms ease, border-color 140ms ease",
@@ -1603,40 +1612,44 @@ function AuthorSearch({
                 },
               }}
             >
-              <Select
-                value={entityType}
-                onChange={handleEntityTypeChange}
-                onMouseDown={(event) => event.stopPropagation()}
-                variant="standard"
-                disableUnderline
-                inputProps={{ "aria-label": "Search entity type" }}
-                sx={{
-                  mr: 0.75,
-                  ml: 0.25,
-                  minWidth: 96,
-                  fontSize: "0.875rem",
-                  fontWeight: 600,
-                  color: "text.secondary",
-                  "& .MuiSelect-select": {
-                    py: 0.75,
-                    pr: "28px !important",
-                  },
-                }}
-              >
-                <MenuItem value={ENTITY_TYPES.AUTHORS}>Authors</MenuItem>
-                <MenuItem value={ENTITY_TYPES.GRANTS}>Grants</MenuItem>
-              </Select>
+              {!embedded ? (
+                <>
+                  <Select
+                    value={entityType}
+                    onChange={handleEntityTypeChange}
+                    onMouseDown={(event) => event.stopPropagation()}
+                    variant="standard"
+                    disableUnderline
+                    inputProps={{ "aria-label": "Search entity type" }}
+                    sx={{
+                      mr: 0.75,
+                      ml: 0.25,
+                      minWidth: 96,
+                      fontSize: "0.875rem",
+                      fontWeight: 600,
+                      color: "text.secondary",
+                      "& .MuiSelect-select": {
+                        py: 0.75,
+                        pr: "28px !important",
+                      },
+                    }}
+                  >
+                    <MenuItem value={ENTITY_TYPES.AUTHORS}>Authors</MenuItem>
+                    <MenuItem value={ENTITY_TYPES.GRANTS}>Grants</MenuItem>
+                  </Select>
 
-              <Box
-                sx={{
-                  width: "1px",
-                  alignSelf: "stretch",
-                  bgcolor: "divider",
-                  my: 0.5,
-                  mr: 1,
-                  flexShrink: 0,
-                }}
-              />
+                  <Box
+                    sx={{
+                      width: "1px",
+                      alignSelf: "stretch",
+                      bgcolor: "divider",
+                      my: 0.5,
+                      mr: 1,
+                      flexShrink: 0,
+                    }}
+                  />
+                </>
+              ) : null}
 
               <IconButton
                 size="small"
@@ -1650,7 +1663,11 @@ function AuthorSearch({
 
               <InputBase
                 fullWidth
-                placeholder={ENTITY_PLACEHOLDERS[entityType]}
+                placeholder={
+                  embedded
+                    ? "Search authors by name or ORCID"
+                    : ENTITY_PLACEHOLDERS[entityType]
+                }
                 onKeyDown={(event) => {
                   if (event.key === "Enter") {
                     if (isGrants) {
@@ -1671,10 +1688,10 @@ function AuthorSearch({
                 }}
                 inputProps={{
                   ...htmlInputSlot,
-                  "aria-label": "Search",
+                  "aria-label": embedded ? "Add author search" : "Search",
                 }}
                 sx={{
-                  fontSize: "1rem",
+                  fontSize: embedded ? "0.95rem" : "1rem",
                   py: 0.5,
                   ml: 0.5,
                   mr: 1,

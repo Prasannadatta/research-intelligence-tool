@@ -49,6 +49,22 @@ export function authorIdentityKeys(item) {
     keys.add(`orcid:${orcid}`);
   }
 
+  // Analysis / saved-search author rows store provider identity at the top level.
+  const topProvider = String(item.provider || "")
+    .trim()
+    .toLowerCase();
+  const topProviderAuthorId = String(item.provider_author_id || "").trim();
+  if (topProvider && topProviderAuthorId) {
+    if (topProvider === "orcid") {
+      const normalized = normalizeOrcid(topProviderAuthorId);
+      if (normalized) {
+        keys.add(`orcid:${normalized}`);
+      }
+    } else {
+      keys.add(`${topProvider}:${topProviderAuthorId}`);
+    }
+  }
+
   const records = Array.isArray(item.source_records) ? item.source_records : [];
   for (const row of records) {
     const provider = String(row?.provider || "")

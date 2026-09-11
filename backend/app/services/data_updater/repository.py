@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import delete, distinct, func, literal, or_, select
+from sqlalchemy import delete, distinct, func, literal, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
@@ -88,13 +88,40 @@ class DataUpdaterRepository:
         )
         return {(str(dataset), str(record_id)) for dataset, record_id in rows.all()}
 
-    async def mark_job_started(self, job: DataUpdateJob, *, total: int) -> None:
+    async def mark_job_started(self, job: DataUpdateJob, *, total: int) -> bool:
+        """Mark the job running unless a pause/cancel signal already won.
+
+        Uses a conditional UPDATE so concurrent pause/cancel requests are not
+        overwritten. Returns False when the job must not continue.
+        """
         now = utc_now()
-        job.status = "running"
-        job.started_at = job.started_at or now
-        job.updated_at = now
-        job.total_records = max(job.total_records or 0, total)
-        await self.session.flush()
+        started_at = job.started_at or now
+        total_records = max(job.total_records or 0, total)
+        result = await self.session.execute(
+            update(DataUpdateJob)
+            .where(
+                DataUpdateJob.id == job.id,
+                DataUpdateJob.status.in_(("queued", "running")),
+            )
+            .values(
+                status="running",
+                started_at=started_at,
+                updated_at=now,
+                total_records=total_records,
+            )
+        )
+        if not result.rowcount:
+            await self.session.execute(
+                update(DataUpdateJob)
+                .where(DataUpdateJob.id == job.id)
+                .values(
+                    started_at=started_at,
+                    updated_at=now,
+                    total_records=total_records,
+                )
+            )
+        await self.session.refresh(job)
+        return job.status == "running"
 
     async def mark_job_completed(self, job: DataUpdateJob, *, status: str = "succeeded") -> None:
         now = utc_now()

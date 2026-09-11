@@ -285,6 +285,350 @@ def test_pause_and_cancel_job_controls(tmp_path, monkeypatch):
         cancel_response = client.post(f"/api/data-updater/jobs/{job_id}/cancel")
         assert cancel_response.status_code == 200
         assert cancel_response.json()["status"] == "cancel_requested"
+
+        # Repeat cancel finalizes orphaned cancel_requested.
+        finalize_response = client.post(f"/api/data-updater/jobs/{job_id}/cancel")
+        assert finalize_response.status_code == 200
+        assert finalize_response.json()["status"] == "cancelled"
+    finally:
+        app.dependency_overrides.clear()
+        asyncio.run(engine.dispose())
+
+
+@pytest.mark.asyncio
+async def test_worker_honors_cancel_during_target_listing(tmp_path, monkeypatch):
+    """Cancel during listing/prepare must stop before processing targets."""
+    from unittest.mock import AsyncMock
+
+    from app.services.data_updater.repository import DataUpdaterRepository
+    from app.services.data_updater.service import DataUpdaterService
+
+    db_path = tmp_path / "cancel_list.db"
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{db_path}",
+        connect_args={"check_same_thread": False},
+    )
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    job_id = uuid.uuid4()
+    process_calls: list[str] = []
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with session_factory() as session:
+        session.add(
+            DataUpdateJob(
+                id=job_id,
+                mode="dataset",
+                dataset="provider_search_cache",
+                status="queued",
+                metadata_={"stale_only": False},
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+        await session.commit()
+
+    async with session_factory() as session:
+        service = DataUpdaterService(session)
+
+        async def list_and_cancel(dataset, ttl_seconds=None, record_ids=None, stale_only=True):
+            await session.commit()
+            async with session_factory() as control:
+                job = await control.get(DataUpdateJob, job_id)
+                job.status = "cancel_requested"
+                await control.commit()
+            return [{"record_id": f"r{i}", "source": None} for i in range(3)]
+
+        async def track_process(job, dataset, target):
+            process_calls.append(target["record_id"])
+            await DataUpdaterRepository(session).add_record_result(
+                job=job,
+                dataset=dataset,
+                record_id=target["record_id"],
+                status="updated",
+                message="ok",
+            )
+
+        service.repo.list_refresh_targets = list_and_cancel
+        service.repo.completed_record_keys = AsyncMock(return_value=set())
+        service._process_target = track_process
+        await service.run_job(str(job_id))
+
+    async with session_factory() as session:
+        job = await session.get(DataUpdateJob, job_id)
+        assert job is not None
+        assert job.status == "cancelled"
+        assert job.processed_records == 0
+        assert process_calls == []
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_worker_honors_pause_during_target_listing(tmp_path, monkeypatch):
+    """Pause during listing must not be overwritten by mark_job_started."""
+    from unittest.mock import AsyncMock
+
+    from app.services.data_updater.repository import DataUpdaterRepository
+    from app.services.data_updater.service import DataUpdaterService
+
+    db_path = tmp_path / "pause_list.db"
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{db_path}",
+        connect_args={"check_same_thread": False},
+    )
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    job_id = uuid.uuid4()
+    process_calls: list[str] = []
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with session_factory() as session:
+        session.add(
+            DataUpdateJob(
+                id=job_id,
+                mode="dataset",
+                dataset="provider_search_cache",
+                status="queued",
+                metadata_={"stale_only": False},
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+        await session.commit()
+
+    async with session_factory() as session:
+        service = DataUpdaterService(session)
+
+        async def list_and_pause(dataset, ttl_seconds=None, record_ids=None, stale_only=True):
+            # Release any worker write lock before the control session updates.
+            await session.commit()
+            async with session_factory() as control:
+                job = await control.get(DataUpdateJob, job_id)
+                job.status = "pause_requested"
+                await control.commit()
+            return [{"record_id": f"r{i}", "source": None} for i in range(3)]
+
+        async def track_process(job, dataset, target):
+            process_calls.append(target["record_id"])
+            await DataUpdaterRepository(session).add_record_result(
+                job=job,
+                dataset=dataset,
+                record_id=target["record_id"],
+                status="updated",
+                message="ok",
+            )
+
+        service.repo.list_refresh_targets = list_and_pause
+        service.repo.completed_record_keys = AsyncMock(return_value=set())
+        service._process_target = track_process
+        await service.run_job(str(job_id))
+
+    async with session_factory() as session:
+        job = await session.get(DataUpdateJob, job_id)
+        assert job is not None
+        assert job.status == "paused"
+        assert job.processed_records == 0
+        assert process_calls == []
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_worker_pause_resume_preserves_progress_and_cancel_stops(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from app.services.data_updater.repository import DataUpdaterRepository
+    from app.services.data_updater.service import DataUpdaterService
+
+    db_path = tmp_path / "pause_resume.db"
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{db_path}",
+        connect_args={"check_same_thread": False},
+    )
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    job_id = uuid.uuid4()
+    targets = [{"record_id": f"r{i}", "source": None} for i in range(4)]
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async with session_factory() as session:
+        session.add(
+            DataUpdateJob(
+                id=job_id,
+                mode="dataset",
+                dataset="provider_search_cache",
+                status="queued",
+                metadata_={"stale_only": False},
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+        await session.commit()
+
+    first_pass: list[str] = []
+
+    async with session_factory() as session:
+        service = DataUpdaterService(session)
+
+        async def process_then_pause(job, dataset, target):
+            first_pass.append(target["record_id"])
+            await DataUpdaterRepository(session).add_record_result(
+                job=job,
+                dataset=dataset,
+                record_id=target["record_id"],
+                status="updated",
+                message="ok",
+            )
+            if len(first_pass) == 1:
+                await session.commit()
+                async with session_factory() as control:
+                    row = await control.get(DataUpdateJob, job_id)
+                    row.status = "pause_requested"
+                    await control.commit()
+
+        service.repo.list_refresh_targets = AsyncMock(return_value=list(targets))
+        service.repo.completed_record_keys = AsyncMock(return_value=set())
+        service._process_target = process_then_pause
+        await service.run_job(str(job_id))
+
+    async with session_factory() as session:
+        job = await session.get(DataUpdateJob, job_id)
+        assert job.status == "paused"
+        assert job.processed_records == 1
+        assert first_pass == ["r0"]
+        job.status = "queued"
+        await session.commit()
+
+    second_pass: list[str] = []
+    async with session_factory() as session:
+        service = DataUpdaterService(session)
+        completed = await DataUpdaterRepository(session).completed_record_keys(job_id)
+
+        async def process_remaining(job, dataset, target):
+            second_pass.append(target["record_id"])
+            await DataUpdaterRepository(session).add_record_result(
+                job=job,
+                dataset=dataset,
+                record_id=target["record_id"],
+                status="updated",
+                message="ok",
+            )
+
+        service.repo.list_refresh_targets = AsyncMock(return_value=list(targets))
+        service.repo.completed_record_keys = AsyncMock(return_value=completed)
+        service._process_target = process_remaining
+        await service.run_job(str(job_id))
+
+    async with session_factory() as session:
+        job = await session.get(DataUpdateJob, job_id)
+        assert job.status == "succeeded"
+        assert job.processed_records == 4
+        assert second_pass == ["r1", "r2", "r3"]
+
+    # Fresh cancel mid-run
+    cancel_job_id = uuid.uuid4()
+    cancel_calls: list[str] = []
+    async with session_factory() as session:
+        session.add(
+            DataUpdateJob(
+                id=cancel_job_id,
+                mode="dataset",
+                dataset="provider_search_cache",
+                status="queued",
+                metadata_={"stale_only": False},
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+        await session.commit()
+
+    async with session_factory() as session:
+        service = DataUpdaterService(session)
+
+        async def process_then_cancel(job, dataset, target):
+            cancel_calls.append(target["record_id"])
+            await DataUpdaterRepository(session).add_record_result(
+                job=job,
+                dataset=dataset,
+                record_id=target["record_id"],
+                status="updated",
+                message="ok",
+            )
+            if len(cancel_calls) == 2:
+                await session.commit()
+                async with session_factory() as control:
+                    row = await control.get(DataUpdateJob, cancel_job_id)
+                    row.status = "cancel_requested"
+                    await control.commit()
+
+        service.repo.list_refresh_targets = AsyncMock(return_value=list(targets))
+        service.repo.completed_record_keys = AsyncMock(return_value=set())
+        service._process_target = process_then_cancel
+        await service.run_job(str(cancel_job_id))
+
+    async with session_factory() as session:
+        job = await session.get(DataUpdateJob, cancel_job_id)
+        assert job.status == "cancelled"
+        assert job.processed_records == 2
+        assert cancel_calls == ["r0", "r1"]
+
+    await engine.dispose()
+
+
+def test_resume_and_cancel_paused_job_via_api(tmp_path, monkeypatch):
+    client, engine, session_factory = _client(tmp_path, monkeypatch)
+    job_id = uuid.uuid4()
+    started = []
+
+    async def seed() -> None:
+        async with session_factory() as session:
+            session.add(
+                DataUpdateJob(
+                    id=job_id,
+                    mode="all_stale",
+                    status="paused",
+                    processed_records=3,
+                    total_records=10,
+                    created_at=datetime.now(timezone.utc),
+                    updated_at=datetime.now(timezone.utc),
+                )
+            )
+            await session.commit()
+
+    async def capture_background(job_id_arg: str) -> None:
+        started.append(job_id_arg)
+
+    asyncio.run(seed())
+    monkeypatch.setattr(
+        "app.services.data_updater.service.run_data_update_job",
+        capture_background,
+    )
+
+    try:
+        resume_response = client.post(f"/api/data-updater/jobs/{job_id}/resume")
+        assert resume_response.status_code == 200
+        assert resume_response.json()["status"] == "queued"
+        assert resume_response.json()["processed_records"] == 3
+        assert started == [str(job_id)]
+
+        # Force paused again then cancel immediately.
+        async def mark_paused() -> None:
+            async with session_factory() as session:
+                job = await session.get(DataUpdateJob, job_id)
+                job.status = "paused"
+                await session.commit()
+
+        asyncio.run(mark_paused())
+        cancel_response = client.post(f"/api/data-updater/jobs/{job_id}/cancel")
+        assert cancel_response.status_code == 200
+        assert cancel_response.json()["status"] == "cancelled"
     finally:
         app.dependency_overrides.clear()
         asyncio.run(engine.dispose())

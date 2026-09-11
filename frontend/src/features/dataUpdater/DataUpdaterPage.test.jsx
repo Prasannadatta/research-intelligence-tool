@@ -3,34 +3,15 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { ThemeProvider, createTheme } from "@mui/material/styles";
 
-import DataUpdaterPage from "./DataUpdaterPage";
+import DataUpdaterPage, { UPDATE_ACTIONS } from "./DataUpdaterPage";
 import * as dataUpdaterApi from "./dataUpdaterApi";
 
 const theme = createTheme({ colorSchemes: { light: true, dark: true } });
 
-const SAVED_SEARCHES = [
-  {
-    id: "saved-1",
-    name: "Quantum Error Correction Researchers",
-    search_type: "authors",
-    updated_at: "2026-08-01T12:00:00Z",
-  },
-];
-
-const TARGETS = [
-  {
-    id: "author-1",
-    type: "author",
-    title: "John Preskill",
-    subtitle: "Author · Caltech",
-    last_updated: "2026-08-03T12:00:00Z",
-  },
-];
-
 const JOB = {
   id: "job-1",
-  mode: "saved_search",
-  dataset: null,
+  mode: "dataset",
+  dataset: "authors",
   status: "running",
   current_dataset: "authors",
   total_records: 421,
@@ -40,24 +21,11 @@ const JOB = {
   retrying_count: 3,
   failed_count: 0,
   metadata: {
-    title: "Updating Quantum Error Correction Researchers",
-    record_ids_by_dataset: {
-      authors: Array.from({ length: 24 }, (_item, index) => `author-${index}`),
-      publications: Array.from({ length: 290 }, (_item, index) => `work-${index}`),
-    },
+    title: "Updating author data",
   },
-  records: [
-    ...Array.from({ length: 18 }, (_item, index) => ({
-      id: `author-record-${index}`,
-      dataset: "authors",
-      status: "unchanged",
-    })),
-    ...Array.from({ length: 214 }, (_item, index) => ({
-      id: `work-record-${index}`,
-      dataset: "publications",
-      status: "updated",
-    })),
-  ],
+  records: [],
+  updated_at: "2026-08-03T12:00:00Z",
+  completed_at: null,
 };
 
 function renderPage() {
@@ -95,26 +63,22 @@ describe("DataUpdaterPage", () => {
   beforeEach(() => {
     installLocalStorageStub();
     window.localStorage.clear();
-    vi.spyOn(dataUpdaterApi, "fetchDataUpdaterSavedSearches").mockResolvedValue(
-      SAVED_SEARCHES,
-    );
-    vi.spyOn(dataUpdaterApi, "searchDataUpdateTargets").mockResolvedValue(TARGETS);
     vi.spyOn(dataUpdaterApi, "startDataUpdate").mockResolvedValue(JOB);
-    vi.spyOn(dataUpdaterApi, "startSavedSearchDataUpdate").mockResolvedValue(JOB);
-    vi.spyOn(dataUpdaterApi, "startAllSavedSearchesDataUpdate").mockResolvedValue(JOB);
-    vi.spyOn(dataUpdaterApi, "startEntityDataUpdate").mockResolvedValue(JOB);
     vi.spyOn(dataUpdaterApi, "fetchDataUpdateJob").mockResolvedValue(JOB);
-    vi.spyOn(dataUpdaterApi, "pauseDataUpdateJob").mockResolvedValue({
-      ...JOB,
-      status: "paused",
+    vi.spyOn(dataUpdaterApi, "pauseDataUpdateJob").mockImplementation(async () => {
+      const next = { ...JOB, status: "paused" };
+      dataUpdaterApi.fetchDataUpdateJob.mockResolvedValue(next);
+      return next;
     });
-    vi.spyOn(dataUpdaterApi, "resumeDataUpdateJob").mockResolvedValue({
-      ...JOB,
-      status: "queued",
+    vi.spyOn(dataUpdaterApi, "resumeDataUpdateJob").mockImplementation(async () => {
+      const next = { ...JOB, status: "queued" };
+      dataUpdaterApi.fetchDataUpdateJob.mockResolvedValue(next);
+      return next;
     });
-    vi.spyOn(dataUpdaterApi, "cancelDataUpdateJob").mockResolvedValue({
-      ...JOB,
-      status: "cancelled",
+    vi.spyOn(dataUpdaterApi, "cancelDataUpdateJob").mockImplementation(async () => {
+      const next = { ...JOB, status: "cancelled" };
+      dataUpdaterApi.fetchDataUpdateJob.mockResolvedValue(next);
+      return next;
     });
   });
 
@@ -123,83 +87,88 @@ describe("DataUpdaterPage", () => {
     vi.restoreAllMocks();
   });
 
-  it("starts an all-data stale refresh", async () => {
+  it("shows explicit update actions with short descriptions", () => {
     renderPage();
 
-    fireEvent.click(screen.getByRole("button", { name: "Update All Data" }));
+    const actions = screen.getByTestId("data-update-actions");
+    for (const action of UPDATE_ACTIONS) {
+      expect(within(actions).getByRole("button", { name: action.label })).toBeInTheDocument();
+      expect(actions).toHaveTextContent(action.description);
+    }
+    expect(screen.queryByLabelText(/saved search/i)).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText(/author, publication, or institution/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("starts each update action with the correct existing refresh scope", async () => {
+    renderPage();
+
+    for (const action of UPDATE_ACTIONS) {
+      dataUpdaterApi.startDataUpdate.mockClear();
+      dataUpdaterApi.startDataUpdate.mockResolvedValueOnce({
+        ...JOB,
+        id: `job-${action.id}`,
+        status: "succeeded",
+        dataset: action.request.dataset || null,
+        mode: action.request.mode,
+      });
+
+      fireEvent.click(screen.getByRole("button", { name: action.label }));
+
+      await waitFor(() => {
+        expect(dataUpdaterApi.startDataUpdate).toHaveBeenCalledWith(action.request);
+      });
+      expect(dataUpdaterApi.startDataUpdate).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("shows idle status, then progress after starting an update", async () => {
+    renderPage();
+
+    expect(screen.getByTestId("data-update-status")).toHaveTextContent("Idle");
+    expect(screen.getByTestId("data-update-progress")).toHaveTextContent(
+      "No update in progress",
+    );
+    expect(screen.getByTestId("data-update-last-updated")).toHaveTextContent(
+      "Not updated yet",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Update Author Data" }));
 
     await waitFor(() => {
       expect(dataUpdaterApi.startDataUpdate).toHaveBeenCalledWith({
-        mode: "all_stale",
+        mode: "dataset",
+        dataset: "authors",
         stale_only: true,
       });
     });
-    expect(await screen.findByTestId("data-update-progress")).toHaveTextContent(
-      "286 / 421 items checked",
+    const progress = await screen.findByTestId("data-update-progress");
+    expect(progress).toHaveTextContent("68% · 286 / 421 items checked");
+    expect(screen.getByTestId("data-update-status")).toHaveTextContent("Running");
+    expect(screen.getByTestId("data-update-last-updated")).toHaveTextContent(
+      /Last updated/i,
     );
   });
 
-  it("updates one saved search and all saved searches", async () => {
+  it("keeps Pause / Resume / Cancel with the progress area, separate from start actions", async () => {
     renderPage();
-
-    expect(
-      await screen.findByText("Quantum Error Correction Researchers"),
-    ).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: "Update This Saved Search" }));
-    await waitFor(() => {
-      expect(dataUpdaterApi.startSavedSearchDataUpdate).toHaveBeenCalledWith("saved-1");
-    });
-
-    fireEvent.click(screen.getByRole("button", { name: "Update All Saved Searches" }));
-    await waitFor(() => {
-      expect(dataUpdaterApi.startAllSavedSearchesDataUpdate).toHaveBeenCalled();
-    });
-  });
-
-  it("searches human-readable targets and updates the selected item", async () => {
-    renderPage();
-
-    const searchInput = screen.getByLabelText(
-      "Search authors, publications, or institutions",
-    );
-    fireEvent.focus(searchInput);
-    fireEvent.change(searchInput, { target: { value: "John" } });
-    await waitFor(() => {
-      expect(dataUpdaterApi.searchDataUpdateTargets).toHaveBeenCalledWith(
-        "John",
-        expect.any(Object),
-      );
-    });
-    fireEvent.keyDown(searchInput, { key: "ArrowDown" });
-
-    const option = await screen.findByText("John Preskill");
-    fireEvent.click(option);
-    fireEvent.click(screen.getByRole("button", { name: "Update" }));
-
-    await waitFor(() => {
-      expect(dataUpdaterApi.startEntityDataUpdate).toHaveBeenCalledWith({
-        type: "author",
-        id: "author-1",
-        stale_only: false,
-      });
-    });
-  });
-
-  it("shows simple progress and supports pause, resume, and cancel", async () => {
-    renderPage();
-    fireEvent.click(screen.getByRole("button", { name: "Update All Data" }));
+    fireEvent.click(screen.getByRole("button", { name: "Update Everything" }));
 
     const progress = await screen.findByTestId("data-update-progress");
-    expect(progress).toHaveTextContent("68%");
-    expect(progress).toHaveTextContent("Authors: 18 / 24");
-    expect(progress).toHaveTextContent("Publications: 214 / 290");
-    expect(progress).toHaveTextContent("Updated: 63");
+    const actions = screen.getByTestId("data-update-actions");
+    expect(within(progress).getByRole("button", { name: "Pause" })).toBeInTheDocument();
+    expect(within(progress).getByRole("button", { name: "Cancel" })).toBeInTheDocument();
+    expect(
+      within(progress).queryByRole("button", { name: "Update Everything" }),
+    ).not.toBeInTheDocument();
+    expect(within(actions).getByRole("button", { name: "Update Everything" })).toBeDisabled();
 
     fireEvent.click(within(progress).getByRole("button", { name: "Pause" }));
     await waitFor(() => {
       expect(dataUpdaterApi.pauseDataUpdateJob).toHaveBeenCalledWith("job-1");
     });
+    expect(await screen.findByTestId("data-update-status")).toHaveTextContent("Paused");
 
     fireEvent.click(await screen.findByRole("button", { name: "Resume" }));
     await waitFor(() => {
@@ -210,11 +179,75 @@ describe("DataUpdaterPage", () => {
     await waitFor(() => {
       expect(dataUpdaterApi.cancelDataUpdateJob).toHaveBeenCalledWith("job-1");
     });
+    expect(await screen.findByTestId("data-update-status")).toHaveTextContent("Cancelled");
+  });
+
+  it("does not start duplicate jobs while one is active", async () => {
+    renderPage();
+    fireEvent.click(screen.getByRole("button", { name: "Update Author Data" }));
+
+    await screen.findByTestId("data-update-progress");
+    expect(screen.getByRole("button", { name: "Update Author Data" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Update Everything" })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Update Author Data" }));
+    fireEvent.click(screen.getByRole("button", { name: "Update Everything" }));
+
+    expect(dataUpdaterApi.startDataUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps Cancel enabled during cancel_requested and re-enables Update after cancelled", async () => {
+    const cancelRequested = {
+      ...JOB,
+      status: "cancel_requested",
+      updated_at: new Date().toISOString(),
+    };
+    dataUpdaterApi.startDataUpdate.mockResolvedValueOnce(cancelRequested);
+    dataUpdaterApi.fetchDataUpdateJob.mockResolvedValue(cancelRequested);
+    dataUpdaterApi.cancelDataUpdateJob.mockImplementationOnce(async () => {
+      const next = { ...JOB, status: "cancelled" };
+      dataUpdaterApi.fetchDataUpdateJob.mockResolvedValue(next);
+      return next;
+    });
+
+    renderPage();
+    fireEvent.click(screen.getByRole("button", { name: "Update Grant Data" }));
+
+    await screen.findByTestId("data-update-progress");
+    expect(screen.getByRole("button", { name: "Update Grant Data" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Pause" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => {
+      expect(dataUpdaterApi.cancelDataUpdateJob).toHaveBeenCalledWith("job-1");
+    });
+    expect(await screen.findByTestId("data-update-status")).toHaveTextContent("Cancelled");
+    expect(screen.getByRole("button", { name: "Update Grant Data" })).toBeEnabled();
+  });
+
+  it("shows Completed and Failed final statuses", async () => {
+    dataUpdaterApi.startDataUpdate.mockResolvedValueOnce({
+      ...JOB,
+      status: "succeeded",
+      completed_at: "2026-08-03T12:00:00Z",
+    });
+    renderPage();
+    fireEvent.click(screen.getByRole("button", { name: "Update Publication Data" }));
+    expect(await screen.findByTestId("data-update-status")).toHaveTextContent("Completed");
+
+    dataUpdaterApi.startDataUpdate.mockResolvedValueOnce({
+      ...JOB,
+      status: "failed",
+      error: "boom",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Update Journal Metrics" }));
+    expect(await screen.findByTestId("data-update-status")).toHaveTextContent("Failed");
   });
 
   it("restores an unfinished update after leaving and returning to the page", async () => {
     const firstRender = renderPage();
-    fireEvent.click(screen.getByRole("button", { name: "Update All Data" }));
+    fireEvent.click(screen.getByRole("button", { name: "Update Author Data" }));
 
     await waitFor(() => {
       expect(dataUpdaterApi.startDataUpdate).toHaveBeenCalled();
@@ -228,7 +261,7 @@ describe("DataUpdaterPage", () => {
       "job-1",
       expect.any(Object),
     );
-    expect(progress).toHaveTextContent("Updating Quantum Error Correction Researchers");
+    expect(progress).toHaveTextContent("Updating author data");
     expect(progress).toHaveTextContent("286 / 421 items checked");
   });
 });
