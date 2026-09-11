@@ -4,101 +4,21 @@ A research intelligence tool for discovering researchers, analyzing publications
 
 The platform combines multiple scholarly data providers behind a unified search and analysis workflow, with canonical author/work identity stored locally in SQLite.
 
-## Easy Setup for Non-Technical Users
+## Easy Setup
 
-Use this guide if you want to run the app on your own laptop. No separate database install is needed — the app stores data locally on your computer.
+**Before you start (install once):** [Git](https://git-scm.com/downloads), [Python 3](https://www.python.org/downloads/) (on Windows, check **Add Python to PATH**), and [Node.js LTS](https://nodejs.org/) (includes npm).
 
-**You only need to install these once:** [Git](https://git-scm.com/downloads) (optional if you use ZIP download), [Node.js LTS](https://nodejs.org/) (includes `npm`, the tool that runs setup commands), and [Python 3](https://www.python.org/downloads/). On Windows, check **“Add Python to PATH”** during Python install.
+1. **Get the `v2` code**
+   - Git: `git clone -b v2 https://github.com/Prasannadatta/research-intelligence-tool.git`
+   - Or download the [v2 ZIP](https://github.com/Prasannadatta/research-intelligence-tool/archive/refs/heads/v2.zip) and unzip it.
+2. **Run setup once** (double-click in the project folder)
+   - Mac: `setup_mac.command`
+   - Windows: `setup_windows.bat`
+3. **Run start whenever you use the app**
+   - Mac: `start_mac.command`
+   - Windows: `start_windows.bat`
 
-### Get the project files
-
-**Easiest (no Git):**
-
-1. On GitHub, click **Code** → **Download ZIP**.
-2. Unzip the folder (for example, to your Desktop).
-3. Open **Terminal** (Mac) or **PowerShell** (Windows) inside that folder (see step 5 below).
-
-**Recommended for updates (uses Git):**
-
-1. Install Git from the link above.
-2. In Terminal or PowerShell, run:
-   ```bash
-   git clone <repository-url>
-   cd research-intelligence-tool
-   ```
-
-### First-time setup
-
-#### Mac
-
-1. Install [Git](https://git-scm.com/downloads) (skip if you used Download ZIP).
-2. Install [Node.js LTS](https://nodejs.org/).
-3. Install [Python 3](https://www.python.org/downloads/).
-4. Get the project (ZIP or Git clone above).
-5. Open **Terminal** in the project folder:
-   - Finder → open the folder → right-click → **New Terminal at Folder**  
-   - or type `cd `, drag the folder into Terminal, press Enter.
-6. Create your settings file:
-   ```bash
-   cp backend/.env.example backend/.env
-   ```
-   `.env` is a local settings file for API keys and configuration. You can leave optional keys blank at first; features that need those services may not work until you add them. **Do not share or upload your `.env` file.**
-7. Run setup (installs what the app needs and prepares the local database):
-   ```bash
-   npm run setup
-   ```
-8. Start the app:
-   ```bash
-   npm run dev
-   ```
-9. Open the web address shown in Terminal (usually [http://localhost:5173/](http://localhost:5173/)).
-
-#### Windows
-
-1. Install [Git](https://git-scm.com/downloads) (skip if you used Download ZIP).
-2. Install [Node.js LTS](https://nodejs.org/).
-3. Install [Python 3](https://www.python.org/downloads/) — enable **“Add Python to PATH”**.
-4. Get the project (ZIP or Git clone above).
-5. Open **PowerShell** in the project folder:
-   - File Explorer → open the folder → click the address bar → type `powershell` → Enter.
-6. Create your settings file:
-   ```powershell
-   copy backend\.env.example backend\.env
-   ```
-   `.env` is a local settings file for API keys and configuration. You can leave optional keys blank at first; features that need those services may not work until you add them. **Do not share or upload your `.env` file.**
-7. Run setup:
-   ```powershell
-   npm run setup
-   ```
-8. Start the app:
-   ```powershell
-   npm run dev
-   ```
-9. Open the web address shown in PowerShell (usually [http://localhost:5173/](http://localhost:5173/)).
-
-### Every time you want to use the app
-
-1. Open the project folder.
-2. Open **Terminal** (Mac) or **PowerShell** (Windows) there.
-3. Run:
-   ```bash
-   npm run dev
-   ```
-4. Open the `localhost` address shown (usually port **5173**).
-5. When finished, press **Ctrl+C** in the terminal window to stop the app.
-
-### Easy setup — common problems
-
-| Problem | What to try |
-| --- | --- |
-| **`npm` is not recognized** | Install Node.js LTS, close and reopen Terminal/PowerShell, then try again. |
-| **`python` or `python3` not found** | Reinstall Python and enable **Add to PATH** (Windows). On Mac, install Python from python.org. |
-| **Port already in use** | Another copy of the app may be running. Close other terminal windows running `npm run dev`, or restart your computer. The app uses ports **5173** and **8000**. |
-| **`.env` missing or setup can’t find settings** | Make sure `backend\.env` exists (copy from `backend\.env.example` as in step 6). |
-| **`npm run setup` failed** | Read the error text in the terminal. Often it means Node, Python, or internet access is missing. Fix those, then run `npm run setup` again. |
-| **Database / migration error** | Run `npm run setup` again. The local database file is `backend/author_identity.db`. |
-
-For more detail (API keys, testing, project layout), see [Developer Setup](#developer-setup) below.
+The start script opens [http://localhost:5173/](http://localhost:5173/). Setup creates `backend/.env` only if it is missing and never overwrites your database. For API keys and developer details, see [Developer Setup](#developer-setup) below.
 
 ## What it does
 
