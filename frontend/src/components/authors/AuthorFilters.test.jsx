@@ -55,15 +55,25 @@ describe("AuthorFilters", () => {
     vi.useRealTimers();
   });
 
-  it("loads institution options via autocomplete and selects one", async () => {
+  it("always shows Institution and Research area fields", () => {
+    renderFilters();
+    expect(screen.getByLabelText("Institution")).toBeInTheDocument();
+    expect(screen.getByLabelText("Research area")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Optional: narrow OpenAlex results by institution or research area.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("loads institution options and selects one into a chip", async () => {
     const onInstitutionChange = vi.fn();
     renderFilters({ onInstitutionChange });
 
-    fireEvent.click(screen.getByRole("button", { name: "Filters" }));
-    const input = screen.getByLabelText("Institution");
-    fireEvent.change(input, { target: { value: "Berkeley" } });
-
-    await vi.advanceTimersByTimeAsync(450);
+    fireEvent.change(screen.getByLabelText("Institution"), {
+      target: { value: "Berkeley" },
+    });
+    await vi.advanceTimersByTimeAsync(350);
 
     await waitFor(() => {
       expect(searchInstitutions).toHaveBeenCalledWith(
@@ -72,9 +82,9 @@ describe("AuthorFilters", () => {
       );
     });
 
-    const option = await screen.findByText("University of California, Berkeley");
-    fireEvent.click(option);
-
+    fireEvent.click(
+      await screen.findByText("University of California, Berkeley"),
+    );
     expect(onInstitutionChange).toHaveBeenCalledWith(
       expect.objectContaining({
         id: "I95457486",
@@ -83,15 +93,14 @@ describe("AuthorFilters", () => {
     );
   });
 
-  it("loads research-area options via autocomplete and selects one", async () => {
+  it("loads research-area options and selects one", async () => {
     const onTopicChange = vi.fn();
     renderFilters({ onTopicChange });
 
-    fireEvent.click(screen.getByRole("button", { name: "Filters" }));
-    const input = screen.getByLabelText("Research area");
-    fireEvent.change(input, { target: { value: "machine learning" } });
-
-    await vi.advanceTimersByTimeAsync(450);
+    fireEvent.change(screen.getByLabelText("Research area"), {
+      target: { value: "machine learning" },
+    });
+    await vi.advanceTimersByTimeAsync(350);
 
     await waitFor(() => {
       expect(searchTopics).toHaveBeenCalledWith(
@@ -100,9 +109,9 @@ describe("AuthorFilters", () => {
       );
     });
 
-    const option = await screen.findByText("Machine Learning in Materials Science");
-    fireEvent.click(option);
-
+    fireEvent.click(
+      await screen.findByText("Machine Learning in Materials Science"),
+    );
     expect(onTopicChange).toHaveBeenCalledWith(
       expect.objectContaining({
         id: "T11948",
@@ -111,7 +120,7 @@ describe("AuthorFilters", () => {
     );
   });
 
-  it("shows selected filter chips and clears them", () => {
+  it("shows chips for selected filters and clears them", () => {
     const onInstitutionChange = vi.fn();
     const onTopicChange = vi.fn();
     renderFilters({
@@ -133,20 +142,30 @@ describe("AuthorFilters", () => {
     expect(
       screen.getByText("Research: Machine Learning in Materials Science"),
     ).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Filters" })).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Institution")).toBeEnabled();
+    expect(screen.getByLabelText("Research area")).toBeEnabled();
 
-    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+    fireEvent.click(screen.getByRole("button", { name: "Clear filters" }));
     expect(onInstitutionChange).toHaveBeenCalledWith(null);
     expect(onTopicChange).toHaveBeenCalledWith(null);
   });
 
-  it("opens filter fields and explains OpenAlex narrowing", () => {
-    renderFilters();
-    fireEvent.click(screen.getByRole("button", { name: "Filters" }));
-    expect(
-      screen.getByText("Narrow OpenAlex authors by institution or research area."),
-    ).toBeInTheDocument();
-    expect(screen.getByLabelText("Institution")).toBeInTheDocument();
-    expect(screen.getByLabelText("Research area")).toBeInTheDocument();
+  it("removes a single filter from its chip", () => {
+    const onInstitutionChange = vi.fn();
+    renderFilters({
+      institution: {
+        id: "I95457486",
+        display_name: "University of California, Berkeley",
+      },
+      onInstitutionChange,
+    });
+
+    const chip = screen.getByText(
+      "Institution: University of California, Berkeley",
+    ).parentElement;
+    const deleteButton = chip?.querySelector(".MuiChip-deleteIcon");
+    expect(deleteButton).toBeTruthy();
+    fireEvent.click(deleteButton);
+    expect(onInstitutionChange).toHaveBeenCalledWith(null);
   });
 });

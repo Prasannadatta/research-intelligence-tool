@@ -11,11 +11,12 @@ export function buildAuthorPublicationsCacheKey({
   filtersKey = "",
   sortKey = "",
   cursor = "*",
+  page = 1,
   limit = 20,
 }) {
   const sortedIds = [...canonicalAuthorIds].filter(Boolean).sort().join(",");
   const pageCursor = cursor == null || cursor === "" ? "*" : String(cursor);
-  const cursorLabel = pageCursor === "*" ? "start" : `cursor-${limit}`;
+  const pageNumber = Number.isFinite(Number(page)) && Number(page) >= 1 ? Number(page) : 1;
   return [
     "author-publications",
     mode || "single",
@@ -23,8 +24,9 @@ export function buildAuthorPublicationsCacheKey({
     providerRecordsKey || "-",
     filtersKey || "-",
     sortKey || "-",
-    cursorLabel,
-    pageCursor,
+    `page-${pageNumber}`,
+    `limit-${limit}`,
+    pageCursor === "*" ? "start" : pageCursor,
   ].join(":");
 }
 
@@ -53,8 +55,10 @@ export function toAnalysisAuthorPayload(item) {
     : [];
   const openalex = sourceRecords.find((row) => row?.provider === "openalex");
   const arxiv = sourceRecords.find((row) => row?.provider === "arxiv");
+  const orcidRecord = sourceRecords.find((row) => row?.provider === "orcid");
 
-  let provider = openalex?.provider || arxiv?.provider || item?.source || null;
+  // Prefer OpenAlex for analysis crawl/sync; fall back to arXiv, then ORCID.
+  let provider = openalex?.provider || arxiv?.provider || null;
   let providerAuthorId =
     openalex?.provider_author_id ||
     arxiv?.provider_author_id ||
@@ -68,6 +72,13 @@ export function toAnalysisAuthorPayload(item) {
     } else if (item?.result_type === "author_name" || item?.source === "arxiv") {
       provider = "arxiv";
       providerAuthorId = item?.result_id || item?.display_name;
+    } else if (item?.orcid || orcidRecord?.provider_author_id) {
+      // ORCID-only: allow Analyze to open with an explicit incomplete/unsupported path.
+      provider = "orcid";
+      providerAuthorId = item?.orcid || orcidRecord.provider_author_id;
+    } else if (item?.source === "orcid" && item?.provider_author_id) {
+      provider = "orcid";
+      providerAuthorId = item.provider_author_id;
     }
   }
 
@@ -104,6 +115,7 @@ export async function fetchAuthorPublications({
   sortDirection,
   limit = 20,
   cursor,
+  page,
   signal,
 } = {}) {
   const payload = {
@@ -111,6 +123,10 @@ export async function fetchAuthorPublications({
     limit,
     cursor: cursor == null || cursor === "" ? null : cursor,
   };
+
+  if (page != null && Number(page) >= 1) {
+    payload.page = Number(page);
+  }
 
   if (Array.isArray(originalAuthorIds) && originalAuthorIds.length > 0) {
     payload.original_author_ids = originalAuthorIds;
@@ -128,6 +144,7 @@ export async function fetchAuthorPublications({
   console.info("[analysis-timing] publications_start", {
     authors: payload.authors.length,
     cursor: payload.cursor,
+    page: payload.page ?? null,
     hasFilters: Boolean(payload.filters),
   });
   const response = await apiClient.post("/analysis/authors/publications", payload, {
@@ -138,9 +155,12 @@ export async function fetchAuthorPublications({
     ms: Math.round(performance.now() - started),
     items: Array.isArray(response.data?.items) ? response.data.items.length : 0,
     hasMore: Boolean(response.data?.pagination?.has_more),
+    page: response.data?.pagination?.page ?? null,
+    total: response.data?.pagination?.total ?? null,
   });
 
   const data = response.data || {};
+  const pagination = data.pagination || {};
   return {
     mode: data.mode || analysisModeForAuthors(payload.authors),
     authors: Array.isArray(data.authors) ? data.authors : payload.authors,
@@ -153,18 +173,30 @@ export async function fetchAuthorPublications({
       && Number(data.provider_total_count) >= 0
       ? Number(data.provider_total_count)
       : null,
-    pagination: data.pagination || {
-      next_cursor: null,
-      has_more: false,
+    pagination: {
+      next_cursor: pagination.next_cursor ?? null,
+      has_more: Boolean(pagination.has_more),
+      page: Number.isFinite(Number(pagination.page)) ? Number(pagination.page) : (page || 1),
+      offset: Number.isFinite(Number(pagination.offset)) ? Number(pagination.offset) : 0,
+      limit: Number.isFinite(Number(pagination.limit)) ? Number(pagination.limit) : limit,
+      total: Number.isFinite(Number(pagination.total)) && pagination.total != null
+        ? Number(pagination.total)
+        : null,
+      corpus_source: pagination.corpus_source || null,
     },
-    next_cursor: data.pagination?.next_cursor ?? null,
-    has_more: Boolean(data.pagination?.has_more),
+    next_cursor: pagination.next_cursor ?? null,
+    has_more: Boolean(pagination.has_more),
     unsupported: Boolean(data.unsupported),
     unsupported_reason: data.unsupported_reason || null,
   };
 }
 
-function buildAuthorInsightsPayload({ authors, filters, excludedWorkIds } = {}) {
+function buildAuthorInsightsPayload({
+  authors,
+  filters,
+  excludedWorkIds,
+  retryIncompleteOnly = false,
+} = {}) {
   const normalizedAuthors = Array.isArray(authors)
     ? authors
         .map((author) => ({
@@ -174,7 +206,7 @@ function buildAuthorInsightsPayload({ authors, filters, excludedWorkIds } = {}) 
         .filter((author) => author.canonical_author_id)
     : [];
 
-  return {
+  const payload = {
     authors: normalizedAuthors,
     excluded_work_ids: Array.isArray(excludedWorkIds)
       ? excludedWorkIds.map((id) => String(id)).filter(Boolean)
@@ -190,6 +222,10 @@ function buildAuthorInsightsPayload({ authors, filters, excludedWorkIds } = {}) 
         : [],
     },
   };
+  if (retryIncompleteOnly) {
+    payload.retry_incomplete_only = true;
+  }
+  return payload;
 }
 
 /**
@@ -200,11 +236,12 @@ export async function createAuthorInsightsJob({
   authors,
   filters,
   excludedWorkIds,
+  retryIncompleteOnly = false,
   signal,
 } = {}) {
   const response = await apiClient.post(
     "/analysis/authors/insights/jobs",
-    buildAuthorInsightsPayload({ authors, filters, excludedWorkIds }),
+    buildAuthorInsightsPayload({ authors, filters, excludedWorkIds, retryIncompleteOnly }),
     { signal },
   );
   return response.data || {};
@@ -226,11 +263,12 @@ export async function getAuthorInsightsJob(jobId, { signal } = {}) {
 export async function createAuthorPublicationStatsJob({
   authors,
   filters,
+  retryIncompleteOnly = false,
   signal,
 } = {}) {
   const response = await apiClient.post(
     "/analysis/authors/publications/stats/jobs",
-    buildAuthorInsightsPayload({ authors, filters }),
+    buildAuthorInsightsPayload({ authors, filters, retryIncompleteOnly }),
     { signal },
   );
   return response.data || {};

@@ -7,10 +7,14 @@ import {
 import {
   activeAuthorIdsKey,
   analysisTitleForAuthors,
+  CORPUS_STATUS,
+  deriveCorpusStatus,
   emptyStateCopy,
+  formatProviderDedupCaption,
   getActiveAuthors,
   getInitialActiveAuthorIds,
   isAuthorCheckboxDisabled,
+  providerDisplayLabel,
   toggleActiveAuthor,
 } from "./authorAnalysisPageLogic";
 
@@ -111,5 +115,56 @@ describe("authorAnalysisPageLogic", () => {
     expect(
       analysisModeForAuthors(getActiveAuthors(AUTHORS, new Set(["c1", "c2"]))),
     ).toBe("common_publications");
+  });
+
+  it("derives compact corpus status labels", () => {
+    expect(
+      deriveCorpusStatus({
+        corpusComplete: true,
+        statsLoading: false,
+        hasLoadedOnce: true,
+      }),
+    ).toBe(CORPUS_STATUS.VERIFIED);
+    expect(
+      deriveCorpusStatus({
+        statsLoading: true,
+        hasLoadedOnce: true,
+      }),
+    ).toBe(CORPUS_STATUS.SYNCING);
+    expect(
+      deriveCorpusStatus({
+        statsError: "OpenAlex rate limit reached.",
+        hasLoadedOnce: true,
+      }),
+    ).toBe(CORPUS_STATUS.RATE_LIMITED);
+    expect(
+      deriveCorpusStatus({
+        statsError: "coverage sync did not finish",
+        hasLoadedOnce: true,
+      }),
+    ).toBe(CORPUS_STATUS.PARTIAL);
+    expect(
+      deriveCorpusStatus({
+        statsError: "Unable to build complete publication statistics.",
+        hasLoadedOnce: true,
+      }),
+    ).toBe(CORPUS_STATUS.FAILED);
+  });
+
+  it("formats provider dedup captions only when records exceed unique works", () => {
+    expect(
+      formatProviderDedupCaption({
+        uniqueCount: 97,
+        providerTotalCount: 107,
+        providerLabel: providerDisplayLabel(AUTHORS),
+      }),
+    ).toBe("97 unique publications from 107 OpenAlex records");
+    expect(
+      formatProviderDedupCaption({
+        uniqueCount: 10,
+        providerTotalCount: 10,
+        providerLabel: "OpenAlex",
+      }),
+    ).toBeNull();
   });
 });

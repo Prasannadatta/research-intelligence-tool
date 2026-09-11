@@ -32,6 +32,7 @@ import SyncRoundedIcon from "@mui/icons-material/SyncRounded";
 import AuthorSearch from "./components/authors/AuthorSearch";
 import SelectedAuthorsList from "./components/authors/SelectedAuthorsList";
 import AuthorAnalysisPage from "./components/authors/AuthorAnalysisPage";
+import AuthorDetailsPage from "./components/authors/AuthorDetailsPage";
 import AuthorInsightsPage from "./features/authorAnalysis/AuthorInsightsPage";
 import SavedSearchesPage from "./features/savedSearches/SavedSearchesPage";
 import DataUpdaterPage from "./features/dataUpdater/DataUpdaterPage";
@@ -220,7 +221,8 @@ function AuthorSearchHome({
           pt: { xs: 10, md: 0 },
           mx: { xs: "auto", md: 0 },
           textAlign: "center",
-          zIndex: 1,
+          // Keep search + filters above the selected-authors slot so chips stay clickable.
+          zIndex: 2,
         }}
       >
         <Typography
@@ -266,7 +268,8 @@ function AuthorSearchHome({
       <Box
         sx={{
           position: { xs: "static", md: "absolute" },
-          top: { md: "calc(44% + 135px)" },
+          // Leave room for always-visible Institution / Research area filters.
+          top: { md: "calc(44% + 230px)" },
           left: { md: "50%" },
           transform: { md: "translateX(-50%)" },
           width: "100%",
@@ -276,6 +279,8 @@ function AuthorSearchHome({
           mx: { xs: "auto", md: 0 },
           pb: { xs: 4, md: 0 },
           zIndex: 1,
+          // Empty slot must not intercept clicks on filter chips above it.
+          pointerEvents: activeSelectedItems.length > 0 ? "auto" : "none",
         }}
       >
         <SelectedAuthorsList
@@ -550,6 +555,29 @@ function AppShell() {
                 selectedWorks={selectedWorks}
                 setSelectedWorks={setSelectedWorks}
               />
+            }
+          />
+          <Route
+            path="/authors/:id"
+            element={
+              <Box sx={{ position: "relative", minHeight: "100vh" }}>
+                {!drawerOpen && (
+                  <Tooltip title="Open sidebar">
+                    <IconButton
+                      onClick={() => setDrawerOpen(true)}
+                      sx={{
+                        position: "absolute",
+                        top: 18,
+                        left: 18,
+                        zIndex: 10,
+                      }}
+                    >
+                      <MenuRoundedIcon />
+                    </IconButton>
+                  </Tooltip>
+                )}
+                <AuthorDetailsPage />
+              </Box>
             }
           />
           <Route

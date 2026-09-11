@@ -220,7 +220,6 @@ export function getWorkId(work) {
 }
 
 export function getWorkLinks(work) {
-  const workId = getWorkId(work);
   const doi = normalizeDoi(work?.doi);
   const arxivId =
     work?.arxiv_id ||
@@ -236,7 +235,6 @@ export function getWorkLinks(work) {
   const providerUrl = work?.url || work?.entry_url || null;
 
   return {
-    internal: workId ? `/works/${workId}` : null,
     doi: doi ? `https://doi.org/${doi}` : null,
     arxiv: arxivUrl,
     provider: providerUrl,
@@ -245,11 +243,11 @@ export function getWorkLinks(work) {
 
 export function getWorkTitleHref(work) {
   const links = getWorkLinks(work);
-  if (links.internal) {
-    return { href: links.internal, external: false };
-  }
   if (links.doi) {
     return { href: links.doi, external: true };
+  }
+  if (links.arxiv) {
+    return { href: links.arxiv, external: true };
   }
   if (links.provider) {
     return { href: links.provider, external: true };

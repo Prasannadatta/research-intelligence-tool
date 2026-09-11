@@ -162,13 +162,20 @@ async def _resolve_author(
         if canonical is not None:
             loaded = True
             display_name = canonical.preferred_name or display_name
+            openalex_records = []
             for record in canonical.provider_records:
                 if record.provider == "openalex":
-                    add_openalex(record.provider_author_id)
+                    openalex_records.append(record)
                 elif record.provider == "arxiv":
                     add_arxiv_name(record.display_name, record.provider_author_id)
+            # Match sync policy: when multiple OA profiles share one ORCID, use
+            # the primary (max works_count) so OA-selected and ORCID-selected
+            # Analyze paths crawl/link the same corpus.
+            for record in _primary_openalex_provider_records(openalex_records):
+                add_openalex(record.provider_author_id)
 
-    # Only query arXiv when the author has an arXiv provider identity.
+    # Request provider fills gaps when DB links are incomplete.
+    # ORCID requests rely on linked OpenAlex/arXiv records above (same corpus).
     if provider == "openalex":
         add_openalex(provider_author_id)
     elif provider == "arxiv":
@@ -192,6 +199,30 @@ async def _resolve_author(
         arxiv_names=arxiv_names,
         provider_records_used=unique_records,
     )
+
+
+def _primary_openalex_provider_records(records: list[Any]) -> list[Any]:
+    """Keep all OpenAlex records unless they share one ORCID (then primary only)."""
+    if len(records) <= 1:
+        return records
+    from app.integrations.orcid.normalize import normalize_orcid_id
+
+    orcids = {
+        normalize_orcid_id(getattr(record, "orcid", None))
+        for record in records
+        if normalize_orcid_id(getattr(record, "orcid", None))
+    }
+    if len(orcids) != 1:
+        return records
+    return [
+        max(
+            records,
+            key=lambda row: (
+                int(getattr(row, "works_count", None) or 0),
+                str(getattr(row, "provider_author_id", "") or ""),
+            ),
+        )
+    ]
 
 
 def _analysis_match(*, verified: bool, method: str) -> dict[str, Any]:
@@ -891,12 +922,142 @@ async def _collect_author_publications(
     }
 
 
+async def _analyze_author_publications_from_stored_corpus(
+    session: AsyncSession,
+    *,
+    authors: list[dict[str, Any]],
+    limit: int,
+    cursor: str | None,
+    page: int | None,
+    filters: dict[str, Any] | None,
+    sort_by: str | None,
+    sort_direction: str | None,
+    request_id: str | None,
+) -> dict[str, Any]:
+    """Paginate filtered/sorted publications from the verified stored corpus."""
+    from app.services.analysis.publication_corpus import load_stored_publication_filter_items
+
+    rid = request_id or uuid.uuid4().hex[:12]
+    loaded = await load_stored_publication_filter_items(session, authors)
+    mode = loaded["mode"]
+    # Preserve request provider echo so the response schema stays stable.
+    by_id = {
+        str(row.get("canonical_author_id") or "").strip(): row
+        for row in authors
+        if isinstance(row, dict) and row.get("canonical_author_id")
+    }
+    echo_authors = []
+    for row in loaded["authors"]:
+        request_row = by_id.get(str(row["canonical_author_id"])) or {}
+        echo_authors.append(
+            {
+                "canonical_author_id": row["canonical_author_id"],
+                "display_name": row["display_name"],
+                "provider": request_row.get("provider") or "openalex",
+                "provider_author_id": request_row.get("provider_author_id")
+                or row["canonical_author_id"],
+            }
+        )
+    authors_key = _authors_key([row["canonical_author_id"] for row in echo_authors])
+    records_key = f"stored:{authors_key}"
+
+    normalized_filters = normalize_filters(filters)
+    active_filters_key = build_filters_key(normalized_filters)
+    active_sort_key = publication_sort_key(sort_by, sort_direction)
+
+    page_offset = 0
+    cursor_payload = _decode_cursor(cursor)
+    if page is not None:
+        page_offset = max(0, (int(page) - 1) * limit)
+    elif cursor_payload is not None:
+        if cursor_payload.get("authors_key") != authors_key:
+            raise AuthorAnalysisError(
+                "Pagination cursor does not match the selected authors.",
+                status_code=422,
+            )
+        if cursor_payload.get("mode") != mode:
+            raise AuthorAnalysisError(
+                "Pagination cursor does not match the analysis mode.",
+                status_code=422,
+            )
+        if not filters_key_matches(cursor_payload.get("filters_key", ""), active_filters_key):
+            raise AuthorAnalysisError(
+                "Pagination cursor does not match the active filters.",
+                status_code=422,
+            )
+        if cursor_payload.get("sort_key", "-") != active_sort_key:
+            raise AuthorAnalysisError(
+                "Pagination cursor does not match the active sort.",
+                status_code=422,
+            )
+        try:
+            page_offset = max(
+                0, int(cursor_payload.get("page_offset") or cursor_payload.get("offset") or 0)
+            )
+        except (TypeError, ValueError):
+            page_offset = 0
+
+    items = list(loaded.get("publication_items") or loaded.get("filter_items") or [])
+    filtered_items = apply_publication_filters(items, normalized_filters)
+    sorted_items = sort_publications(
+        filtered_items,
+        sort_by=sort_by,
+        sort_direction=sort_direction,
+    )
+    matched_total = len(sorted_items)
+    # Clamp offset if filters shrink the set between page requests.
+    if page_offset > 0 and page_offset >= matched_total and matched_total > 0:
+        page_offset = ((matched_total - 1) // limit) * limit
+    page_items = sorted_items[page_offset : page_offset + limit]
+    next_offset = page_offset + len(page_items)
+    has_more = next_offset < matched_total
+    next_cursor = None
+    if has_more:
+        next_cursor = _encode_cursor(
+            {
+                "v": 3,
+                "mode": mode,
+                "authors_key": authors_key,
+                "records_key": records_key,
+                "filters_key": active_filters_key,
+                "sort_key": active_sort_key,
+                "stage": "stored",
+                "page_offset": next_offset,
+                "limit": limit,
+            }
+        )
+
+    current_page = (page_offset // limit) + 1 if limit else 1
+    return {
+        "mode": mode,
+        "authors": echo_authors,
+        "items": page_items,
+        "timeline": None,
+        "facets": _empty_facets(),
+        "pagination": {
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+            "page": current_page,
+            "offset": page_offset,
+            "limit": limit,
+            "total": matched_total,
+            "corpus_source": "stored_complete_corpus",
+        },
+        "provider_total_count": len(items),
+        "unsupported": False,
+        "unsupported_reason": None,
+        "request_id": rid,
+        "corpus_source": "stored_complete_corpus",
+    }
+
+
 async def analyze_author_publications(
     session: AsyncSession | None,
     *,
     authors: list[dict[str, Any]],
     limit: int = 20,
     cursor: str | None = None,
+    page: int | None = None,
     filters: dict[str, Any] | None = None,
     sort_by: str | None = None,
     sort_direction: str | None = None,
@@ -904,11 +1065,38 @@ async def analyze_author_publications(
 ) -> dict[str, Any]:
     total_started = time.perf_counter()
     page_limit = max(1, min(int(limit or 20), 20))
+    # When the verified corpus is fresh, serve the table from the same stored
+    # works as timeline/facets so year filters and counts cannot diverge.
+    if session is not None:
+        from app.services.analysis.author_work_sync import AuthorWorkSyncService
+
+        if await AuthorWorkSyncService(session).fresh_verified_sync_stats(authors) is not None:
+            result = await _analyze_author_publications_from_stored_corpus(
+                session,
+                authors=authors,
+                limit=page_limit,
+                cursor=cursor,
+                page=page,
+                filters=filters,
+                sort_by=sort_by,
+                sort_direction=sort_direction,
+                request_id=request_id,
+            )
+            _log_stage(
+                result.get("request_id") or request_id or "-",
+                "analyze_total_stored",
+                total_started,
+                returned=len(result.get("items") or []),
+            )
+            return result
+
     cursor_payload = _decode_cursor(cursor)
     page_offset = 0
     stage = None
     oa_cursor = None
     arxiv_cursor = None
+    if page is not None and cursor_payload is None:
+        page_offset = max(0, (int(page) - 1) * page_limit)
     if cursor_payload is not None:
         try:
             page_offset = max(0, int(cursor_payload.get("page_offset") or cursor_payload.get("offset") or 0))
@@ -939,7 +1127,15 @@ async def analyze_author_publications(
             "items": [],
             "timeline": None,
             "facets": _empty_facets(),
-            "pagination": {"next_cursor": None, "has_more": False},
+            "pagination": {
+                "next_cursor": None,
+                "has_more": False,
+                "page": 1,
+                "offset": 0,
+                "limit": page_limit,
+                "total": 0,
+                "corpus_source": "live",
+            },
             "provider_total_count": None,
             "unsupported": True,
             "unsupported_reason": collected.get("unsupported_reason"),
@@ -977,10 +1173,10 @@ async def analyze_author_publications(
     enrich_started = time.perf_counter()
     all_items = await enrich_publication_items_authors(session, collected["items"])
     _log_stage(rid, "enrich_authors", enrich_started, items=len(all_items))
-    facet_started = time.perf_counter()
-    facets = build_dependent_publication_facets(all_items, normalized_filters)
+    # Timeline/facets for Analyze Authors come from the publication-stats job
+    # (full verified corpus). Do not recompute them on live table page requests.
+    filter_started = time.perf_counter()
     filtered_items = apply_publication_filters(all_items, normalized_filters)
-    timeline = build_publication_timeline(filtered_items)
     sorted_items = sort_publications(
         filtered_items,
         sort_by=sort_by,
@@ -988,8 +1184,8 @@ async def analyze_author_publications(
     )
     _log_stage(
         rid,
-        "filter_facet_sort",
-        facet_started,
+        "filter_sort",
+        filter_started,
         collected=len(all_items),
         filtered=len(filtered_items),
         page=len(sorted_items[page_offset : page_offset + page_limit]),
@@ -1053,16 +1249,51 @@ async def analyze_author_publications(
         "mode": mode,
         "authors": echo_authors,
         "items": page_items,
-        "timeline": timeline if cursor_payload is None else None,
-        "facets": facets if cursor_payload is None else _empty_facets(),
+        # Kept for response shape compatibility; Analyze UI reads stats-job timeline/facets.
+        "timeline": None,
+        "facets": _empty_facets(),
         "pagination": {
             "next_cursor": next_cursor,
             "has_more": bool(next_cursor),
+            "page": (page_offset // page_limit) + 1 if page_limit else 1,
+            "offset": page_offset,
+            "limit": page_limit,
+            # Exact filtered total is unknown until the verified corpus is ready.
+            "total": None,
+            "corpus_source": "live",
         },
         "provider_total_count": collected.get("provider_total_count"),
         "unsupported": False,
         "unsupported_reason": None,
     }
+
+
+async def _items_for_facet_suggestions(
+    session: AsyncSession | None,
+    *,
+    authors: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Prefer the stored verified corpus for venue/grant/facet lookups.
+
+    Falls back to a live (non-persisting) provider page crawl only when coverage
+    is not yet verified-complete.
+    """
+    if session is not None:
+        from app.services.analysis.author_work_sync import AuthorWorkSyncService
+        from app.services.analysis.publication_corpus import (
+            load_stored_publication_filter_items,
+        )
+
+        if await AuthorWorkSyncService(session).fresh_verified_sync_stats(authors) is not None:
+            loaded = await load_stored_publication_filter_items(session, authors)
+            return list(loaded.get("filter_items") or [])
+
+    collected = await _collect_author_publications(
+        session, authors=authors, persist=False
+    )
+    if collected.get("unsupported"):
+        return []
+    return await enrich_publication_items_authors(session, collected["items"])
 
 
 async def search_author_publication_venues(
@@ -1072,13 +1303,9 @@ async def search_author_publication_venues(
     query: str = "",
     limit: int = 20,
 ) -> list[dict[str, Any]]:
-    # Facet lookups only need the publication set; skip persistence writes.
-    collected = await _collect_author_publications(
-        session, authors=authors, persist=False
-    )
-    if collected.get("unsupported"):
+    items = await _items_for_facet_suggestions(session, authors=authors)
+    if not items:
         return []
-    items = await enrich_publication_items_authors(session, collected["items"])
     return search_venue_facets(items, query, limit=limit)
 
 
@@ -1089,12 +1316,9 @@ async def search_author_publication_grants(
     query: str = "",
     limit: int = 20,
 ) -> list[dict[str, Any]]:
-    collected = await _collect_author_publications(
-        session, authors=authors, persist=False
-    )
-    if collected.get("unsupported"):
+    items = await _items_for_facet_suggestions(session, authors=authors)
+    if not items:
         return []
-    items = await enrich_publication_items_authors(session, collected["items"])
     return search_grant_facets(items, query, limit=limit)
 
 
@@ -1105,16 +1329,11 @@ async def build_author_publication_facets(
     filters: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
-    collected = await _collect_author_publications(
-        session,
-        authors=authors,
-        persist=False,
-    )
-    rid = collected.get("request_id") or "-"
-    if collected.get("unsupported"):
+    items = await _items_for_facet_suggestions(session, authors=authors)
+    rid = "-"
+    if not items:
         return {"sources": [], "institutions": [], "venues": [], "grants": [], "authors": []}
     enrich_started = time.perf_counter()
-    items = await enrich_publication_items_authors(session, collected["items"])
     _log_stage(rid, "facets_enrich_authors", enrich_started, items=len(items))
     facets = build_dependent_publication_facets(items, filters)
     _log_stage(

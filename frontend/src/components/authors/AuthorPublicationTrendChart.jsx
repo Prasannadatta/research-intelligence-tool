@@ -187,7 +187,8 @@ function AuthorPublicationTrendChart({
         ) : null}
         {error ? (
           <Alert
-            severity="error"
+            severity={/rate limit/i.test(String(error)) ? "warning" : "info"}
+            variant="outlined"
             sx={{ mt: 1.5, mb: 0 }}
             action={
               onRetry ? (

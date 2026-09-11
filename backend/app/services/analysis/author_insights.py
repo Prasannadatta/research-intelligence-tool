@@ -90,19 +90,28 @@ class StoredWorkInsights:
     id: str
     title: str
     publication_year: int | None
+    publication_date: str | None = None
     providers: list[str] = field(default_factory=list)
     source: str | None = None
     journal: str | None = None
     citation_count: int | None = None
+    citations_by_provider: dict[str, int] = field(default_factory=dict)
     grants: list[dict[str, Any]] = field(default_factory=list)
     authors: list[dict[str, Any]] = field(default_factory=list)
     institutions: dict[str, InstitutionRef] = field(default_factory=dict)
     source_records: list[dict[str, str]] = field(default_factory=list)
     doi: str | None = None
+    pmid: str | None = None
     url: str | None = None
     openalex_id: str | None = None
     source_id: str | None = None
     arxiv_id: str | None = None
+    arxiv_version: str | None = None
+    scopus_id: str | None = None
+    work_type: str | None = None
+    publisher: str | None = None
+    is_open_access: bool | None = None
+    pdf_url: str | None = None
     authorship_count: int = 0
     authorship_with_institution_count: int = 0
     issns: list[str] = field(default_factory=list)
@@ -112,13 +121,17 @@ class StoredWorkInsights:
             "id": self.id,
             "title": self.title,
             "publication_year": self.publication_year,
+            "publication_date": self.publication_date,
             "providers": self.providers,
             "source": self.source,
             "journal": self.journal,
+            "primary_source": self.journal,
             "citation_count": self.citation_count,
             "cited_by_count": self.citation_count,
+            "citations_by_provider": dict(self.citations_by_provider),
             "grants": self.grants,
             "authors": self.authors,
+            "work_type": self.work_type,
         }
 
     def as_publication_item(self) -> dict[str, Any]:
@@ -131,22 +144,32 @@ class StoredWorkInsights:
             "title": self.title,
             "authors": self.authors,
             "publication_year": self.publication_year,
+            "publication_date": self.publication_date,
             "journal": self.journal,
             "primary_source": self.journal,
             "citation_count": self.citation_count,
             "cited_by_count": self.citation_count,
+            "citations_by_provider": dict(self.citations_by_provider),
             "doi": self.doi,
+            "pmid": self.pmid,
             "url": self.url,
             "providers": self.providers,
             "grants": self.grants,
             "analysis_match": {
                 "verified": True,
-                "method": "stored_author_insights_combination",
+                "method": "stored_complete_corpus",
             },
             "source": provider,
             "openalex_id": self.openalex_id,
             "source_id": self.source_id,
             "source_records": self.source_records,
+            "arxiv_id": self.arxiv_id,
+            "arxiv_version": self.arxiv_version,
+            "scopus_id": self.scopus_id,
+            "work_type": self.work_type,
+            "publisher": self.publisher,
+            "is_open_access": self.is_open_access,
+            "pdf_url": self.pdf_url,
         }
 
     @property
@@ -679,6 +702,7 @@ class AuthorInsightsService:
                 title=work.title,
                 publication_year=work.publication_year,
                 doi=work.doi,
+                pmid=work.pmid,
                 arxiv_id=work.arxiv_id,
             )
             for work in works_result.scalars().all()
@@ -695,7 +719,7 @@ class AuthorInsightsService:
                 continue
             if record.provider not in work.providers:
                 work.providers.append(record.provider)
-            if work.source is None:
+            if work.source is None or record.provider == "openalex":
                 work.source = record.provider
             work.source_records.append(
                 {
@@ -707,27 +731,54 @@ class AuthorInsightsService:
                 work.openalex_id = record.provider_work_id
             if record.provider == "arxiv" and work.arxiv_id is None:
                 work.arxiv_id = record.provider_work_id
+            if record.provider == "scopus" and work.scopus_id is None:
+                work.scopus_id = record.provider_work_id
             if work.source_id is None:
                 work.source_id = record.provider_work_id
             raw = record.raw_metadata if isinstance(record.raw_metadata, dict) else {}
             citation_count = _extract_citation_count(raw)
             if citation_count is not None:
-                work.citation_count = (
-                    citation_count
-                    if work.citation_count is None
-                    else max(work.citation_count, citation_count)
-                )
-            if work.journal is None:
-                work.journal = _extract_venue(raw)
+                # Source-aware: keep per-provider values; never sum or max-merge.
+                work.citations_by_provider[record.provider] = citation_count
+            venue = _extract_venue(raw)
+            if venue:
+                if record.provider == "openalex" or work.journal is None:
+                    work.journal = venue
             for compact in extract_issns_from_work_metadata(raw):
                 if compact not in work.issns:
                     work.issns.append(compact)
             if work.publication_year is None:
                 work.publication_year = _extract_publication_year(raw)
+            if work.publication_date is None:
+                work.publication_date = _extract_publication_date(raw)
             if work.doi is None:
                 work.doi = _extract_doi(raw)
+            if work.pmid is None:
+                work.pmid = _extract_pmid(raw)
             if work.url is None:
                 work.url = _extract_url(raw)
+            if work.work_type is None:
+                work.work_type = _extract_work_type(raw)
+            if work.publisher is None:
+                work.publisher = _extract_publisher(raw)
+            if work.pdf_url is None:
+                work.pdf_url = _extract_pdf_url(raw)
+            if work.is_open_access is None:
+                work.is_open_access = _extract_is_open_access(raw)
+            if record.provider == "arxiv":
+                version = _extract_arxiv_version(raw)
+                if version and work.arxiv_version is None:
+                    work.arxiv_version = version
+                if raw.get("arxiv_id") and not work.arxiv_id:
+                    work.arxiv_id = str(raw.get("arxiv_id")).strip() or work.arxiv_id
+            if record.provider == "scopus":
+                scopus_id = _extract_scopus_id(raw, fallback=record.provider_work_id)
+                if scopus_id and work.scopus_id is None:
+                    work.scopus_id = scopus_id
+            # Already-stored OpenAlex (and other) snapshots may carry grants[] in
+            # raw_metadata even when WorkGrantMatch was never populated historically.
+            for grant_row in _grants_from_provider_raw(raw, provider=record.provider):
+                _append_source_aware_grant(work, grant_row)
 
         grant_result = await self.session.execute(
             select(WorkGrantMatch).where(WorkGrantMatch.canonical_work_id.in_(work_uuids))
@@ -736,14 +787,15 @@ class AuthorInsightsService:
             work = works.get(str(grant.canonical_work_id))
             if work is None:
                 continue
-            work.grants.append(
+            _append_source_aware_grant(
+                work,
                 {
                     "award_id": grant.grant_number,
                     "funder_name": _extract_funder_name(grant.raw_metadata),
                     "verified": grant.verified,
                     "match_type": grant.match_type,
                     "provider": grant.provider,
-                }
+                },
             )
 
         authorship_result = await self.session.execute(
@@ -776,8 +828,30 @@ class AuthorInsightsService:
                 )
             work.authors.append(_serialize_work_author(authorship))
 
+        from app.services.analysis.publication_enrichment import preferred_citation_count
+
         for work in works.values():
-            work.providers = sorted(work.providers)
+            work.citation_count = preferred_citation_count(work.citations_by_provider)
+            # Include enrichment providers only when they contributed identifiers/metadata.
+            if work.arxiv_id and "arxiv" not in work.providers:
+                work.providers.append("arxiv")
+            if work.scopus_id and "scopus" not in work.providers:
+                work.providers.append("scopus")
+            for provider in work.citations_by_provider:
+                key = str(provider or "").strip().lower()
+                if key and key not in work.providers:
+                    work.providers.append(key)
+            work.providers = sorted(
+                {
+                    "scopus" if provider == "elsevier" else provider
+                    for provider in work.providers
+                    if provider
+                },
+                key=lambda value: (
+                    0 if value == "openalex" else 1,
+                    value,
+                ),
+            )
             work.source_records = sorted(
                 work.source_records,
                 key=lambda row: (
@@ -1385,6 +1459,14 @@ def _extract_publication_year(raw: dict[str, Any]) -> int | None:
     return None
 
 
+def _extract_publication_date(raw: dict[str, Any]) -> str | None:
+    for key in ("publication_date", "published_date"):
+        value = str(raw.get(key) or "").strip()
+        if value:
+            return value[:32]
+    return None
+
+
 def _extract_citation_count(raw: dict[str, Any]) -> int | None:
     for key in ("citation_count", "cited_by_count"):
         value = raw.get(key)
@@ -1421,6 +1503,104 @@ def _extract_doi(raw: dict[str, Any]) -> str | None:
             text = " ".join(str(value).split())
             if text:
                 return text.replace("https://doi.org/", "").replace("http://doi.org/", "")
+    return None
+
+
+def _extract_pmid(raw: dict[str, Any]) -> str | None:
+    for key in ("pmid", "PMID", "pubmed_id"):
+        value = raw.get(key)
+        if value:
+            text = " ".join(str(value).split())
+            if text:
+                return text
+    ids = raw.get("ids")
+    if isinstance(ids, dict):
+        value = ids.get("pmid") or ids.get("PMID")
+        if value:
+            text = " ".join(str(value).split())
+            if text:
+                return text
+    return None
+
+
+def _extract_work_type(raw: dict[str, Any]) -> str | None:
+    for key in ("work_type", "type", "aggregation_type", "subtypeDescription"):
+        value = raw.get(key)
+        if value:
+            text = " ".join(str(value).split())
+            if text:
+                return text
+    return None
+
+
+def _extract_publisher(raw: dict[str, Any]) -> str | None:
+    for key in ("publisher", "host_organization_name"):
+        value = raw.get(key)
+        if value:
+            text = " ".join(str(value).split())
+            if text:
+                return text
+    primary = raw.get("primary_location")
+    if isinstance(primary, dict):
+        source = primary.get("source")
+        if isinstance(source, dict):
+            for key in ("host_organization_name", "publisher", "display_name"):
+                value = source.get(key)
+                if value and key != "display_name":
+                    text = " ".join(str(value).split())
+                    if text:
+                        return text
+    return None
+
+
+def _extract_pdf_url(raw: dict[str, Any]) -> str | None:
+    for key in ("pdf_url",):
+        value = raw.get(key)
+        if value:
+            text = " ".join(str(value).split())
+            if text:
+                return text
+    primary = raw.get("primary_location")
+    if isinstance(primary, dict):
+        value = primary.get("pdf_url")
+        if value:
+            text = " ".join(str(value).split())
+            if text:
+                return text
+    return None
+
+
+def _extract_is_open_access(raw: dict[str, Any]) -> bool | None:
+    for key in ("is_open_access", "is_oa"):
+        if key in raw and raw.get(key) is not None:
+            return bool(raw.get(key))
+    oa = raw.get("open_access")
+    if isinstance(oa, dict) and "is_oa" in oa:
+        return bool(oa.get("is_oa"))
+    return None
+
+
+def _extract_arxiv_version(raw: dict[str, Any]) -> str | None:
+    for key in ("arxiv_version", "version"):
+        value = raw.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text.lstrip("vV")
+    return None
+
+
+def _extract_scopus_id(raw: dict[str, Any], *, fallback: str | None = None) -> str | None:
+    for key in ("scopus_id", "eid", "source_id"):
+        value = raw.get(key)
+        if value:
+            text = " ".join(str(value).split())
+            if text:
+                return text
+    if fallback:
+        text = " ".join(str(fallback).split())
+        return text or None
     return None
 
 
@@ -1480,11 +1660,100 @@ def _extract_funder_name(raw: dict[str, Any] | None) -> str | None:
         return None
     for key in ("funder_name", "funder_display_name", "funder"):
         value = raw.get(key)
+        if isinstance(value, dict):
+            value = value.get("display_name")
         if value:
             text = " ".join(str(value).split())
             if text:
                 return text
     return None
+
+
+def _grant_dedupe_key(grant: dict[str, Any]) -> str:
+    provider = str(grant.get("provider") or "").strip().lower()
+    award = " ".join(str(grant.get("award_id") or grant.get("grant_number") or "").split())
+    return f"{provider}|{award.casefold()}"
+
+
+def _append_source_aware_grant(work: StoredWorkInsights, grant: dict[str, Any]) -> None:
+    """Append a grant without collapsing across providers or dropping OpenAlex rows."""
+    award_id = grant.get("award_id") or grant.get("grant_number")
+    if not award_id:
+        return
+    normalized = {
+        "award_id": " ".join(str(award_id).split()).strip(),
+        "funder_name": grant.get("funder_name") or grant.get("funder"),
+        "verified": bool(grant.get("verified")),
+        "match_type": grant.get("match_type"),
+        "provider": grant.get("provider"),
+    }
+    if not normalized["award_id"]:
+        return
+    key = _grant_dedupe_key(normalized)
+    existing_keys = {_grant_dedupe_key(row) for row in work.grants}
+    if key in existing_keys:
+        return
+    work.grants.append(normalized)
+
+
+def _grants_from_provider_raw(
+    raw: dict[str, Any] | None,
+    *,
+    provider: str,
+) -> list[dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return []
+    out: list[dict[str, Any]] = []
+    grants = raw.get("grants")
+    if isinstance(grants, list):
+        for item in grants:
+            if not isinstance(item, dict):
+                continue
+            award_id = (
+                item.get("award_id")
+                or item.get("grant_number")
+                or item.get("funder_award_id")
+            )
+            if not award_id:
+                continue
+            verified_default = provider == "openalex"
+            match_default = (
+                "structured_award_relationship"
+                if provider == "openalex"
+                else "metadata_text_match"
+            )
+            out.append(
+                {
+                    "award_id": award_id,
+                    "funder_name": item.get("funder_name") or item.get("funder"),
+                    "verified": bool(item.get("verified", verified_default)),
+                    "match_type": item.get("match_type") or match_default,
+                    "provider": item.get("provider") or provider,
+                }
+            )
+    matched = raw.get("matched_grant_number")
+    if matched:
+        grant_match = raw.get("grant_match") if isinstance(raw.get("grant_match"), dict) else {}
+        verified_default = provider == "openalex"
+        match_default = (
+            "structured_award_relationship"
+            if provider == "openalex"
+            else "metadata_text_match"
+        )
+        out.append(
+            {
+                "award_id": matched,
+                "funder_name": grant_match.get("funder_name"),
+                "verified": bool(
+                    grant_match.get("verified")
+                    if grant_match.get("verified") is not None
+                    else verified_default
+                ),
+                "match_type": grant_match.get("type") or match_default,
+                "provider": provider,
+            }
+        )
+    return out
 
 
 def _best_venue_label(existing: str | None, candidate: str) -> str:

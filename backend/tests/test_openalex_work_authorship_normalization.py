@@ -179,3 +179,51 @@ def test_extract_normalized_work_authors_keeps_all_coauthors():
     assert len(authors) == 7
     assert authors[0]["author_position"] == 0
     assert authors[-1]["name"] == "Author 7"
+
+
+def test_normalize_empty_title_recovers_landing_page_slug():
+    """Regression: Monika Schleier-Smith W3099820453 (empty title repository record)."""
+    work = {
+        "id": "https://openalex.org/W3099820453",
+        "title": "",
+        "display_name": "",
+        "publication_year": None,
+        "type": "other",
+        "authorships": [
+            {
+                "author": {
+                    "id": "https://openalex.org/A5021463446",
+                    "display_name": "Monika Schleier-Smith",
+                },
+                "institutions": [],
+            }
+        ],
+        "primary_location": {
+            "landing_page_url": (
+                "https://curis.ku.dk/portal/da/publications/"
+                "one-and-twoaxis-squeezing-of-atomic-ensembles-in-optical-cavities"
+                "(43e66380-0507-42ad-96d6-f680e730e209).html"
+            ),
+            "source": {
+                "display_name": "Research at the University of Copenhagen",
+            },
+        },
+    }
+
+    normalized = normalize_search_work(work)
+    assert normalized is not None
+    assert normalized["openalex_id"] == "W3099820453"
+    assert "squeezing" in normalized["title"].lower()
+    assert "atomic" in normalized["title"].lower()
+
+
+def test_normalize_empty_title_falls_back_to_untitled_label():
+    work = {
+        "id": "https://openalex.org/W999000111",
+        "title": "",
+        "display_name": "",
+        "authorships": [],
+    }
+    normalized = normalize_search_work(work)
+    assert normalized is not None
+    assert normalized["title"] == "Untitled work W999000111"

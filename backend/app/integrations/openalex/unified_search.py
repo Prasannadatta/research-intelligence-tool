@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 from app.core.issn import collect_issns, compact_issn, format_issn
 from app.integrations.openalex.client import (
@@ -18,6 +20,11 @@ from app.integrations.openalex.client import (
     _short_openalex_id,
 )
 from app.services.work_persistence.affiliations import normalize_affiliation_payload
+
+_LANDING_UUID_SUFFIX_RE = re.compile(
+    r"\([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\)$",
+    re.IGNORECASE,
+)
 
 OPENALEX_AUTHORS_URL = "https://api.openalex.org/authors"
 OPENALEX_WORKS_URL = "https://api.openalex.org/works"
@@ -38,6 +45,73 @@ def _optional_str(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _title_from_landing_page_url(url: str | None) -> str | None:
+    """Recover a display title from repository landing URLs when OpenAlex title is empty.
+
+    Pure/CURis-style paths encode the title in the final path segment, e.g.
+    ``.../one-and-twoaxis-squeezing-...(uuid).html``.
+    """
+    text = _optional_str(url)
+    if not text:
+        return None
+    path = unquote(urlparse(text).path).rstrip("/")
+    if not path:
+        return None
+    segment = path.rsplit("/", 1)[-1]
+    if segment.lower().endswith(".html"):
+        segment = segment[: -len(".html")]
+    segment = _LANDING_UUID_SUFFIX_RE.sub("", segment).strip("-_. ")
+    if len(segment) < 8:
+        return None
+    # Skip opaque identifiers (OpenAlex/MAG ids, bare UUIDs).
+    if re.fullmatch(r"[A-Za-z]?\d{6,}", segment):
+        return None
+    if re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        segment,
+        flags=re.IGNORECASE,
+    ):
+        return None
+    words = [part for part in re.split(r"[-_]+", segment) if part]
+    if len(words) < 2:
+        return None
+    return " ".join(words)
+
+
+def _iter_openalex_location_dicts(work: dict[str, Any]) -> list[dict[str, Any]]:
+    locations: list[dict[str, Any]] = []
+    primary = work.get("primary_location")
+    if isinstance(primary, dict):
+        locations.append(primary)
+    raw_locations = work.get("locations")
+    if isinstance(raw_locations, list):
+        for location in raw_locations:
+            if isinstance(location, dict):
+                locations.append(location)
+    return locations
+
+
+def resolve_openalex_work_title(work: dict[str, Any], *, openalex_id: str) -> str:
+    """Return a persistable title for an OpenAlex work.
+
+    Empty ``title``/``display_name`` is common on repository duplicates that still
+    appear in ``meta.count`` (e.g. Monika Schleier-Smith W3099820453). Dropping
+    those IDs permanently fails Analyze completeness (107 reported vs 96 linked).
+    Prefer landing-page slug recovery; fall back to a stable Untitled label so the
+    W-id still enters the provider→canonical pipeline.
+    """
+    title = _optional_str(work.get("title")) or _optional_str(work.get("display_name"))
+    if title:
+        return title
+    for location in _iter_openalex_location_dicts(work):
+        recovered = _title_from_landing_page_url(
+            _optional_str(location.get("landing_page_url"))
+        )
+        if recovered:
+            return recovered
+    return f"Untitled work {openalex_id}"
 
 
 def _optional_float(value: Any) -> float | None:
@@ -321,9 +395,7 @@ def normalize_search_work(work: dict[str, Any]) -> dict[str, Any] | None:
     if not openalex_id:
         return None
 
-    title = _optional_str(work.get("title")) or _optional_str(work.get("display_name"))
-    if not title:
-        return None
+    title = resolve_openalex_work_title(work, openalex_id=openalex_id)
 
     authors = extract_normalized_work_authors(work)
 

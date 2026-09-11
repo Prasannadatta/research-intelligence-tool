@@ -151,6 +151,85 @@ def parse_scopus_ids_from_abstract(payload: dict[str, Any] | None) -> ScopusWork
     return ScopusWorkIds(scopus_id=scopus_id, eid=eid, citedby_count=count)
 
 
+@dataclass(frozen=True)
+class ScopusAbstractEnrichment:
+    """Citation / journal / publication fields from Abstract Retrieval META."""
+
+    scopus_id: str | None = None
+    eid: str | None = None
+    citedby_count: int | None = None
+    title: str | None = None
+    publication_name: str | None = None
+    cover_date: str | None = None
+    publication_year: int | None = None
+    aggregation_type: str | None = None
+    doi: str | None = None
+    issn: str | None = None
+    eissn: str | None = None
+
+
+def parse_scopus_abstract_enrichment(
+    payload: dict[str, Any] | None,
+) -> ScopusAbstractEnrichment | None:
+    """Parse META Abstract Retrieval into enrich-only publication fields."""
+    root = _as_dict(payload).get("abstracts-retrieval-response") or payload
+    core = _as_dict(_as_dict(root).get("coredata"))
+    if not core:
+        return None
+    ids = parse_scopus_ids_from_abstract(payload)
+    cover = _text(core.get("prism:coverDate") or core.get("prism:coverDisplayDate"))
+    doi_raw = _text(core.get("prism:doi") or core.get("dc:identifier"))
+    # Prefer real DOI over SCOPUS_ID:… identifiers.
+    if doi_raw and doi_raw.upper().startswith("SCOPUS_ID:"):
+        doi_raw = _text(core.get("prism:doi"))
+    return ScopusAbstractEnrichment(
+        scopus_id=ids.scopus_id,
+        eid=ids.eid,
+        citedby_count=ids.citedby_count,
+        title=_text(core.get("dc:title")),
+        publication_name=_text(core.get("prism:publicationName")),
+        cover_date=cover,
+        publication_year=publication_year_from_cover_date(cover),
+        aggregation_type=_text(
+            core.get("prism:aggregationType") or core.get("subtypeDescription")
+        ),
+        doi=normalize_doi(doi_raw) or doi_raw,
+        issn=_text(core.get("prism:issn")),
+        eissn=_text(core.get("prism:eIssn") or core.get("prism:eissn")),
+    )
+
+
+def scopus_enrichment_as_provider_result(
+    enrichment: ScopusAbstractEnrichment,
+    *,
+    fallback_title: str,
+) -> dict[str, Any]:
+    """Normalize Scopus enrichment into a provider work row for persistence."""
+    provider_work_id = enrichment.scopus_id or enrichment.eid
+    if not provider_work_id:
+        raise ValueError("Scopus enrichment requires scopus_id or eid")
+    return {
+        "result_id": f"scopus:{provider_work_id}",
+        "result_type": "work",
+        "source": "scopus",
+        "source_id": provider_work_id,
+        "scopus_id": enrichment.scopus_id,
+        "eid": enrichment.eid,
+        "title": enrichment.title or fallback_title,
+        "publication_year": enrichment.publication_year,
+        "publication_date": enrichment.cover_date,
+        "journal": enrichment.publication_name,
+        "primary_source": enrichment.publication_name,
+        "citation_count": enrichment.citedby_count,
+        "cited_by_count": enrichment.citedby_count,
+        "doi": enrichment.doi,
+        "issn": enrichment.issn,
+        "eissn": enrichment.eissn,
+        "work_type": enrichment.aggregation_type,
+        "authors": [],
+    }
+
+
 def parse_scopus_ids_from_search_entry(entry: dict[str, Any] | None) -> ScopusWorkIds:
     payload = _as_dict(entry)
     identifier = payload.get("dc:identifier")

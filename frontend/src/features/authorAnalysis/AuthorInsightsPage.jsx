@@ -354,12 +354,25 @@ function AuthorInsightsPage() {
       authors: activeAuthorApiPayload,
       filters: appliedFiltersPayload,
       excludedWorkIds: excludedWorkIdList,
+      retryIncompleteOnly: retryToken > 0,
     });
     const unsubscribeProgress = subscribeInsightsJobProgress(entry, (progress) => {
       if (!active || requestSeqRef.current !== sequence) {
         return;
       }
-      setJobProgress(progress);
+      setJobProgress((previous) => {
+        const sameJob =
+          previous?.jobId
+          && progress?.jobId
+          && String(previous.jobId) === String(progress.jobId);
+        if (!sameJob) {
+          return progress;
+        }
+        return {
+          ...progress,
+          percent: Math.max(Number(previous.percent) || 0, Number(progress.percent) || 0),
+        };
+      });
     });
 
     entry.promise

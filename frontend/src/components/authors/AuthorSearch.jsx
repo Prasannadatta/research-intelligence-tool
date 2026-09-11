@@ -383,7 +383,7 @@ const AuthorResultRow = memo(function AuthorResultRow({
                 bgcolor: "action.hover",
                 color: "text.secondary",
                 fontWeight: 600,
-                letterSpacing: 0.01,
+                letterSpacing: "0.01em",
               }}
             >
               {sourceLabel}
@@ -663,6 +663,7 @@ function AuthorSearch({
   // When the user dismisses the dropdown (outside click / Escape), do not reopen
   // it when an in-flight search resolves.
   const suppressOpenRef = useRef(false);
+  const searchContainerRef = useRef(null);
 
   const openDropdown = useCallback(() => {
     if (suppressOpenRef.current) {
@@ -1473,29 +1474,34 @@ function AuthorSearch({
     : `Searching ${sourceStatusLabel}${filterStatusSuffix}…`;
 
   return (
-    <Box sx={{ width: "100%", textAlign: "left" }}>
-      <SourceSelector
-        sources={capabilities.sources}
-        value={source}
-        entityType={entityType}
-        onChange={handleSourceChange}
-      />
-
-      <ClickAwayListener
-        onClickAway={(event) => {
-          if (!showDropdown) {
-            return;
-          }
-          const target = event.target;
+    <ClickAwayListener
+      mouseEvent="onMouseDown"
+      touchEvent="onTouchStart"
+      onClickAway={(event) => {
+        if (!showDropdown) {
+          return;
+        }
+        const target = event.target;
+        if (target instanceof Element) {
           if (
-            target instanceof Element &&
-            target.closest(".MuiAutocomplete-popper")
+            searchContainerRef.current?.contains(target) ||
+            target.closest(".MuiAutocomplete-popper") ||
+            target.closest(".MuiPopover-root")
           ) {
             return;
           }
-          closeDropdown();
-        }}
-      >
+        }
+        closeDropdown();
+      }}
+    >
+      <Box ref={searchContainerRef} sx={{ width: "100%", textAlign: "left" }}>
+        <SourceSelector
+          sources={capabilities.sources}
+          value={source}
+          entityType={entityType}
+          onChange={handleSourceChange}
+        />
+
         <Box>
           <Autocomplete
         fullWidth
@@ -1688,16 +1694,15 @@ function AuthorSearch({
         }}
       />
         </Box>
-      </ClickAwayListener>
 
-      {showAuthorFilters ? (
-        <AuthorFilters
-          institution={institutionFilter}
-          topic={topicFilter}
-          onInstitutionChange={handleInstitutionChange}
-          onTopicChange={handleTopicChange}
-        />
-      ) : null}
+        {showAuthorFilters ? (
+          <AuthorFilters
+            institution={institutionFilter}
+            topic={topicFilter}
+            onInstitutionChange={handleInstitutionChange}
+            onTopicChange={handleTopicChange}
+          />
+        ) : null}
 
       {validationMessage ? (
         <Typography
@@ -1725,6 +1730,7 @@ function AuthorSearch({
         </Alert>
       ) : null}
     </Box>
+  </ClickAwayListener>
   );
 }
 

@@ -176,6 +176,70 @@ async def test_stats_job_skips_http_for_fresh_complete(session_factory, monkeypa
     assert mock_fetch.await_count == 0
     assert client.get(f"/api/analysis/authors/publications/stats/jobs/{job_id}").json()["status"] == "completed"
     assert client.get(f"/api/analysis/authors/publications/stats/jobs/{job_id2}").json()["status"] == "completed"
+    # Fresh verified corpus: remount reuses the completed job instead of enqueueing again.
+    assert job_id == job_id2
+
+
+@pytest.mark.asyncio
+async def test_sipahigil_shaped_stats_timeline_matches_88_canonical(
+    session_factory, monkeypatch
+):
+    """Graph/stats totals follow merged canonical corpus (88), not OpenAlex raw 99."""
+    _hold_scheduler(monkeypatch)
+    monkeypatch.setattr(publication_stats_jobs, "SessionLocal", session_factory)
+
+    openalex_author_id = "A5064615305"
+    results: list[dict] = []
+    for index in range(88):
+        row = _work_row(
+            f"W{index:03d}",
+            f"Canonical Paper {index}",
+            [(openalex_author_id, "Alp Sipahigil")],
+        )
+        row["publication_year"] = 2011 + (index % 15)
+        row["doi"] = f"10.1000/sipahigil-{index}"
+        results.append(row)
+    for index in range(11):
+        alt = _work_row(
+            f"WALT{index:03d}",
+            f"Canonical Paper {index}",
+            [(openalex_author_id, "Alp Sipahigil")],
+        )
+        alt["publication_year"] = results[index]["publication_year"]
+        alt["doi"] = results[index]["doi"]
+        results.append(alt)
+
+    async with session_factory() as session:
+        author = await _seed_author(
+            session, name="Alp Sipahigil", openalex_id=openalex_author_id
+        )
+        await _set_works_count(session, author, 99)
+
+    with patch(
+        "app.services.analysis.author_work_sync.search_works_by_author_ids",
+        new_callable=AsyncMock,
+        return_value={
+            "results": results,
+            "has_more": False,
+            "next_cursor": None,
+            "count": 99,
+        },
+    ):
+        created = client.post(
+            "/api/analysis/authors/publications/stats/jobs",
+            json={"authors": [_author_payload(author.id, "Alp Sipahigil")]},
+        )
+        job_id = created.json()["job_id"]
+        await run_publication_stats_job(job_id)
+
+    done = client.get(f"/api/analysis/authors/publications/stats/jobs/{job_id}").json()
+    assert done["status"] == "completed"
+    assert done["result"]["corpus_complete"] is True
+    assert done["result"]["total_matching_publications"] == 88
+    assert done["result"]["total_corpus_publications"] == 88
+    assert done["result"]["timeline"]["total_matching_publications"] == 88
+    assert done["result"]["timeline"]["total_dated_publications"] == 88
+    assert sum(row["count"] for row in done["result"]["timeline"]["items"]) == 88
 
 
 @pytest.mark.asyncio
@@ -347,3 +411,68 @@ async def test_stats_job_fails_when_author_has_no_provider_identity(session_fact
     assert payload["result"] is None
     assert payload["progress_detail"]["corpus_complete"] is False
     assert "provider" in (payload["error_message"] or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_stats_job_reuses_in_flight_for_same_fingerprint(session_factory, monkeypatch):
+    scheduled = _hold_scheduler(monkeypatch)
+    monkeypatch.setattr(publication_stats_jobs, "SessionLocal", session_factory)
+
+    async with session_factory() as session:
+        author = await _seed_author(session, name="Inflight", openalex_id="IF1")
+        await _mark_complete(session, author.id)
+        await session.commit()
+        author_id = author.id
+
+    payload = {"authors": [_author_payload(author_id, "Inflight")]}
+    first = client.post("/api/analysis/authors/publications/stats/jobs", json=payload)
+    second = client.post("/api/analysis/authors/publications/stats/jobs", json=payload)
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["job_id"] == second.json()["job_id"]
+    assert len(scheduled) == 1
+
+
+@pytest.mark.asyncio
+async def test_stats_filter_change_skips_sync_when_corpus_fresh(session_factory, monkeypatch):
+    _hold_scheduler(monkeypatch)
+    monkeypatch.setattr(publication_stats_jobs, "SessionLocal", session_factory)
+
+    async with session_factory() as session:
+        author = await _seed_author(session, name="Filter Fresh", openalex_id="FF1")
+        await _seed_work(
+            session,
+            title="Stored A",
+            year=2022,
+            provider_work_id="FFW1",
+            selected_authors=[author],
+        )
+        await _seed_work(
+            session,
+            title="Stored B",
+            year=2018,
+            provider_work_id="FFW2",
+            selected_authors=[author],
+        )
+        await _mark_complete(session, author.id, stored=2)
+        await session.commit()
+        author_id = author.id
+
+    with patch(
+        "app.services.analysis.author_work_sync.search_works_by_author_ids",
+        new_callable=AsyncMock,
+    ) as mock_fetch:
+        created = client.post(
+            "/api/analysis/authors/publications/stats/jobs",
+            json={
+                "authors": [_author_payload(author_id, "Filter Fresh")],
+                "filters": {"from_year": 2020},
+            },
+        )
+        job_id = created.json()["job_id"]
+        await run_publication_stats_job(job_id)
+
+    done = client.get(f"/api/analysis/authors/publications/stats/jobs/{job_id}").json()
+    assert done["status"] == "completed"
+    assert done["result"]["total_matching_publications"] == 1
+    assert mock_fetch.await_count == 0

@@ -66,9 +66,22 @@ export function formatInsightsJobProgressMessage(progress) {
   const authorName = String(detail.author_name || detail.authorName || "").trim();
   const processed = detail.publications_processed ?? detail.publicationsProcessed;
   const total = detail.publications_total ?? detail.publicationsTotal;
+  const ready = detail.authors_ready ?? detail.authorsReady;
+  const authorsTotal = detail.authors_total ?? detail.authorsTotal ?? detail.author_total ?? detail.authorTotal;
 
   if (phase === "checking") {
     return "Checking publication coverage…";
+  }
+
+  if (ready != null && authorsTotal != null && Number(authorsTotal) > 0) {
+    const readyLabel = `${Number(ready).toLocaleString()} of ${Number(authorsTotal).toLocaleString()} authors ready`;
+    if (authorName && processed != null && total != null) {
+      return `${readyLabel} — syncing ${authorName} (${Number(processed).toLocaleString()} / ${Number(total).toLocaleString()})`;
+    }
+    if (authorName) {
+      return `${readyLabel} — syncing ${authorName}`;
+    }
+    return readyLabel;
   }
 
   if (authorName && processed != null && total != null) {
@@ -127,6 +140,7 @@ async function fetchAuthorInsightsViaJob({
   authors,
   filters,
   excludedWorkIds,
+  retryIncompleteOnly = false,
   signal,
   onProgress,
 } = {}) {
@@ -134,6 +148,7 @@ async function fetchAuthorInsightsViaJob({
     authors,
     filters,
     excludedWorkIds,
+    retryIncompleteOnly,
     signal,
   });
   onProgress?.(created);

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import select
@@ -14,17 +15,22 @@ from sqlalchemy.orm import selectinload
 
 from app.core.config import get_settings
 from app.db.models import (
-    AuthorAlias,
     AuthorProfile,
     CanonicalAuthor,
     CanonicalAuthorInstitution,
     ProviderAuthorRecord,
 )
+from app.integrations.elsevier.client import elsevier_configured
 from app.integrations.openalex.client import (
     OpenAlexApiError,
     fetch_openalex_author_payload,
-    get_openalex_author,
     normalize_openalex_author,
+)
+from app.integrations.orcid.client import orcid_configured
+from app.services.authors.affiliation_enrichment import (
+    enrich_from_orcid,
+    enrich_from_scopus,
+    source_needs_enrichment,
 )
 from app.services.authors.openalex_enrichment import (
     extract_openalex_affiliations,
@@ -35,6 +41,9 @@ from app.services.author_resolution.normalization import normalize_author_name
 from app.services.author_resolution.repository import AuthorIdentityRepository
 
 logger = logging.getLogger(__name__)
+
+_enrich_locks: dict[str, asyncio.Lock] = {}
+_enrich_locks_guard = asyncio.Lock()
 
 
 class AuthorSummaryError(Exception):
@@ -71,8 +80,7 @@ def _merge_topics(existing: list[str] | None, incoming: list[str]) -> list[str]:
 
 
 def _merge_providers(existing: list[str] | None, incoming: list[str]) -> list[str]:
-    merged = sorted({*(existing or []), *(incoming or [])})
-    return merged
+    return sorted({*(existing or []), *(incoming or [])})
 
 
 def _institution_sort_key(row: CanonicalAuthorInstitution) -> tuple[Any, ...]:
@@ -101,6 +109,129 @@ def _serialize_institution(row: CanonicalAuthorInstitution) -> dict[str, Any]:
     }
 
 
+def _mark_openalex_meta(profile: AuthorProfile) -> None:
+    meta = dict(profile.enrichment_meta or {})
+    meta["openalex"] = datetime.now(UTC).isoformat()
+    profile.enrichment_meta = meta
+
+
+def _has_usable_profile(profile: AuthorProfile | None) -> bool:
+    if profile is None:
+        return False
+    return any(
+        (
+            profile.works_count is not None,
+            profile.citation_count is not None,
+            profile.h_index is not None,
+            bool(profile.topics),
+            bool(profile.orcid),
+            bool(profile.enriched_at),
+        )
+    )
+
+
+def _resolve_orcid(profile: AuthorProfile | None, canonical: CanonicalAuthor) -> str | None:
+    if profile and profile.orcid:
+        return str(profile.orcid).strip() or None
+    for record in canonical.provider_records:
+        if record.orcid:
+            return str(record.orcid).strip() or None
+        if record.provider == "orcid" and record.provider_author_id:
+            return str(record.provider_author_id).strip() or None
+    return None
+
+
+def _pending_enrichment(
+    profile: AuthorProfile | None,
+    canonical: CanonicalAuthor,
+) -> dict[str, Any]:
+    settings = get_settings()
+    oa_ttl = getattr(settings, "author_profile_freshness_days", 14)
+    orcid_ttl = getattr(settings, "author_profile_orcid_enrichment_ttl_days", 14)
+    scopus_ttl = getattr(settings, "author_profile_scopus_enrichment_ttl_days", 30)
+
+    has_openalex = any(r.provider == "openalex" for r in canonical.provider_records)
+    orcid = _resolve_orcid(profile, canonical)
+    settings_obj = get_settings()
+    openalex_ok = bool(getattr(settings_obj, "openalex_configured", False))
+    orcid_ok = orcid_configured()
+    scopus_ok = elsevier_configured()
+
+    pending: list[str] = []
+    if (
+        has_openalex
+        and openalex_ok
+        and _has_usable_profile(profile)
+        and source_needs_enrichment(profile, "openalex", ttl_days=oa_ttl)
+    ):
+        # Stale OA refresh is lazy — cold profiles sync synchronously on GET.
+        pending.append("openalex")
+    if orcid and orcid_ok and source_needs_enrichment(profile, "orcid", ttl_days=orcid_ttl):
+        pending.append("orcid")
+    if orcid and scopus_ok and source_needs_enrichment(profile, "scopus", ttl_days=scopus_ttl):
+        pending.append("scopus")
+
+    sources = {
+        "openalex": (
+            not source_needs_enrichment(profile, "openalex", ttl_days=oa_ttl)
+            if has_openalex
+            else False
+        ),
+        "orcid": (
+            not source_needs_enrichment(profile, "orcid", ttl_days=orcid_ttl)
+            if orcid
+            else False
+        ),
+        "scopus": (
+            not source_needs_enrichment(profile, "scopus", ttl_days=scopus_ttl)
+            if orcid
+            else False
+        ),
+    }
+    return {"pending": pending, "sources": sources}
+
+
+def _collect_provider_ids(
+    canonical: CanonicalAuthor,
+    profile: AuthorProfile | None,
+) -> dict[str, list[str]]:
+    """Stable provider author IDs only — never inferred from display name."""
+    buckets: dict[str, list[str]] = {
+        "openalex": [],
+        "orcid": [],
+        "scopus": [],
+        "arxiv": [],
+    }
+    seen: dict[str, set[str]] = {key: set() for key in buckets}
+
+    def _add(provider: str, value: str | None) -> None:
+        text = str(value or "").strip()
+        if not text:
+            return
+        key = provider.lower()
+        if key not in buckets:
+            buckets[key] = []
+            seen[key] = set()
+        if text in seen[key]:
+            return
+        seen[key].add(text)
+        buckets[key].append(text)
+
+    for record in canonical.provider_records or []:
+        provider = str(record.provider or "").strip().lower()
+        if not provider:
+            continue
+        _add(provider, record.provider_author_id)
+        if record.orcid:
+            _add("orcid", record.orcid)
+
+    orcid = _resolve_orcid(profile, canonical)
+    if orcid:
+        _add("orcid", orcid)
+
+    return buckets
+
+
 def _build_summary(
     canonical: CanonicalAuthor,
     profile: AuthorProfile | None,
@@ -122,13 +253,16 @@ def _build_summary(
         )
 
     updated_at = profile.updated_at if profile else canonical.updated_at
+    enrichment = _pending_enrichment(profile, canonical)
+    orcid = _resolve_orcid(profile, canonical)
 
     return {
         "id": str(canonical.id),
         "display_name": canonical.preferred_name,
         "aliases": aliases,
         "institutions": [_serialize_institution(row) for row in institutions],
-        "orcid": profile.orcid if profile else None,
+        "orcid": orcid,
+        "provider_ids": _collect_provider_ids(canonical, profile),
         "topics": list(profile.topics or []) if profile and profile.topics else [],
         "works_count": profile.works_count if profile else None,
         "citation_count": profile.citation_count if profile else None,
@@ -136,6 +270,7 @@ def _build_summary(
         "providers": providers,
         "updated_at": updated_at.isoformat() if updated_at else None,
         "unresolved": unresolved,
+        "enrichment": enrichment,
     }
 
 
@@ -150,6 +285,8 @@ async def _load_profile_bundle(
             selectinload(CanonicalAuthor.aliases),
             selectinload(CanonicalAuthor.provider_records),
         )
+        # Enrichment may attach new provider rows in-session; refresh the identity map.
+        .execution_options(populate_existing=True)
     )
     canonical = (await session.execute(canonical_stmt)).scalar_one_or_none()
     if canonical is None:
@@ -176,16 +313,6 @@ async def _load_profile_bundle(
     return canonical, profile, institutions
 
 
-def _profile_is_fresh(profile: AuthorProfile | None, freshness_days: int) -> bool:
-    if profile is None or profile.enriched_at is None:
-        return False
-    cutoff = datetime.now(UTC) - timedelta(days=freshness_days)
-    enriched_at = profile.enriched_at
-    if enriched_at.tzinfo is None:
-        enriched_at = enriched_at.replace(tzinfo=UTC)
-    return enriched_at >= cutoff
-
-
 async def _upsert_profile_from_openalex(
     session: AsyncSession,
     canonical: CanonicalAuthor,
@@ -193,7 +320,6 @@ async def _upsert_profile_from_openalex(
     openalex_payload: dict[str, Any],
     raw_openalex: dict[str, Any],
 ) -> tuple[AuthorProfile, list[CanonicalAuthorInstitution]]:
-    openalex_id = openalex_payload.get("openalex_id")
     topics = extract_openalex_topic_names(raw_openalex)
     h_index = extract_openalex_h_index(raw_openalex)
     orcid = openalex_payload.get("orcid")
@@ -211,6 +337,7 @@ async def _upsert_profile_from_openalex(
     profile.topics = _merge_topics(profile.topics, topics)
     profile.providers = _merge_providers(profile.providers, ["openalex"])
     profile.enriched_at = datetime.now(UTC)
+    _mark_openalex_meta(profile)
     await session.flush()
 
     affiliation_rows = extract_openalex_affiliations(raw_openalex)
@@ -229,23 +356,31 @@ async def _upsert_profile_from_openalex(
 
     for row in affiliation_rows:
         key = row["institution_key"]
+        provider = row.get("provider") or "openalex"
         current = by_key.get(key)
+        if current is not None and current.provider and current.provider != provider:
+            key = f"{provider}:{key}"
+            current = by_key.get(key)
+
         if current is None:
             current = CanonicalAuthorInstitution(
                 id=uuid.uuid4(),
                 canonical_author_id=canonical.id,
                 institution_key=key,
+                provider=provider,
             )
             session.add(current)
             by_key[key] = current
 
         if row.get("institution_name"):
-            current.institution_name = row["institution_name"]
-        if row.get("institution_id"):
+            if not current.institution_name or current.provider == provider:
+                current.institution_name = row["institution_name"]
+        if row.get("institution_id") and not current.institution_id:
             current.institution_id = row["institution_id"]
-        if row.get("country_code"):
+        if row.get("country_code") and not current.country_code:
             current.country_code = row["country_code"]
-        if row.get("department"):
+        # Fill missing department only — never overwrite ORCID/Scopus values.
+        if row.get("department") and not current.department:
             current.department = row["department"]
         if row.get("valid_from_year") is not None:
             current.valid_from_year = _merge_optional_int(
@@ -257,7 +392,8 @@ async def _upsert_profile_from_openalex(
             )
         if row.get("is_current"):
             current.is_current = True
-        current.provider = row.get("provider") or current.provider or "openalex"
+        if not current.provider:
+            current.provider = provider
 
     await session.flush()
 
@@ -265,7 +401,7 @@ async def _upsert_profile_from_openalex(
     return profile, institutions
 
 
-async def _enrich_from_providers(
+async def _enrich_from_openalex(
     session: AsyncSession,
     canonical: CanonicalAuthor,
     profile: AuthorProfile | None,
@@ -296,14 +432,27 @@ async def _enrich_from_providers(
         openalex_payload,
         raw_openalex,
     )
-
     return profile, institutions
+
+
+async def _enrich_lock_for(canonical_id: str) -> asyncio.Lock:
+    async with _enrich_locks_guard:
+        lock = _enrich_locks.get(canonical_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _enrich_locks[canonical_id] = lock
+        return lock
+
+
+def reset_author_summary_enrich_locks_for_tests() -> None:
+    _enrich_locks.clear()
 
 
 async def get_author_summary(
     session: AsyncSession | None,
     canonical_author_id: str,
 ) -> dict[str, Any]:
+    """Return local profile immediately. Sync OpenAlex only when no usable snapshot exists."""
     if session is None:
         raise AuthorSummaryError(
             "Author metadata storage is unavailable.",
@@ -322,24 +471,105 @@ async def get_author_summary(
     if canonical is None:
         raise AuthorSummaryError("Author not found.", status_code=404)
 
-    settings = get_settings()
-    freshness_days = getattr(settings, "author_profile_freshness_days", 14)
-    needs_enrichment = not _profile_is_fresh(profile, freshness_days)
-
-    if needs_enrichment:
-        profile, institutions = await _enrich_from_providers(
+    # Cold start only: block once for OpenAlex base profile so the hover card has metrics.
+    if not _has_usable_profile(profile):
+        profile, institutions = await _enrich_from_openalex(
             session, canonical, profile, institutions
         )
         try:
             await session.commit()
         except Exception:
-            logger.exception("Failed to commit author summary enrichment")
+            logger.exception("Failed to commit author summary OpenAlex sync")
             await session.rollback()
         canonical, profile, institutions = await _load_profile_bundle(
             session, canonical_uuid
         )
+        if canonical is None:
+            raise AuthorSummaryError("Author not found.", status_code=404)
 
     return _build_summary(canonical, profile, institutions)
+
+
+async def enrich_author_summary(
+    session: AsyncSession | None,
+    canonical_author_id: str,
+) -> dict[str, Any]:
+    """Lazy ORCID/Scopus (+ stale OpenAlex) enrichment. Failures never break the card."""
+    if session is None:
+        raise AuthorSummaryError(
+            "Author metadata storage is unavailable.",
+            status_code=503,
+        )
+
+    try:
+        canonical_uuid = uuid.UUID(str(canonical_author_id).strip())
+    except (TypeError, ValueError) as exc:
+        raise AuthorSummaryError(
+            "Invalid canonical author ID.",
+            status_code=422,
+        ) from exc
+
+    lock = await _enrich_lock_for(str(canonical_uuid))
+    async with lock:
+        canonical, profile, institutions = await _load_profile_bundle(
+            session, canonical_uuid
+        )
+        if canonical is None:
+            raise AuthorSummaryError("Author not found.", status_code=404)
+
+        settings = get_settings()
+        oa_ttl = getattr(settings, "author_profile_freshness_days", 14)
+        orcid_ttl = getattr(settings, "author_profile_orcid_enrichment_ttl_days", 14)
+        scopus_ttl = getattr(settings, "author_profile_scopus_enrichment_ttl_days", 30)
+
+        contacted: list[str] = []
+
+        if source_needs_enrichment(profile, "openalex", ttl_days=oa_ttl):
+            before = profile.enriched_at if profile else None
+            profile, institutions = await _enrich_from_openalex(
+                session, canonical, profile, institutions
+            )
+            after = profile.enriched_at if profile else None
+            if after is not None and after != before:
+                contacted.append("openalex")
+
+        if profile is None:
+            profile = AuthorProfile(canonical_author_id=canonical.id)
+            session.add(profile)
+            await session.flush()
+
+        try:
+            if source_needs_enrichment(profile, "orcid", ttl_days=orcid_ttl):
+                if await enrich_from_orcid(session, canonical=canonical, profile=profile):
+                    contacted.append("orcid")
+        except Exception:
+            logger.exception("ORCID enrichment crashed for %s", canonical.id)
+
+        try:
+            if source_needs_enrichment(profile, "scopus", ttl_days=scopus_ttl):
+                if await enrich_from_scopus(session, canonical=canonical, profile=profile):
+                    contacted.append("scopus")
+        except Exception:
+            logger.exception("Scopus enrichment crashed for %s", canonical.id)
+
+        try:
+            await session.commit()
+        except Exception:
+            logger.exception("Failed to commit author summary enrichment")
+            await session.rollback()
+
+        canonical, profile, institutions = await _load_profile_bundle(
+            session, canonical_uuid
+        )
+        if canonical is None:
+            raise AuthorSummaryError("Author not found.", status_code=404)
+
+        summary = _build_summary(canonical, profile, institutions)
+        summary["enrichment"] = {
+            **summary.get("enrichment", {}),
+            "contacted": contacted,
+        }
+        return summary
 
 
 async def get_author_summary_by_openalex_id(
@@ -399,8 +629,24 @@ async def get_author_summary_by_openalex_id(
     except Exception:
         logger.exception("Failed to commit OpenAlex-only author summary")
         await session.rollback()
+        raise AuthorSummaryError(
+            "Author metadata could not be saved.",
+            status_code=503,
+        ) from None
 
-    return _build_summary(canonical, profile, institutions, unresolved=True)
+    # Reload with selectinload — freshly created objects do not have aliases/provider
+    # collections populated in-memory, and lazy load raises MissingGreenlet.
+    loaded_canonical, loaded_profile, loaded_institutions = await _load_profile_bundle(
+        session, canonical.id
+    )
+    if loaded_canonical is None:
+        return _build_summary(canonical, profile, institutions, unresolved=True)
+    return _build_summary(
+        loaded_canonical,
+        loaded_profile or profile,
+        loaded_institutions or institutions,
+        unresolved=True,
+    )
 
 
 async def lookup_canonical_ids_for_openalex_authors(

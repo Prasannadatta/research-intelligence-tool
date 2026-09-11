@@ -42,11 +42,31 @@ export function formatPublicationStatsProgressMessage(progress) {
           : provider;
     return `${label} rate limit reached. Your existing data is safe; please try again shortly.`;
   }
+
+  const ready = detail.authors_ready ?? detail.authorsReady;
+  const authorsTotal = detail.authors_total ?? detail.authorsTotal ?? detail.author_total ?? detail.authorTotal;
+  const authorName = String(detail.author_name || detail.authorName || detail.current_author || "").trim();
   const processed = detail.publications_processed ?? detail.publicationsProcessed;
   const total = detail.publications_total ?? detail.publicationsTotal;
   const stage = String(progress?.stage || "Preparing")
     .replace(/[.…]+\s*$/, "")
     .trim();
+  const authorsTotalNumber = Number(authorsTotal);
+
+  if (ready != null && Number.isFinite(authorsTotalNumber) && authorsTotalNumber > 0) {
+    const readyLabel = `${Number(ready).toLocaleString()} of ${authorsTotalNumber.toLocaleString()} authors ready`;
+    // Large cohorts: keep the message stable (no rapidly changing per-author detail).
+    if (authorsTotalNumber >= 20) {
+      return readyLabel;
+    }
+    if (authorName && processed != null && total != null) {
+      return `${readyLabel} — syncing ${authorName} (${Number(processed).toLocaleString()} / ${Number(total).toLocaleString()})`;
+    }
+    if (authorName) {
+      return `${readyLabel} — syncing ${authorName}`;
+    }
+    return readyLabel;
+  }
 
   if (processed != null && total != null) {
     return `Syncing publications — ${Number(processed).toLocaleString()} / ${Number(total).toLocaleString()}`;
@@ -90,12 +110,14 @@ export function formatPublicationStatsErrorMessage(error) {
 export async function fetchAuthorPublicationCorpusStats({
   authors,
   filters,
+  retryIncompleteOnly = false,
   signal,
   onProgress,
 } = {}) {
   const created = await createAuthorPublicationStatsJob({
     authors,
     filters,
+    retryIncompleteOnly,
     signal,
   });
   onProgress?.(created);

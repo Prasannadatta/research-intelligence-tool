@@ -36,6 +36,8 @@ class AuthorProfile(Base):
     h_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
     topics: Mapped[list[Any] | None] = mapped_column(JSONType, nullable=True)
     providers: Mapped[list[Any] | None] = mapped_column(JSONType, nullable=True)
+    # Per-source enrichment timestamps, e.g. {"openalex": "...", "orcid": "...", "scopus": "..."}.
+    enrichment_meta: Mapped[dict[str, Any] | None] = mapped_column(JSONType, nullable=True)
     enriched_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

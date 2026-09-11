@@ -99,7 +99,7 @@ const WorkCard = memo(function WorkCard({ option }) {
               bgcolor: "action.hover",
               color: "text.secondary",
               fontWeight: 600,
-              letterSpacing: 0.02,
+              letterSpacing: "0.02em",
             }}
           >
             arXiv

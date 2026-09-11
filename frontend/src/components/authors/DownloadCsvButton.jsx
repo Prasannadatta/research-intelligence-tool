@@ -59,6 +59,8 @@ export default function DownloadCsvButton({
   disabled = false,
   onExport,
   helperText = "Exports all filtered publications with available author, institution, grant, venue, and source metadata.",
+  compact = false,
+  sx = undefined,
 }) {
   const [exporting, setExporting] = useState(false);
   const [error, setError] = useState(null);
@@ -95,7 +97,7 @@ export default function DownloadCsvButton({
   }, [disabled, exporting, onExport]);
 
   return (
-    <Box sx={{ mt: 2, mb: 1 }}>
+    <Box sx={compact ? { display: "inline-flex", flexDirection: "column", ...sx } : { mt: 2, mb: 1, ...sx }}>
       <Button
         variant="outlined"
         color="inherit"
@@ -111,19 +113,26 @@ export default function DownloadCsvButton({
         onClick={handleClick}
         disabled={disabled || exporting}
         data-testid="download-csv-button"
-        sx={{ textTransform: "none" }}
+        sx={{ textTransform: "none", whiteSpace: "nowrap" }}
       >
         {exporting ? "Preparing CSV…" : "Download CSV"}
       </Button>
-      <Typography
-        variant="caption"
-        color="text.secondary"
-        sx={{ display: "block", mt: 0.75, lineHeight: 1.4 }}
-      >
-        {helperText}
-      </Typography>
+      {!compact && helperText ? (
+        <Typography
+          variant="caption"
+          color="text.secondary"
+          sx={{ display: "block", mt: 0.75, lineHeight: 1.4 }}
+        >
+          {helperText}
+        </Typography>
+      ) : null}
       {error ? (
-        <Alert severity="error" sx={{ mt: 1.5 }} onClose={() => setError(null)}>
+        <Alert
+          severity="warning"
+          variant="outlined"
+          sx={{ mt: compact ? 1 : 1.5, maxWidth: compact ? 280 : "100%" }}
+          onClose={() => setError(null)}
+        >
           {error}
         </Alert>
       ) : null}

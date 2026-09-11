@@ -101,18 +101,30 @@ class WorkPersistenceService:
         """
         Resolve or create a canonical work.
 
-        Priority: existing provider record → DOI → arXiv ID → PMID →
-        normalized title + year + first author. Never merge on title alone.
-
-        Existing provider records are returned as-is to avoid rewriting unchanged
-        works on every analysis/timeline page fetch (critical for SQLite locking).
+        Conservative merge priority:
+        1. existing provider record
+        2. same DOI
+        3. same arXiv ID
+        4. same PMID
+        5. title + first author + year + month (all required; month precision
+           must agree). Same title + year alone is never enough. When month is
+           unavailable, prefer keeping possible duplicates.
         """
         existing_record = await self.repo.get_provider_record(
             candidate.provider,
             candidate.provider_work_id,
         )
         if existing_record is not None and existing_record.canonical_work is not None:
-            return existing_record.canonical_work, False
+            canonical = existing_record.canonical_work
+            # Refresh the provider snapshot and upsert grants additively. Do not
+            # recreate the canonical work or wipe other providers' grant rows.
+            await self.repo.upsert_provider_record(candidate, canonical)
+            await self.persist_grants_from_raw_metadata(
+                canonical_work_id=canonical.id,
+                provider=candidate.provider,
+                raw_metadata=candidate.raw_metadata,
+            )
+            return canonical, False
 
         canonical = None
         if candidate.doi:
@@ -122,9 +134,10 @@ class WorkPersistenceService:
         if canonical is None and candidate.pmid:
             canonical = await self.repo.find_canonical_by_pmid(candidate.pmid)
         if canonical is None:
-            canonical = await self.repo.find_canonical_by_title_year_author(
+            canonical = await self.repo.find_canonical_by_title_author_strong_timing(
                 normalized_title=candidate.normalized_title,
                 publication_year=candidate.publication_year,
+                publication_month=candidate.publication_month,
                 normalized_first_author=candidate.normalized_first_author,
             )
 
@@ -142,7 +155,166 @@ class WorkPersistenceService:
             provider_work_id=candidate.provider_work_id,
             raw_metadata=candidate.raw_metadata,
         )
+        await self.persist_grants_from_raw_metadata(
+            canonical_work_id=canonical.id,
+            provider=candidate.provider,
+            raw_metadata=candidate.raw_metadata,
+        )
         return canonical, created
+
+    async def persist_grants_from_raw_metadata(
+        self,
+        *,
+        canonical_work_id: uuid.UUID,
+        provider: str,
+        raw_metadata: dict[str, Any] | None,
+    ) -> int:
+        """Upsert source-aware grant rows from a provider work snapshot.
+
+        Additive only — never deletes existing WorkGrantMatch rows (including
+        OpenAlex grants when a later arXiv/Scopus enrichment overlay is attached).
+        """
+        from app.services.work_persistence.normalization import normalize_grant_number
+
+        if not isinstance(raw_metadata, dict):
+            return 0
+
+        pending: list[dict[str, Any]] = []
+        seen_normalized: set[str] = set()
+        grants = raw_metadata.get("grants")
+        if isinstance(grants, list):
+            for item in grants:
+                if not isinstance(item, dict):
+                    continue
+                award_id = (
+                    item.get("award_id")
+                    or item.get("grant_number")
+                    or item.get("funder_award_id")
+                )
+                if not award_id:
+                    continue
+                verified_default = provider == "openalex"
+                match_default = (
+                    "structured_award_relationship"
+                    if provider == "openalex"
+                    else "metadata_text_match"
+                )
+                cleaned = " ".join(str(award_id).split()).strip()
+                normalized = normalize_grant_number(cleaned)
+                if not cleaned or not normalized or normalized in seen_normalized:
+                    continue
+                seen_normalized.add(normalized)
+                funder = item.get("funder_name") or item.get("funder")
+                if isinstance(funder, dict):
+                    funder = funder.get("display_name")
+                grant_meta = {
+                    "funder_name": " ".join(str(funder).split()) if funder else None,
+                    "award_id": cleaned,
+                    "provider": item.get("provider") or provider,
+                    "verified": bool(item.get("verified", verified_default)),
+                    "match_type": item.get("match_type") or match_default,
+                }
+                pending.append(
+                    {
+                        "grant_number": cleaned,
+                        "normalized_grant_number": normalized,
+                        "verified": bool(item.get("verified", verified_default)),
+                        "match_type": item.get("match_type") or match_default,
+                        "raw_metadata": grant_meta,
+                    }
+                )
+
+        matched = raw_metadata.get("matched_grant_number")
+        if matched:
+            cleaned = " ".join(str(matched).split()).strip()
+            normalized = normalize_grant_number(cleaned)
+            if cleaned and normalized and normalized not in seen_normalized:
+                seen_normalized.add(normalized)
+                grant_match = (
+                    raw_metadata.get("grant_match")
+                    if isinstance(raw_metadata.get("grant_match"), dict)
+                    else {}
+                )
+                verified_default = provider == "openalex"
+                match_default = (
+                    "structured_award_relationship"
+                    if provider == "openalex"
+                    else "metadata_text_match"
+                )
+                pending.append(
+                    {
+                        "grant_number": cleaned,
+                        "normalized_grant_number": normalized,
+                        "verified": bool(
+                            grant_match.get("verified")
+                            if grant_match.get("verified") is not None
+                            else verified_default
+                        ),
+                        "match_type": str(grant_match.get("type") or match_default),
+                        "raw_metadata": {
+                            "award_id": cleaned,
+                            "provider": provider,
+                            **grant_match,
+                        },
+                    }
+                )
+
+        persisted = 0
+        for row in pending:
+            await self.repo.upsert_grant_match(
+                canonical_work_id=canonical_work_id,
+                provider=provider,
+                grant_number=row["grant_number"],
+                normalized_grant_number=row["normalized_grant_number"],
+                verified=row["verified"],
+                match_type=row["match_type"],
+                matched_text=None,
+                raw_metadata=row["raw_metadata"],
+            )
+            persisted += 1
+        return persisted
+
+    async def attach_enrichment_to_existing(
+        self,
+        *,
+        canonical_work_id: uuid.UUID,
+        candidate: WorkCandidate,
+    ) -> CanonicalWork | None:
+        """Upsert provider metadata onto an existing canonical work only.
+
+        Never creates a new CanonicalWork row. Does not rewrite authorships —
+        enrichment overlays store citation/journal/preprint fields on
+        ProviderWorkRecord.raw_metadata keyed by provider.
+        """
+        canonical = await self.session.get(CanonicalWork, canonical_work_id)
+        if canonical is None:
+            return None
+
+        # Trust only stable ID agreement when both sides have the identifier.
+        if candidate.doi and canonical.doi and candidate.doi != canonical.doi:
+            logger.info(
+                "enrichment_doi_mismatch canonical=%s candidate_doi=%s work_doi=%s",
+                canonical_work_id,
+                candidate.doi,
+                canonical.doi,
+            )
+            return None
+        if (
+            candidate.arxiv_id
+            and canonical.arxiv_id
+            and candidate.arxiv_id != canonical.arxiv_id
+        ):
+            logger.info(
+                "enrichment_arxiv_mismatch canonical=%s candidate=%s work=%s",
+                canonical_work_id,
+                candidate.arxiv_id,
+                canonical.arxiv_id,
+            )
+            return None
+
+        self.repo.enrich_canonical_work(canonical, candidate)
+        await self.repo.upsert_provider_record(candidate, canonical)
+        return canonical
 
     async def get_cached_provider_response(
         self,

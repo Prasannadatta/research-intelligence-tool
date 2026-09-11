@@ -24,6 +24,29 @@ export function publicationSortKey(sort) {
   return `${normalized.sortBy}:${normalized.sortDirection}`;
 }
 
+const SORT_FIELD_LABELS = {
+  [PUBLICATION_SORT_FIELDS.YEAR]: "Year",
+  [PUBLICATION_SORT_FIELDS.CITATIONS]: "Citations",
+  [PUBLICATION_SORT_FIELDS.TITLE]: "Title",
+  [PUBLICATION_SORT_FIELDS.VENUE]: "Venue",
+  [PUBLICATION_SORT_FIELDS.AUTHOR_COUNT]: "Authors",
+};
+
+export function isDefaultPublicationSort(sort) {
+  const normalized = normalizePublicationSort(sort);
+  return (
+    normalized.sortBy === DEFAULT_PUBLICATION_SORT.sortBy
+    && normalized.sortDirection === DEFAULT_PUBLICATION_SORT.sortDirection
+  );
+}
+
+export function publicationSortChipLabel(sort) {
+  const normalized = normalizePublicationSort(sort);
+  const field = SORT_FIELD_LABELS[normalized.sortBy] || normalized.sortBy;
+  const direction = normalized.sortDirection === "asc" ? "ascending" : "descending";
+  return `Sorted by ${field} (${direction})`;
+}
+
 export function nextPublicationSort(current, field) {
   const normalized = normalizePublicationSort(current);
   if (normalized.sortBy !== field) {

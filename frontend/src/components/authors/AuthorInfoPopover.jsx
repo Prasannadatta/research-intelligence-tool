@@ -10,90 +10,37 @@ import {
 import { useNavigate } from "react-router-dom";
 import {
   Box,
+  Button,
   CircularProgress,
   Popover,
   Typography,
 } from "@mui/material";
 
 import {
+  enrichAuthorSummary,
   fetchAuthorSummary,
   getAuthorLookupKey,
   getAuthorSummaryCacheKey,
   getCachedAuthorSummary,
 } from "./authorSummaryCache";
+import {
+  buildPublicationInstitution,
+  formatNumberValue,
+  formatProviderLabel,
+  formatTextValue,
+  getCurrentInstitution,
+} from "./authorSummaryDisplay";
 
 const OPEN_DELAY_MS = 250;
 const CLOSE_DELAY_MS = 250;
 
 const AuthorInfoPopoverContext = createContext(null);
 
-function cleanText(value) {
-  if (value == null) {
-    return null;
-  }
-  const text = String(value).replace(/\s+/g, " ").trim();
-  return text || null;
-}
-
 function normalizeComparableText(value) {
-  return cleanText(value)?.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim() || "";
-}
-
-function buildPublicationInstitution(author) {
-  if (!author || typeof author !== "object") {
-    return null;
-  }
-  const institutions = Array.isArray(author.institutions) ? author.institutions : [];
-  const firstInstitution = institutions.find((row) => row);
-  const countries = Array.isArray(author.countries) ? author.countries : [];
-
-  let name = null;
-  let department = cleanText(author.department);
-  let countryCode = cleanText(countries[0]);
-  let source = cleanText(author.affiliationSource || author.affiliation_source);
-
-  if (typeof firstInstitution === "string") {
-    name = cleanText(firstInstitution);
-  } else if (firstInstitution && typeof firstInstitution === "object") {
-    name = cleanText(
-      firstInstitution.name
-        || firstInstitution.display_name
-        || firstInstitution.institution_name,
-    );
-    department = department || cleanText(firstInstitution.department);
-    countryCode = countryCode || cleanText(firstInstitution.country_code || firstInstitution.country);
-    source = source || cleanText(
-      firstInstitution.affiliation_source || firstInstitution.source,
-    );
-  }
-
-  if (!name && !department && !countryCode) {
-    return null;
-  }
-  return {
-    name,
-    department,
-    country_code: countryCode,
-    source,
-    publicationSpecific: true,
-  };
-}
-
-function getCurrentInstitution(summary) {
-  const institutions = Array.isArray(summary?.institutions) ? summary.institutions : [];
-  return institutions.find((row) => row?.current) || institutions[0] || null;
-}
-
-function formatProvider(value) {
-  const text = cleanText(value);
-  if (!text) {
-    return null;
-  }
-  const labels = {
-    openalex: "OpenAlex",
-    arxiv: "arXiv",
-  };
-  return labels[text.toLowerCase()] || text;
+  return formatTextValue(value, "")
+    ?.toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim() || "";
 }
 
 function providerFromAuthor(author) {
@@ -101,7 +48,7 @@ function providerFromAuthor(author) {
     return null;
   }
   if (author.provider) {
-    return formatProvider(author.provider);
+    return formatProviderLabel(author.provider);
   }
   if (author.providerIds?.openalex?.length > 0) {
     return "OpenAlex";
@@ -112,19 +59,15 @@ function providerFromAuthor(author) {
   return null;
 }
 
-function formatNumberValue(value) {
-  if (value == null || value === "") {
-    return "—";
+function resolveCanonicalAuthorId(summary, activeAuthor) {
+  const fromSummary = summary?.id ? String(summary.id).trim() : "";
+  if (fromSummary) {
+    return fromSummary;
   }
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) {
-    return "—";
-  }
-  return numeric.toLocaleString();
-}
-
-function formatTextValue(value) {
-  return cleanText(value) || "N/A";
+  const fromAuthor = activeAuthor?.canonicalAuthorId
+    ? String(activeAuthor.canonicalAuthorId).trim()
+    : "";
+  return fromAuthor || null;
 }
 
 function DetailRow({ label, value, text = false }) {
@@ -153,7 +96,7 @@ function buildCompactSummary(summary, activeAuthor) {
   const primaryInstitution = publicationInstitution || currentInstitution;
   const provider =
     (Array.isArray(summary?.providers) && summary.providers.length > 0
-      ? summary.providers.map(formatProvider).filter(Boolean).join(", ")
+      ? summary.providers.map(formatProviderLabel).filter(Boolean).join(", ")
       : null)
     || providerFromAuthor(activeAuthor);
 
@@ -202,9 +145,19 @@ function CompactAuthorSummary({ summary, activeAuthor }) {
   );
 }
 
-function AuthorSummaryContent({ summary, loading, error, activeAuthor }) {
+function AuthorSummaryContent({
+  summary,
+  loading,
+  error,
+  activeAuthor,
+  onViewDetails,
+}) {
+  const canonicalAuthorId = resolveCanonicalAuthorId(summary, activeAuthor);
+  const showViewDetails = Boolean(canonicalAuthorId && onViewDetails);
+
+  let body = null;
   if (loading) {
-    return (
+    body = (
       <Box sx={{ display: "flex", alignItems: "center", gap: 1.25, py: 0.5 }}>
         <CircularProgress size={16} aria-hidden="true" />
         <Typography variant="body2" color="text.secondary">
@@ -212,17 +165,41 @@ function AuthorSummaryContent({ summary, loading, error, activeAuthor }) {
         </Typography>
       </Box>
     );
-  }
-
-  if (error) {
-    return (
+  } else if (error) {
+    body = (
       <Typography variant="body2" color="error">
         {error}
       </Typography>
     );
+  } else {
+    body = <CompactAuthorSummary summary={summary} activeAuthor={activeAuthor} />;
   }
 
-  return <CompactAuthorSummary summary={summary} activeAuthor={activeAuthor} />;
+  return (
+    <Box sx={{ display: "grid", gap: 1 }}>
+      {body}
+      {showViewDetails ? (
+        <Box sx={{ display: "flex", justifyContent: "flex-end", pt: 0.25 }}>
+          <Button
+            size="small"
+            variant="text"
+            onClick={() => onViewDetails(canonicalAuthorId)}
+            aria-label="View details"
+            sx={{
+              minWidth: 0,
+              px: 0.75,
+              py: 0.25,
+              textTransform: "none",
+              fontWeight: 600,
+              lineHeight: 1.3,
+            }}
+          >
+            View details
+          </Button>
+        </Box>
+      ) : null}
+    </Box>
+  );
 }
 
 function useAuthorInfoPopover() {
@@ -230,6 +207,7 @@ function useAuthorInfoPopover() {
 }
 
 export function AuthorInfoPopoverProvider({ children }) {
+  const navigate = useNavigate();
   const [anchorEl, setAnchorEl] = useState(null);
   const [activeAuthorKey, setActiveAuthorKey] = useState(null);
   const [activeAuthor, setActiveAuthor] = useState(null);
@@ -376,6 +354,15 @@ export function AuthorInfoPopoverProvider({ children }) {
     scheduleClose();
   }, [scheduleClose]);
 
+  const handleViewDetails = useCallback((canonicalAuthorId) => {
+    const id = String(canonicalAuthorId || "").trim();
+    if (!id) {
+      return;
+    }
+    closeImmediately();
+    navigate(`/authors/${id}`);
+  }, [closeImmediately, navigate]);
+
   useEffect(() => {
     if (!open || !activeAuthorKey || !anchorElRef.current) {
       return;
@@ -421,12 +408,38 @@ export function AuthorInfoPopoverProvider({ children }) {
       return undefined;
     }
 
-    const cached = getCachedAuthorSummary(author);
-    if (cached) {
-      setSummary(cached);
+    let cancelled = false;
+    const authorKeyAtStart = activeAuthorKey;
+
+    const applySummary = (data) => {
+      if (cancelled || fetchAuthorKeyRef.current !== authorKeyAtStart) {
+        return;
+      }
+      setSummary(data);
       setLoading(false);
       setError(null);
-      return undefined;
+    };
+
+    const maybeEnrich = (data) => {
+      if (!data?.enrichment?.pending?.length) {
+        return;
+      }
+      // Do not abort enrichment on hover leave — warms cache for the next open.
+      enrichAuthorSummary(author, { summary: data }).then((enriched) => {
+        if (!enriched || cancelled || fetchAuthorKeyRef.current !== authorKeyAtStart) {
+          return;
+        }
+        setSummary(enriched);
+      });
+    };
+
+    const cached = getCachedAuthorSummary(author);
+    if (cached) {
+      applySummary(cached);
+      maybeEnrich(cached);
+      return () => {
+        cancelled = true;
+      };
     }
 
     setSummary(null);
@@ -437,14 +450,11 @@ export function AuthorInfoPopoverProvider({ children }) {
 
     fetchAuthorSummary(author, { signal: controller.signal })
       .then((data) => {
-        if (fetchAuthorKeyRef.current !== activeAuthorKey) {
-          return;
-        }
-        setSummary(data);
-        setLoading(false);
+        applySummary(data);
+        maybeEnrich(data);
       })
       .catch((err) => {
-        if (fetchAuthorKeyRef.current !== activeAuthorKey) {
+        if (cancelled || fetchAuthorKeyRef.current !== authorKeyAtStart) {
           return;
         }
         if (err?.name === "CanceledError" || err?.code === "ERR_CANCELED") {
@@ -455,6 +465,7 @@ export function AuthorInfoPopoverProvider({ children }) {
       });
 
     return () => {
+      cancelled = true;
       controller.abort();
     };
   }, [activeAuthorKey]);
@@ -514,8 +525,8 @@ export function AuthorInfoPopoverProvider({ children }) {
           summary={summary}
           loading={loading}
           error={error}
-          unresolved={Boolean(activeAuthor?.unresolved)}
           activeAuthor={activeAuthor}
+          onViewDetails={handleViewDetails}
         />
       </Popover>
     </AuthorInfoPopoverContext.Provider>
@@ -524,17 +535,13 @@ export function AuthorInfoPopoverProvider({ children }) {
 
 export function AuthorNameLink({ author, name }) {
   const popover = useAuthorInfoPopover();
-  const navigate = useNavigate();
   const displayName = name || author?.name || "Unknown author";
-  const href = author?.canonicalAuthorId ? `/authors/${author.canonicalAuthorId}` : null;
   const authorKey = getAuthorLookupKey(author);
 
   const handleClick = (event) => {
-    if (!href) {
-      return;
-    }
+    // Names no longer navigate; click only opens the hover card immediately.
     event.preventDefault();
-    navigate(href);
+    popover?.handleAuthorFocus?.(event, author);
   };
 
   return (
@@ -543,7 +550,7 @@ export function AuthorNameLink({ author, name }) {
       type="button"
       data-author-key={authorKey}
       className="author-name-interactive"
-      aria-label={href ? `View profile for ${displayName}` : `Author details for ${displayName}`}
+      aria-label={`Author details for ${displayName}`}
       onMouseEnter={(event) => popover?.handleAuthorMouseEnter(event, author)}
       onMouseLeave={() => popover?.handleAuthorMouseLeave()}
       onFocus={(event) => popover?.handleAuthorFocus(event, author)}

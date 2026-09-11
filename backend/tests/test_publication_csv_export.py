@@ -426,8 +426,17 @@ def test_citation_fallback_to_provider_metadata_preserves_zero():
 
 def test_sources_use_human_labels():
     row = publication_item_to_row_dict(
-        _work(work_id="W1", title="Labeled", providers=["openalex", "arxiv"])
+        _work(
+            work_id="W1",
+            title="Labeled",
+            providers=["openalex"],
+        )
+        | {
+            "openalex_id": "W1",
+            "arxiv_id": "2401.00001",
+        }
     )
+    # arXiv contributed an id even though providers[] only listed OpenAlex.
     assert row["Sources"] == "OpenAlex | arXiv"
 
 

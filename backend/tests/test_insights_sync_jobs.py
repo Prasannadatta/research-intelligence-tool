@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -36,6 +35,7 @@ def _settings(monkeypatch):
     monkeypatch.setenv("OPENALEX_API_KEY", "test-key")
     monkeypatch.setenv("ARXIV_ENABLED", "false")
     monkeypatch.setenv("AUTHOR_WORK_SYNC_TTL_SECONDS", str(18 * 60 * 60))
+    monkeypatch.setenv("PUBLICATION_ENRICHMENT_ENABLED", "false")
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()
@@ -188,6 +188,78 @@ async def test_insights_job_skips_provider_http_for_fresh_complete_author(
     assert client.get(f"/api/analysis/authors/insights/jobs/{job_id2}").json()["status"] == "completed"
     assert first_ms < 2000
     assert second_ms < 2000
+    # Fresh verified corpus: remount reuses the completed Insights job.
+    assert job_id == job_id2
+
+
+@pytest.mark.asyncio
+async def test_insights_job_reuses_in_flight_for_same_fingerprint(session_factory, monkeypatch):
+    scheduled = _hold_scheduler(monkeypatch)
+    monkeypatch.setattr(insights_jobs, "SessionLocal", session_factory)
+
+    async with session_factory() as session:
+        author = await _seed_author(session, name="Inflight Insights", openalex_id="II1")
+        await session.commit()
+        author_id = author.id
+
+    payload = {"authors": [_author_payload(author_id, "Inflight Insights")]}
+    first = client.post("/api/analysis/authors/insights/jobs", json=payload)
+    second = client.post("/api/analysis/authors/insights/jobs", json=payload)
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["job_id"] == second.json()["job_id"]
+    assert len(scheduled) == 1
+
+
+@pytest.mark.asyncio
+async def test_insights_filter_change_skips_sync_when_corpus_fresh(session_factory, monkeypatch):
+    _hold_scheduler(monkeypatch)
+    monkeypatch.setattr(insights_jobs, "SessionLocal", session_factory)
+
+    async with session_factory() as session:
+        author = await _seed_author(session, name="Filter Insights", openalex_id="FI1")
+        await _seed_work(
+            session,
+            title="Stored",
+            year=2022,
+            provider_work_id="FIW1",
+            selected_authors=[author],
+        )
+        now = datetime.now(timezone.utc)
+        session.add(
+            AuthorWorkSyncState(
+                id=uuid.uuid4(),
+                canonical_author_id=author.id,
+                provider="openalex",
+                last_synced_at=now,
+                last_successful_synced_at=now,
+                last_attempted_at=now,
+                stored_work_count=1,
+                provider_work_count=1,
+                status="complete",
+            )
+        )
+        await session.commit()
+        author_id = author.id
+
+    with patch(
+        "app.services.analysis.author_work_sync.search_works_by_author_ids",
+        new_callable=AsyncMock,
+    ) as mock_fetch:
+        created = client.post(
+            "/api/analysis/authors/insights/jobs",
+            json={
+                "authors": [_author_payload(author_id, "Filter Insights")],
+                "filters": {"from_year": 2020},
+            },
+        )
+        job_id = created.json()["job_id"]
+        await run_insights_job(job_id)
+
+    done = client.get(f"/api/analysis/authors/insights/jobs/{job_id}").json()
+    assert done["status"] == "completed"
+    assert done["result"]["coverage"]["corpus_complete"] is True
+    assert mock_fetch.await_count == 0
 
 
 @pytest.mark.asyncio
@@ -427,6 +499,36 @@ async def test_insights_job_progress_includes_author_and_counts(session_factory,
         },
     ]
 
+    original_execute = insights_jobs.InsightsJobService.execute
+
+    async def execute_with_progress_capture(self, job_id: str) -> None:
+        job_uuid = uuid.UUID(str(job_id))
+        real_commit = self.session.commit
+
+        async def commit_and_sample():
+            await real_commit()
+            job = await self.get_job(job_uuid)
+            if job is not None:
+                progress_events.append(
+                    {
+                        "stage": job.progress_stage,
+                        "detail": (
+                            job.progress_detail
+                            if isinstance(job.progress_detail, dict)
+                            else {}
+                        ),
+                        "status": job.status,
+                    }
+                )
+
+        self.session.commit = commit_and_sample  # type: ignore[method-assign]
+        try:
+            await original_execute(self, job_id)
+        finally:
+            self.session.commit = real_commit  # type: ignore[method-assign]
+
+    monkeypatch.setattr(insights_jobs.InsightsJobService, "execute", execute_with_progress_capture)
+
     with patch(
         "app.services.analysis.author_work_sync.search_works_by_author_ids",
         new_callable=AsyncMock,
@@ -437,24 +539,7 @@ async def test_insights_job_progress_includes_author_and_counts(session_factory,
             json={"authors": [_author_payload(author.id, "Martin Head-Gordon")]},
         )
         job_id = created.json()["job_id"]
-
-        async def run_and_sample():
-            task = asyncio.create_task(run_insights_job(job_id))
-            for _ in range(100):
-                await asyncio.sleep(0.02)
-                row = client.get(f"/api/analysis/authors/insights/jobs/{job_id}").json()
-                progress_events.append(
-                    {
-                        "stage": row.get("progress_stage"),
-                        "detail": row.get("progress_detail"),
-                        "status": row.get("status"),
-                    }
-                )
-                if row.get("status") in {"completed", "failed"}:
-                    break
-            await task
-
-        await run_and_sample()
+        await run_insights_job(job_id)
 
     done = client.get(f"/api/analysis/authors/insights/jobs/{job_id}").json()
     assert done["status"] == "completed"

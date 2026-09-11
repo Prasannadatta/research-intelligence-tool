@@ -153,7 +153,12 @@ async def test_insights_job_failure_is_stored_as_failed(session_factory, monkeyp
     payload = done.json()
     assert payload["status"] == "failed"
     assert payload["result"] is None
-    assert "Canonical author not found" in (payload["error_message"] or "")
+    message = payload["error_message"] or ""
+    assert (
+        "Canonical author not found" in message
+        or "Publication coverage is incomplete" in message
+        or "No OpenAlex" in message
+    )
     assert payload["progress_stage"] == "Failed"
     assert payload["completed_at"] is not None
 

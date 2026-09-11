@@ -34,10 +34,64 @@ from app.services.analysis.author_insights import (
     build_insights_combinations,
     stable_author_combination_id,
 )
+from app.services.analysis.author_work_sync import STATUS_COMPLETE
 from app.services.work_persistence.candidate import candidate_from_provider_result
 from app.services.work_persistence.service import WorkPersistenceService
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _insights_http_uses_verified_local_corpus(monkeypatch):
+    """Legacy Insights HTTP tests seed local works; skip live OpenAlex sync/enrichment."""
+
+    async def _fake_sync(self, authors, **kwargs):
+        return [
+            {
+                "canonical_author_id": str(row.get("canonical_author_id")),
+                "provider": "openalex",
+                "display_name": row.get("display_name") or "Selected author",
+                "stored_work_count_before": 0,
+                "existing_links_repaired": 0,
+                "fetched_work_count": 0,
+                "new_works": 0,
+                "stored_work_count_after": 0,
+                "provider_work_count": 0,
+                "status": STATUS_COMPLETE,
+                "network_skipped": True,
+                "error_message": None,
+                "rate_limited": False,
+                "coverage_verified": True,
+                "resume_cursor": None,
+                "last_synced_at": None,
+            }
+            for row in authors
+            if isinstance(row, dict) and row.get("canonical_author_id")
+        ]
+
+    async def _fake_enrich(session, authors):
+        return {
+            "provider_calls": {"arxiv": 0, "scopus": 0, "openalex": 0, "orcid": 0},
+            "cache_hits": {"arxiv": 0, "scopus": 0},
+            "enriched": {"arxiv": 0, "scopus": 0},
+            "skipped": {"disabled": 1},
+            "created_canonical_works": 0,
+            "elapsed_ms": {"arxiv": 0.0, "scopus": 0.0, "total": 0.0},
+            "works_considered": 0,
+            "works_attempted": 0,
+        }
+
+    monkeypatch.setattr(
+        "app.services.analysis.author_work_sync.AuthorWorkSyncService.synchronize_selected_authors",
+        _fake_sync,
+    )
+    monkeypatch.setattr(
+        "app.api.routes.analysis.enrich_selected_authors_publications",
+        _fake_enrich,
+    )
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 @pytest_asyncio.fixture
@@ -1462,7 +1516,15 @@ async def test_combination_drilldown_empty_combination_returns_empty_items(sessi
 
     assert response.status_code == 200
     assert response.json()["items"] == []
-    assert response.json()["pagination"] == {"next_cursor": None, "has_more": False}
+    assert response.json()["pagination"] == {
+        "next_cursor": None,
+        "has_more": False,
+        "page": 1,
+        "offset": 0,
+        "limit": 20,
+        "total": None,
+        "corpus_source": None,
+    }
 
 
 @pytest.mark.asyncio
@@ -1718,7 +1780,12 @@ async def test_endpoint_returns_complete_dashboard_response_shape(session_factor
         "default_combination_id",
         "institution_data_quality",
         "facets",
+        "coverage",
+        "enrichment",
     }
+    assert payload["coverage"]["corpus_complete"] is True
+    assert payload["coverage"]["enrichment_affects_completeness"] is False
+    assert payload["enrichment"] is not None
     assert set(payload["metrics"].keys()) == {
         "total_unique_publications",
         "multi_selected_author_publications",
@@ -1939,7 +2006,9 @@ async def test_existing_provider_record_short_circuit_preserves_sqlite_locking_f
 
     assert again.id == canonical.id
     assert created_again is False
-    assert record.raw_metadata["title"] == "Locking Fix Paper"
+    # Existing provider-work short-circuit may refresh raw metadata, but must not
+    # recreate authorship rows (the historical SQLite locking failure mode).
+    assert record.raw_metadata["title"] == "Locking Fix Paper Updated"
     assert authorship_count == 1
 
 

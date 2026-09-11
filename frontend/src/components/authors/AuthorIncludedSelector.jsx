@@ -10,7 +10,7 @@ function AuthorIncludedSelector({
   sx,
 }) {
   return (
-    <Box sx={{ mb: 2.5, ...sx }} data-testid={dataTestId}>
+    <Box sx={{ mb: 1.5, ...sx }} data-testid={dataTestId}>
       <Typography
         variant="body2"
         color="text.secondary"

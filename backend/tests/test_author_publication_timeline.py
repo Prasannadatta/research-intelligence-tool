@@ -144,7 +144,7 @@ def test_build_timeline_exposes_matching_and_dated_totals():
     assert sum(row["count"] for row in timeline["items"]) == 1
 
 
-def test_single_author_endpoint_timeline_uses_fetched_page_only(monkeypatch):
+def test_single_author_endpoint_omits_timeline_on_live_table_request(monkeypatch):
     monkeypatch.setenv("ARXIV_ENABLED", "false")
     get_settings.cache_clear()
     page_one = [
@@ -211,16 +211,14 @@ def test_single_author_endpoint_timeline_uses_fetched_page_only(monkeypatch):
     body = response.json()
     assert body["mode"] == "single_author"
     assert len(body["items"]) == 1
-    assert body["timeline"] is not None
-    assert body["timeline"]["interval"] == "month"
-    assert body["timeline"]["total_dated_publications"] == 1
-    assert body["timeline"]["total_matching_publications"] == 1
-    assert sum(row["count"] for row in body["timeline"]["items"]) == 1
+    # Live table requests no longer compute page-scoped timelines.
+    assert body["timeline"] is None
+    assert body["facets"]["sources"] == []
     assert body["pagination"]["has_more"] is True
     assert mock_oa.await_count == 1
 
 
-def test_multi_author_timeline_uses_common_publications_only(monkeypatch):
+def test_multi_author_live_table_omits_timeline(monkeypatch):
     monkeypatch.setenv("ARXIV_ENABLED", "false")
     get_settings.cache_clear()
     with patch(
@@ -271,7 +269,8 @@ def test_multi_author_timeline_uses_common_publications_only(monkeypatch):
     assert response.status_code == 200
     body = response.json()
     assert body["mode"] == "common_publications"
-    assert body["timeline"]["items"][0]["count"] == 1
+    assert body["timeline"] is None
+    assert len(body["items"]) == 1
     assert mock_oa.await_args.kwargs["author_id_groups"] == [
         ["A1111111111"],
         ["A2222222222"],

@@ -5,7 +5,7 @@ import { ThemeProvider, createTheme } from "@mui/material/styles";
 
 import AuthorPublicationsTable from "./AuthorPublicationsTable";
 import { AuthorInfoPopoverProvider, AuthorNameLink } from "./AuthorInfoPopover";
-import { clearAuthorSummaryCache, fetchAuthorSummary } from "./authorSummaryCache";
+import { clearAuthorSummaryCache, enrichAuthorSummary, fetchAuthorSummary } from "./authorSummaryCache";
 import * as authorSummaryApi from "../../api/authorSummaryApi";
 
 vi.mock("../../api/authorSummaryApi");
@@ -51,6 +51,7 @@ const SUMMARY = {
   topics: ["Genomics"],
   providers: ["openalex"],
   updated_at: "2025-01-01T00:00:00Z",
+  enrichment: { pending: [], sources: { openalex: true, orcid: false, scopus: false } },
 };
 
 function renderWithProvider(ui) {
@@ -63,7 +64,7 @@ function renderWithProvider(ui) {
   );
 }
 
-function getAuthorButton(label = "View profile for Jane Doe") {
+function getAuthorButton(label = "Author details for Jane Doe") {
   return screen.getByRole("button", { name: label });
 }
 
@@ -82,7 +83,12 @@ describe("authorSummaryCache", () => {
     clearAuthorSummaryCache();
     vi.mocked(authorSummaryApi.fetchAuthorSummaryByCanonicalId).mockClear();
     vi.mocked(authorSummaryApi.fetchAuthorSummaryByOpenAlexId).mockClear();
+    vi.mocked(authorSummaryApi.enrichAuthorSummaryByCanonicalId)?.mockClear?.();
     vi.mocked(authorSummaryApi.fetchAuthorSummaryByCanonicalId).mockResolvedValue(SUMMARY);
+    vi.mocked(authorSummaryApi.enrichAuthorSummaryByCanonicalId).mockResolvedValue({
+      ...SUMMARY,
+      enrichment: { pending: [], sources: { openalex: true, orcid: true, scopus: true } },
+    });
   });
 
   afterEach(() => {
@@ -105,6 +111,40 @@ describe("authorSummaryCache", () => {
     await Promise.all([first, second]);
     expect(authorSummaryApi.fetchAuthorSummaryByCanonicalId).toHaveBeenCalledTimes(1);
   });
+
+  it("deduplicates enrichment requests and skips when nothing pending", async () => {
+    const pendingSummary = {
+      ...SUMMARY,
+      enrichment: { pending: ["orcid", "scopus"], sources: { openalex: true } },
+    };
+    let resolveEnrich;
+    const enrichPending = new Promise((resolve) => {
+      resolveEnrich = resolve;
+    });
+    vi.mocked(authorSummaryApi.enrichAuthorSummaryByCanonicalId).mockReturnValue(enrichPending);
+
+    const first = enrichAuthorSummary(AUTHOR, { summary: pendingSummary });
+    const second = enrichAuthorSummary(AUTHOR, { summary: pendingSummary });
+    resolveEnrich({
+      ...pendingSummary,
+      institutions: [
+        ...pendingSummary.institutions,
+        {
+          name: "UC Berkeley",
+          department: "EECS",
+          country_code: "US",
+          current: true,
+          sources: ["orcid"],
+        },
+      ],
+      enrichment: { pending: [], sources: { openalex: true, orcid: true, scopus: true } },
+    });
+    await Promise.all([first, second]);
+    expect(authorSummaryApi.enrichAuthorSummaryByCanonicalId).toHaveBeenCalledTimes(1);
+
+    await enrichAuthorSummary(AUTHOR);
+    expect(authorSummaryApi.enrichAuthorSummaryByCanonicalId).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("AuthorInfoPopover", () => {
@@ -112,8 +152,10 @@ describe("AuthorInfoPopover", () => {
     clearAuthorSummaryCache();
     vi.mocked(authorSummaryApi.fetchAuthorSummaryByCanonicalId).mockClear();
     vi.mocked(authorSummaryApi.fetchAuthorSummaryByOpenAlexId).mockClear();
+    vi.mocked(authorSummaryApi.enrichAuthorSummaryByCanonicalId).mockClear();
     vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.mocked(authorSummaryApi.fetchAuthorSummaryByCanonicalId).mockResolvedValue(SUMMARY);
+    vi.mocked(authorSummaryApi.enrichAuthorSummaryByCanonicalId).mockResolvedValue(SUMMARY);
   });
 
   afterEach(() => {
@@ -325,16 +367,29 @@ describe("AuthorInfoPopover", () => {
 
     expect(screen.getAllByText("Name Only Author").length).toBeGreaterThanOrEqual(2);
     expect(screen.getAllByText("N/A").length).toBeGreaterThan(0);
+    expect(screen.queryByRole("button", { name: "View details" })).not.toBeInTheDocument();
     expect(authorSummaryApi.fetchAuthorSummaryByCanonicalId).not.toHaveBeenCalled();
     expect(warnSpy).toHaveBeenCalled();
 
     warnSpy.mockRestore();
   });
 
-  it("navigates to the author profile on click", () => {
+  it("does not navigate when the author name is clicked", async () => {
     mockNavigate.mockClear();
     renderWithProvider(<AuthorNameLink author={AUTHOR} name="Jane Doe" />);
     fireEvent.click(getAuthorButton());
+    expect(mockNavigate).not.toHaveBeenCalled();
+    await waitFor(() => {
+      expect(screen.getByRole("presentation")).toBeInTheDocument();
+    });
+  });
+
+  it("navigates to the author profile from the popover View details control", async () => {
+    mockNavigate.mockClear();
+    renderWithProvider(<AuthorNameLink author={AUTHOR} name="Jane Doe" />);
+    await openAuthorPopover();
+    const detailsButton = await screen.findByRole("button", { name: "View details" });
+    fireEvent.click(detailsButton);
     expect(mockNavigate).toHaveBeenCalledWith("/authors/canonical-1");
   });
 
@@ -356,6 +411,54 @@ describe("AuthorInfoPopover", () => {
     expect(screen.getByText("84")).toBeInTheDocument();
     expect(screen.getByRole("presentation")).toBeInTheDocument();
   });
+
+  it("shows cached summary immediately then applies background enrichment", async () => {
+    const localSummary = {
+      ...SUMMARY,
+      department: undefined,
+      enrichment: { pending: ["orcid"], sources: { openalex: true } },
+    };
+    vi.mocked(authorSummaryApi.fetchAuthorSummaryByCanonicalId).mockResolvedValue(localSummary);
+    vi.mocked(authorSummaryApi.enrichAuthorSummaryByCanonicalId).mockResolvedValue({
+      ...localSummary,
+      institutions: [
+        {
+          name: "University of California, Berkeley",
+          department: "EECS",
+          country_code: "US",
+          current: true,
+          sources: ["orcid"],
+        },
+      ],
+      enrichment: { pending: [], sources: { openalex: true, orcid: true } },
+    });
+
+    renderWithProvider(<AuthorNameLink author={AUTHOR} name="Jane Doe" />);
+    await openAuthorPopover();
+
+    expect(screen.getByText("84")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByText("EECS")).toBeInTheDocument();
+    });
+    expect(authorSummaryApi.fetchAuthorSummaryByCanonicalId).toHaveBeenCalledTimes(1);
+    expect(authorSummaryApi.enrichAuthorSummaryByCanonicalId).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the hover card usable when enrichment fails", async () => {
+    vi.mocked(authorSummaryApi.fetchAuthorSummaryByCanonicalId).mockResolvedValue({
+      ...SUMMARY,
+      enrichment: { pending: ["orcid", "scopus"], sources: { openalex: true } },
+    });
+    vi.mocked(authorSummaryApi.enrichAuthorSummaryByCanonicalId).mockRejectedValue(
+      new Error("provider down"),
+    );
+
+    renderWithProvider(<AuthorNameLink author={AUTHOR} name="Jane Doe" />);
+    await openAuthorPopover();
+
+    expect(await screen.findByText("84")).toBeInTheDocument();
+    expect(screen.queryByText("Author information could not be loaded")).not.toBeInTheDocument();
+  });
 });
 
 describe("AuthorPublicationsTable author popovers", () => {
@@ -363,6 +466,7 @@ describe("AuthorPublicationsTable author popovers", () => {
     clearAuthorSummaryCache();
     vi.mocked(authorSummaryApi.fetchAuthorSummaryByCanonicalId).mockClear();
     vi.mocked(authorSummaryApi.fetchAuthorSummaryByOpenAlexId).mockClear();
+    vi.mocked(authorSummaryApi.enrichAuthorSummaryByCanonicalId).mockClear();
     vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.mocked(authorSummaryApi.fetchAuthorSummaryByCanonicalId).mockResolvedValue({
       id: "auth-a",
@@ -371,6 +475,16 @@ describe("AuthorPublicationsTable author popovers", () => {
       institutions: [],
       topics: [],
       providers: ["openalex"],
+      enrichment: { pending: [], sources: { openalex: true } },
+    });
+    vi.mocked(authorSummaryApi.enrichAuthorSummaryByCanonicalId).mockResolvedValue({
+      id: "auth-a",
+      display_name: "Alice Alpha",
+      aliases: [],
+      institutions: [],
+      topics: [],
+      providers: ["openalex"],
+      enrichment: { pending: [], sources: { openalex: true } },
     });
   });
 
@@ -401,10 +515,8 @@ describe("AuthorPublicationsTable author popovers", () => {
                 },
               ]}
               loading={false}
-              loadingMore={false}
               error={null}
               mode="single_author"
-              sentinelRef={{ current: null }}
               emptyCopy={{ heading: "No publications found", body: "Nothing here." }}
               initialEmpty={false}
             />
@@ -413,7 +525,7 @@ describe("AuthorPublicationsTable author popovers", () => {
       </ThemeProvider>,
     );
 
-    fireEvent.mouseEnter(screen.getByRole("button", { name: "View profile for Alice Alpha" }));
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "Author details for Alice Alpha" }));
     await act(async () => {
       await vi.advanceTimersByTimeAsync(OPEN_DELAY);
     });
@@ -473,10 +585,8 @@ describe("AuthorPublicationsTable author popovers", () => {
                 },
               ]}
               loading={false}
-              loadingMore={false}
               error={null}
               mode="single_author"
-              sentinelRef={{ current: null }}
               emptyCopy={{ heading: "No publications found", body: "Nothing here." }}
               initialEmpty={false}
             />
@@ -485,7 +595,7 @@ describe("AuthorPublicationsTable author popovers", () => {
       </ThemeProvider>,
     );
 
-    fireEvent.mouseEnter(screen.getByRole("button", { name: "View profile for Alice Alpha" }));
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "Author details for Alice Alpha" }));
     await act(async () => {
       await vi.advanceTimersByTimeAsync(OPEN_DELAY);
     });
@@ -524,10 +634,8 @@ describe("AuthorPublicationsTable author popovers", () => {
                 },
               ]}
               loading={false}
-              loadingMore={false}
               error={null}
               mode="single_author"
-              sentinelRef={{ current: null }}
               emptyCopy={{ heading: "No publications found", body: "Nothing here." }}
               initialEmpty={false}
             />
@@ -536,7 +644,7 @@ describe("AuthorPublicationsTable author popovers", () => {
       </ThemeProvider>,
     );
 
-    const button = screen.getByRole("button", { name: "View profile for Alice Alpha" });
+    const button = screen.getByRole("button", { name: "Author details for Alice Alpha" });
     fireEvent.mouseEnter(button);
     await act(async () => {
       await vi.advanceTimersByTimeAsync(OPEN_DELAY);
@@ -561,11 +669,9 @@ describe("AuthorPublicationsTable author popovers", () => {
                   analysis_match: { verified: true, method: "x" },
                 },
               ]}
-              loading={false}
-              loadingMore
+              loading={true}
               error={null}
               mode="single_author"
-              sentinelRef={{ current: null }}
               emptyCopy={{ heading: "No publications found", body: "Nothing here." }}
               initialEmpty={false}
             />

@@ -77,6 +77,7 @@ class SyncProviderRecord:
     provider_author_id: str
     display_name: str
     works_count: int | None
+    orcid: str | None = None
 
 
 @dataclass(frozen=True)
@@ -187,13 +188,91 @@ class AuthorWorkSyncService:
         self.session = session
         self.settings = get_settings()
 
+    async def fresh_verified_sync_stats(
+        self,
+        authors: list[dict[str, Any]],
+    ) -> list[dict[str, Any]] | None:
+        """Return sync-stat rows when every selected author has fresh verified OpenAlex coverage.
+
+        Used by stats/Insights jobs to skip synchronize (and repair) when filters change
+        or Retry runs against an already-complete corpus. Returns None when any author
+        still needs OpenAlex crawl/resume work so callers fall back to
+        synchronize_selected_authors. arXiv enrichment groups are not required for the
+        fast path (OpenAlex remains the verified-completeness source of truth).
+        """
+        records = await self._load_selected_provider_records(authors)
+        if not records:
+            return None
+        groups = self._group_provider_records(records)
+        if not groups:
+            return None
+
+        selected_ids = _selected_author_ids(authors)
+        openalex_complete: set[str] = set()
+        stats: list[dict[str, Any]] = []
+        for group in groups:
+            if group.provider != "openalex":
+                continue
+            state = await self._load_state(group)
+            if self.effective_status(state) != STATUS_COMPLETE or state is None:
+                return None
+            author_id = str(group.canonical_author_id)
+            openalex_complete.add(author_id)
+            display_name = (
+                group.records[0].display_name if group.records else "Selected author"
+            )
+            stored = int(
+                state.stored_work_count
+                if state.stored_work_count is not None
+                else await self._stored_provider_work_count(
+                    group.canonical_author_id, group.provider
+                )
+            )
+            stats.append(
+                {
+                    "canonical_author_id": author_id,
+                    "provider": group.provider,
+                    "display_name": display_name,
+                    "stored_work_count_before": stored,
+                    "existing_links_repaired": 0,
+                    "fetched_work_count": 0,
+                    "new_works": 0,
+                    "stored_work_count_after": stored,
+                    "provider_work_count": state.provider_work_count,
+                    "status": STATUS_COMPLETE,
+                    "network_skipped": True,
+                    "error_message": None,
+                    "rate_limited": False,
+                    "coverage_verified": True,
+                    "resume_cursor": None,
+                    "last_synced_at": (
+                        (state.last_successful_synced_at or state.last_synced_at).isoformat()
+                        if (state.last_successful_synced_at or state.last_synced_at)
+                        else None
+                    ),
+                }
+            )
+
+        if not selected_ids or any(author_id not in openalex_complete for author_id in selected_ids):
+            return None
+        return stats
+
     async def synchronize_selected_authors(
         self,
         authors: list[dict[str, Any]],
         *,
         timeout_seconds: float | None = None,
         on_progress: SyncProgressCallback | None = None,
+        sync_mode: str = "needed",
     ) -> list[dict[str, Any]]:
+        """Sync selected authors, skipping verified-fresh corpora.
+
+        sync_mode:
+        - ``needed`` (default): crawl never / partial / failed / TTL-stale groups.
+          Verified-complete groups are counted as ready with no provider HTTP.
+        - ``incomplete_only`` (Retry): resume never / partial / failed (or resume
+          cursor) only — do not re-crawl TTL-stale authors that previously completed.
+        """
         records = await self._load_selected_provider_records(authors)
         groups = self._group_provider_records(records)
         deadline = (
@@ -209,7 +288,31 @@ class AuthorWorkSyncService:
         }
         author_order = list(dict.fromkeys(str(group.canonical_author_id) for group in groups))
         authors_total = max(len(author_order), 1)
-        completed_authors: set[str] = set()
+        mode = str(sync_mode or "needed").strip().lower()
+        if mode not in {"needed", "incomplete_only"}:
+            mode = "needed"
+
+        # Pre-classify so we can seed authors_ready and skip complete work cheaply.
+        planned: list[tuple[SyncProviderGroup, AuthorWorkSyncState | None, str, bool]] = []
+        openalex_ready: set[str] = set()
+        for group in groups:
+            state = await self._load_state(group)
+            effective = self.effective_status(state)
+            needs = self._group_needs_sync(effective, state, mode)
+            planned.append((group, state, effective, needs))
+            if group.provider == "openalex" and (
+                effective == STATUS_COMPLETE
+                or (
+                    mode == "incomplete_only"
+                    and effective == STATUS_STALE
+                    and state is not None
+                    and not state.resume_cursor
+                    and self._verified_complete_coverage(state)
+                )
+            ):
+                openalex_ready.add(str(group.canonical_author_id))
+
+        authors_ready = len(openalex_ready)
 
         async def _emit(**kwargs: Any) -> None:
             if on_progress is None:
@@ -218,38 +321,59 @@ class AuthorWorkSyncService:
             author_index = 0
             if author_id and author_id in author_order:
                 author_index = author_order.index(str(author_id)) + 1
-            elif completed_authors:
-                author_index = len(completed_authors)
+            elif openalex_ready:
+                author_index = len(openalex_ready)
+            ready_count = max(int(kwargs.get("authors_ready") or authors_ready), authors_ready)
             payload = {
                 "phase": kwargs.get("phase") or "syncing",
                 "current_author": kwargs.get("current_author"),
                 "canonical_author_id": author_id,
                 "author_index": author_index,
-                "authors_completed": len(completed_authors),
-                "authors_total": len(author_order),
+                "authors_completed": ready_count,
+                "authors_ready": ready_count,
+                "authors_total": authors_total,
                 "publications_processed": kwargs.get("publications_processed"),
                 "publications_total": kwargs.get("publications_total"),
                 "provider": kwargs.get("provider"),
                 "sync_status": kwargs.get("sync_status"),
                 "status": kwargs.get("status") or kwargs.get("sync_status"),
                 "rate_limited": bool(kwargs.get("rate_limited")),
+                "network_skipped": bool(kwargs.get("network_skipped")),
+                "sync_mode": mode,
             }
             await on_progress(payload)
 
-        await _emit(phase="checking", authors_total=authors_total)
+        await _emit(
+            phase="checking",
+            authors_ready=authors_ready,
+            authors_total=authors_total,
+        )
 
         selected_author_ids = _selected_author_ids(authors)
         stats: list[dict[str, Any]] = []
-        for group in groups:
+        for group, preexisting_state, effective, needs in planned:
             author_key = str(group.canonical_author_id)
             display_name = author_names.get(author_key) or "Selected author"
             expected_total = _profile_expected_total(group)
+
+            if not needs:
+                skip_stat = self._network_skip_stat(
+                    group,
+                    state=preexisting_state,
+                    display_name=display_name,
+                    effective=effective,
+                )
+                stats.append(skip_stat)
+                if group.provider == "openalex" and skip_stat.get("status") == STATUS_COMPLETE:
+                    openalex_ready.add(author_key)
+                    authors_ready = max(authors_ready, len(openalex_ready))
+                continue
 
             if _deadline_exceeded(deadline):
                 stored = await self._stored_provider_work_count(
                     group.canonical_author_id, group.provider
                 )
-                existing_state = await self._load_state(group)
+                existing_state = preexisting_state or await self._load_state(group)
                 stat = await self._mark_group_incomplete(
                     group,
                     display_name=display_name,
@@ -262,7 +386,6 @@ class AuthorWorkSyncService:
                     resume_cursor=existing_state.resume_cursor if existing_state else None,
                 )
                 stats.append(stat)
-                completed_authors.add(author_key)
                 await _emit(
                     phase="syncing",
                     current_author=display_name,
@@ -271,11 +394,11 @@ class AuthorWorkSyncService:
                     sync_status=STATUS_PARTIAL,
                     status=STATUS_PARTIAL,
                     publications_total=expected_total,
+                    authors_ready=authors_ready,
                 )
                 continue
 
             key = f"{group.canonical_author_id}|{group.provider}"
-            # Process-local lock; also take a DB row lock when supported.
             lock = await _lock_for_key(key)
 
             async def _group_progress(
@@ -300,13 +423,30 @@ class AuthorWorkSyncService:
                     sync_status=sync_status,
                     status=sync_status,
                     rate_limited=rate_limited,
+                    authors_ready=authors_ready,
                 )
 
             async with lock:
+                # Re-check under lock — another job may have finished this author.
+                locked_state = await self._load_state(group)
+                locked_effective = self.effective_status(locked_state)
+                if not self._group_needs_sync(locked_effective, locked_state, mode):
+                    skip_stat = self._network_skip_stat(
+                        group,
+                        state=locked_state,
+                        display_name=display_name,
+                        effective=locked_effective,
+                    )
+                    stats.append(skip_stat)
+                    if group.provider == "openalex" and skip_stat.get("status") == STATUS_COMPLETE:
+                        openalex_ready.add(author_key)
+                        authors_ready = max(authors_ready, len(openalex_ready))
+                    continue
+
                 await _group_progress(
                     phase="syncing",
                     publications_processed=0,
-                    sync_status=STATUS_STALE,
+                    sync_status=locked_effective if locked_effective != STATUS_COMPLETE else STATUS_PARTIAL,
                 )
                 stats.append(
                     await self._sync_provider_group(
@@ -317,8 +457,14 @@ class AuthorWorkSyncService:
                     )
                 )
 
-            completed_authors.add(author_key)
             final_stat = stats[-1]
+            if (
+                group.provider == "openalex"
+                and final_stat.get("status") == STATUS_COMPLETE
+                and final_stat.get("coverage_verified")
+            ):
+                openalex_ready.add(author_key)
+                authors_ready = max(authors_ready, len(openalex_ready))
             await _emit(
                 phase="syncing",
                 current_author=display_name,
@@ -332,6 +478,8 @@ class AuthorWorkSyncService:
                 sync_status=final_stat.get("status"),
                 status=final_stat.get("status"),
                 rate_limited=bool(final_stat.get("rate_limited")),
+                network_skipped=bool(final_stat.get("network_skipped")),
+                authors_ready=authors_ready,
             )
 
         covered_authors = {str(row.get("canonical_author_id") or "") for row in stats}
@@ -370,6 +518,70 @@ class AuthorWorkSyncService:
             )
         return stats
 
+    def _group_needs_sync(
+        self,
+        effective: str,
+        state: AuthorWorkSyncState | None,
+        sync_mode: str,
+    ) -> bool:
+        if effective == STATUS_COMPLETE:
+            return False
+        if sync_mode == "incomplete_only":
+            # Retry: resume unfinished crawls only. Do not re-crawl TTL-stale
+            # authors that previously completed with no resume cursor.
+            if (
+                effective == STATUS_STALE
+                and state is not None
+                and not state.resume_cursor
+                and self._verified_complete_coverage(state)
+            ):
+                return False
+            return True
+        return True
+
+    def _network_skip_stat(
+        self,
+        group: SyncProviderGroup,
+        *,
+        state: AuthorWorkSyncState | None,
+        display_name: str,
+        effective: str,
+    ) -> dict[str, Any]:
+        stored = int(state.stored_work_count or 0) if state is not None else 0
+        verified = bool(
+            state is not None
+            and (
+                effective == STATUS_COMPLETE
+                or (
+                    effective == STATUS_STALE
+                    and not state.resume_cursor
+                    and self._verified_complete_coverage(state)
+                )
+            )
+        )
+        return {
+            "canonical_author_id": str(group.canonical_author_id),
+            "provider": group.provider,
+            "display_name": display_name,
+            "stored_work_count_before": stored,
+            "existing_links_repaired": 0,
+            "fetched_work_count": 0,
+            "new_works": 0,
+            "stored_work_count_after": stored,
+            "provider_work_count": state.provider_work_count if state else None,
+            "status": STATUS_COMPLETE if verified else effective,
+            "network_skipped": True,
+            "error_message": None,
+            "rate_limited": False,
+            "coverage_verified": verified,
+            "resume_cursor": None,
+            "last_synced_at": (
+                (state.last_successful_synced_at or state.last_synced_at).isoformat()
+                if state and (state.last_successful_synced_at or state.last_synced_at)
+                else None
+            ),
+        }
+
     def _group_provider_records(
         self,
         records: list[SyncProviderRecord],
@@ -380,16 +592,23 @@ class AuthorWorkSyncService:
                 (record.canonical_author_id, record.provider),
                 [],
             ).append(record)
-        return [
-            SyncProviderGroup(
-                canonical_author_id=canonical_author_id,
-                provider=provider,
-                records=tuple(sorted(rows, key=lambda row: row.provider_author_id)),
+        groups: list[SyncProviderGroup] = []
+        for (canonical_author_id, provider), rows in sorted(
+            grouped.items(), key=lambda item: (str(item[0][0]), item[0][1])
+        ):
+            selected = list(rows)
+            if provider == "openalex" and len(selected) > 1:
+                selected = _primary_openalex_records_for_sync(selected)
+            groups.append(
+                SyncProviderGroup(
+                    canonical_author_id=canonical_author_id,
+                    provider=provider,
+                    records=tuple(
+                        sorted(selected, key=lambda row: row.provider_author_id)
+                    ),
+                )
             )
-            for (canonical_author_id, provider), rows in sorted(
-                grouped.items(), key=lambda item: (str(item[0][0]), item[0][1])
-            )
-        ]
+        return groups
 
     async def _load_selected_provider_records(
         self,
@@ -444,6 +663,7 @@ class AuthorWorkSyncService:
                     display_name=provider_record.display_name
                     or canonical_author.preferred_name,
                     works_count=provider_record.works_count,
+                    orcid=provider_record.orcid,
                 )
             )
         return records
@@ -490,6 +710,48 @@ class AuthorWorkSyncService:
         on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
         started = time.perf_counter()
+        state = await self._load_state(group)
+        effective = self.effective_status(state)
+        profile_expected = _profile_expected_total(group)
+        expected_total = (
+            state.provider_work_count
+            if state and state.provider_work_count is not None
+            else profile_expected
+        )
+
+        # Fresh verified corpus: skip repair + provider HTTP (filters/Retry reuse path).
+        if effective == STATUS_COMPLETE and state is not None:
+            stored = int(
+                state.stored_work_count
+                if state.stored_work_count is not None
+                else await self._stored_provider_work_count(
+                    group.canonical_author_id, group.provider
+                )
+            )
+            stat = {
+                "canonical_author_id": str(group.canonical_author_id),
+                "provider": group.provider,
+                "display_name": display_name,
+                "stored_work_count_before": stored,
+                "existing_links_repaired": 0,
+                "fetched_work_count": 0,
+                "new_works": 0,
+                "stored_work_count_after": stored,
+                "provider_work_count": state.provider_work_count,
+                "status": STATUS_COMPLETE,
+                "network_skipped": True,
+                "error_message": None,
+                "rate_limited": False,
+                "coverage_verified": True,
+                "last_synced_at": (
+                    (state.last_successful_synced_at or state.last_synced_at).isoformat()
+                    if (state.last_successful_synced_at or state.last_synced_at)
+                    else None
+                ),
+            }
+            self._log_stats(stat, started)
+            return stat
+
         before_count = await self._stored_provider_work_count(
             group.canonical_author_id, group.provider
         )
@@ -501,17 +763,16 @@ class AuthorWorkSyncService:
         )
         await self.session.commit()
 
+        # Reload after repair in case status/counts changed.
         state = await self._load_state(group)
         effective = self.effective_status(state)
-        profile_expected = _profile_expected_total(group)
         expected_total = (
             state.provider_work_count
             if state and state.provider_work_count is not None
             else profile_expected
         )
 
-        if effective == STATUS_COMPLETE:
-            # Fresh verified complete coverage: reuse stored works, no provider HTTP.
+        if effective == STATUS_COMPLETE and state is not None:
             stat = {
                 "canonical_author_id": str(group.canonical_author_id),
                 "provider": group.provider,
@@ -547,13 +808,15 @@ class AuthorWorkSyncService:
             )
 
         # Mark attempt / expose stale before network work. Preserve prior success stamp.
-        prior_success_at = (
-            state.last_successful_synced_at if state else None
-        )
         prior_complete = bool(
             state
             and normalize_stored_status(state.status) == STATUS_COMPLETE
             and self._verified_complete_coverage(state)
+        )
+        prior_success_at = (
+            (state.last_successful_synced_at or state.last_synced_at)
+            if state
+            else None
         )
         await self._upsert_state(
             group,
@@ -762,6 +1025,7 @@ class AuthorWorkSyncService:
             group.canonical_author_id, group.provider
         )
         seen_work_ids.update(existing_ids)
+        api_work_ids: set[str] = set()
 
         provider_reported_count: int | None = None
         pages_fetched = 0
@@ -814,9 +1078,12 @@ class AuthorWorkSyncService:
             for row in list(page.get("results") or []):
                 if not isinstance(row, dict):
                     continue
-                work_id = str(
-                    row.get("openalex_id") or row.get("source_id") or row.get("id") or ""
+                work_id = _normalize_provider_work_id(
+                    group.provider,
+                    row.get("openalex_id") or row.get("source_id") or row.get("id"),
                 )
+                if work_id:
+                    api_work_ids.add(work_id)
                 if work_id and work_id in seen_work_ids:
                     continue
                 if work_id:
@@ -877,6 +1144,32 @@ class AuthorWorkSyncService:
                 next_resume = None
 
         unique_fetched = len(seen_work_ids)
+        # OpenAlex meta.count counts distinct work IDs, including alternate versions
+        # of the same paper (preprint vs journal, duplicate DOI / title+year records).
+        # Persistence merges those into one canonical work (DOI → arXiv → title+year+
+        # first-author).
+        # Examples:
+        # - Alp Sipahigil (A5064615305): meta.count=99 → 88 canonical after DOI merge.
+        # - Monika Schleier-Smith (A5021463446): meta.count=107 → all W-ids must be
+        #   normalized/persisted (including empty-title repository records); ~10 DOI
+        #   alternates then collapse. Completeness still requires a finished crawl of
+        #   every reported ID — we never self-certify from len(fetched) alone.
+        # When pagination returned at least meta.count unique API ids, the linked
+        # stored total is the verifiable Analyze corpus size (not OpenAlex's raw ID
+        # count).
+        if (
+            finished
+            and not rate_limited
+            and error_message is None
+            and provider_reported_count is not None
+            and len(api_work_ids) >= int(provider_reported_count)
+        ):
+            linked_now = await self._stored_provider_work_count(
+                group.canonical_author_id, group.provider
+            )
+            if linked_now > 0:
+                provider_reported_count = linked_now
+
         return FetchResult(
             rows=[],
             finished=finished and not rate_limited and error_message is None,
@@ -1102,6 +1395,16 @@ class AuthorWorkSyncService:
                 canonical, created = await persistence.resolve_candidate(candidate)
                 if created:
                     new_works += 1
+                # Refresh provider snapshot even when resolve_candidate early-returns
+                # on an existing (provider, provider_work_id) so grants/raw stay current.
+                await WorkPersistenceRepository(self.session).upsert_provider_record(
+                    candidate, canonical
+                )
+                await persistence.persist_grants_from_raw_metadata(
+                    canonical_work_id=canonical.id,
+                    provider=group.provider,
+                    raw_metadata=candidate.raw_metadata,
+                )
                 # Always refresh authorships so coauthors with known provider
                 # records get canonical links (needed for multi-author intersection).
                 await WorkPersistenceRepository(self.session).replace_work_authorships(
@@ -1287,9 +1590,18 @@ class AuthorWorkSyncService:
         canonical_author_id: uuid.UUID,
         provider: str,
     ) -> set[str]:
+        """Return one normalized provider work id per linked canonical work.
+
+        Duplicate ProviderWorkRecord rows for the same canonical work must not
+        inflate the crawl seen-set; that previously caused Retry to skip works
+        that still lacked authorship links and permanently fail completeness.
+        """
         rows = (
             await self.session.execute(
-                select(ProviderWorkRecord.provider_work_id)
+                select(
+                    ProviderWorkRecord.canonical_work_id,
+                    ProviderWorkRecord.provider_work_id,
+                )
                 .join(
                     WorkAuthorship,
                     WorkAuthorship.canonical_work_id == ProviderWorkRecord.canonical_work_id,
@@ -1301,7 +1613,20 @@ class AuthorWorkSyncService:
                 )
             )
         ).all()
-        return {str(row[0]) for row in rows if row[0]}
+        by_canonical: dict[str, str] = {}
+        for canonical_work_id, provider_work_id in rows:
+            normalized = _normalize_provider_work_id(provider, provider_work_id)
+            if not normalized:
+                continue
+            key = str(canonical_work_id)
+            current = by_canonical.get(key)
+            if current is None:
+                by_canonical[key] = normalized
+                continue
+            # Prefer compact OpenAlex ids over full URLs.
+            if "openalex.org" in current and "openalex.org" not in normalized:
+                by_canonical[key] = normalized
+        return set(by_canonical.values())
 
     def _log_stats(self, stat: dict[str, Any], started: float) -> None:
         logger.info(
@@ -1344,28 +1669,47 @@ def _matching_group_record(
     group: SyncProviderGroup,
     row: dict[str, Any],
 ) -> SyncProviderRecord:
-    if len(group.records) == 1:
-        return group.records[0]
     author_ids: set[str] = set()
-    for author in list(row.get("authors") or []):
-        if not isinstance(author, dict):
-            continue
-        short = _canonical_provider_author_id(
-            group.provider,
-            author.get("id") or author.get("openalex_id") or author.get("source_id"),
-        )
+    for raw in list(row.get("author_ids") or []) + list(
+        (row.get("provider_ids") or {}).get("openalex") or []
+    ):
+        short = _canonical_provider_author_id(group.provider, raw)
         if short:
             author_ids.add(short)
-        provider_ids = author.get("provider_ids")
-        if isinstance(provider_ids, dict):
-            for raw in list(provider_ids.get(group.provider) or []):
-                short = _canonical_provider_author_id(group.provider, raw)
-                if short:
-                    author_ids.add(short)
+    raw_authors = row.get("authors")
+    if isinstance(raw_authors, list):
+        for author in raw_authors:
+            if not isinstance(author, dict):
+                continue
+            short = _canonical_provider_author_id(
+                group.provider, author.get("id") or author.get("author_id")
+            )
+            if short:
+                author_ids.add(short)
     for record in group.records:
         if record.provider_author_id in author_ids:
             return record
     return group.records[0]
+
+
+def _primary_openalex_records_for_sync(
+    records: list[SyncProviderRecord],
+) -> list[SyncProviderRecord]:
+    """When multiple OpenAlex ids share one ORCID, crawl only the primary profile."""
+    from app.integrations.orcid.normalize import normalize_orcid_id
+
+    orcids = {
+        normalize_orcid_id(record.orcid)
+        for record in records
+        if normalize_orcid_id(record.orcid)
+    }
+    if len(orcids) != 1:
+        return records
+    primary = max(
+        records,
+        key=lambda row: (int(row.works_count or 0), row.provider_author_id),
+    )
+    return [primary]
 
 
 def _canonical_provider_author_id(provider: str, provider_author_id: Any) -> str | None:
@@ -1375,6 +1719,15 @@ def _canonical_provider_author_id(provider: str, provider_author_id: Any) -> str
     if provider == "openalex":
         text = text.rstrip("/").split("/")[-1]
     return text or None
+
+
+def _normalize_provider_work_id(provider: str, provider_work_id: Any) -> str:
+    text = str(provider_work_id or "").strip()
+    if not text:
+        return ""
+    if provider == "openalex":
+        text = text.rstrip("/").split("/")[-1]
+    return text
 
 
 def _raw_title(raw_metadata: dict[str, Any] | None) -> str | None:

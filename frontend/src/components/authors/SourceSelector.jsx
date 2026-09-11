@@ -76,7 +76,7 @@ function SourceSelector({
       <Typography
         variant="caption"
         color="text.secondary"
-        sx={{ fontWeight: 500, letterSpacing: 0.01 }}
+        sx={{ fontWeight: 500, letterSpacing: "0.01em" }}
       >
         Source
       </Typography>
@@ -86,22 +86,28 @@ function SourceSelector({
           onChange={(event) => onChange?.(event.target.value)}
           disableUnderline
           inputProps={{ "aria-label": "Search source" }}
+
           MenuProps={{
-            transitionDuration: 0,
+            slotProps: {
+              paper: {
+                style: {
+                  maxHeight: 300,
+                },
+              },
+            },
           }}
           sx={{
-            fontSize: "0.8125rem",
+            fontSize: "13px",
             fontWeight: 600,
             color: "text.primary",
             transition: "color 120ms ease",
             "& .MuiSelect-select": {
               py: 0.35,
-              pr: "22px !important",
+              pr: 2.75,
               pl: 0.5,
               borderRadius: 1,
             },
           }}
-          renderValue={() => selectedLabel}
         >
           {visibleSources.map((source) => {
             const reason = optionDisabledReason(source, entityType);
@@ -111,7 +117,7 @@ function SourceSelector({
                 key={source.id}
                 value={source.id}
                 disabled={Boolean(reason)}
-                sx={{ fontSize: "0.875rem", fontWeight: source.id === selected ? 600 : 400 }}
+                sx={{ fontWeight: source.id === selected ? 600 : 400 }}
               >
                 {label}
               </MenuItem>
@@ -123,9 +129,7 @@ function SourceSelector({
 
             return (
               <Tooltip key={source.id} title={reason} placement="left">
-                <Box component="span" sx={{ display: "block" }}>
-                  {menuItem}
-                </Box>
+                <span>{menuItem}</span>
               </Tooltip>
             );
           })}

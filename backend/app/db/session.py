@@ -40,6 +40,38 @@ async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
         yield session
 
 
+def _ensure_sqlite_schema_patches(sync_conn) -> None:  # noqa: ANN001
+    """Patch columns create_all cannot add to existing SQLite tables.
+
+    Alembic remains the source of truth; this only keeps local/dev DBs usable
+    when a migration was not applied yet (e.g. resume_cursor).
+    """
+    from sqlalchemy import inspect, text
+
+    if not str(sync_conn.engine.url).startswith("sqlite"):
+        return
+    inspector = inspect(sync_conn)
+    if "author_work_sync_state" not in inspector.get_table_names():
+        return
+    columns = {col["name"] for col in inspector.get_columns("author_work_sync_state")}
+    if "resume_cursor" not in columns:
+        sync_conn.execute(
+            text(
+                "ALTER TABLE author_work_sync_state "
+                "ADD COLUMN resume_cursor VARCHAR(512)"
+            )
+        )
+
+    if "author_profiles" in inspector.get_table_names():
+        profile_cols = {
+            col["name"] for col in inspector.get_columns("author_profiles")
+        }
+        if "enrichment_meta" not in profile_cols:
+            sync_conn.execute(
+                text("ALTER TABLE author_profiles ADD COLUMN enrichment_meta JSON")
+            )
+
+
 async def init_db() -> None:
     """Create tables when using SQLite/dev without running Alembic first."""
     from app.db import models  # noqa: F401
@@ -47,3 +79,4 @@ async def init_db() -> None:
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_ensure_sqlite_schema_patches)

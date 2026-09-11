@@ -114,8 +114,8 @@ For more detail (API keys, testing, project layout), see [Developer Setup](#deve
 | --- | --- |
 | **OpenAlex** | Primary author and publication metadata (names, works, institutions, topics, citations, grants) |
 | **ORCID** | Author identity, search, and enrichment; strong cross-provider identity signal |
-| **arXiv** | Secondary author and publication source (some author/grant matching is experimental) |
-| **Scopus / Elsevier** | Journal metrics (CiteScore, SJR, SNIP) via the Serial Title API |
+| **arXiv** | Secondary author/publication source; enrich-only preprint/version overlays on matched OpenAlex works |
+| **Scopus / Elsevier** | Journal metrics (CiteScore, SJR, SNIP); optional Abstract Retrieval enrichment of citation/journal fields on existing works; author affiliation enrichment on hover cards |
 
 **ORCID as an identity bridge.** When an ORCID iD matches exactly across providers, the platform links records: **ORCID → exact OpenAlex match → canonical author → OpenAlex publications**. Name similarity alone is never used to merge identities.
 
@@ -141,10 +141,11 @@ From Author Search, select one or more authors and open **Analyze authors**.
 - **Publication exclusions** — exclude specific works from the active analysis set.
 - **Author affiliation hover metadata** — hover author names in the table for available author and institution details.
 
-**Performance and sample-based statistics**
+**Performance and corpus statistics**
 
 - Normal table loading fetches provider pages incrementally; the first page renders without waiting for a full provider crawl.
-- The **Publications over time** chart and filter facet counts on Analyze Authors are based on the **initially loaded publication sample**, not the complete corpus. The UI states this explicitly (for example, “Based on the first *N* loaded publications” and “Filter options and counts are from currently loaded publications, not the full corpus.”).
+- After OpenAlex coverage is verified complete, Analyze Authors timeline, filter facets, and the publications table prefer the **stored complete corpus** (via background publication-stats jobs). Until then, UI copy may note that early counts are from the currently loaded sample.
+- Background jobs may enrich existing OpenAlex works with arXiv preprint/version metadata and Scopus citation/journal fields (DOI / arXiv id match only; never creates duplicate publication rows). Enrichment is cached and does not block first-page table load.
 - **CSV export** can collect the full matching corpus according to your active filters.
 
 ## Collaboration Insights
@@ -326,10 +327,10 @@ npm run test:setup
 
 ## Current limitations
 
-- Analyze Authors timeline and filter facets reflect the **initial loaded publication sample**, not the full corpus (CSV export can still gather the full filtered set).
+- Until OpenAlex coverage is verified complete for the selection, Analyze Authors timeline/facets may still reflect the currently loaded sample rather than the full corpus (CSV export can still gather the full filtered set).
 - Collaboration Insights depends on publication data already stored/synced for the selected authors; it does not live-crawl providers when you change filters.
 - ORCID-only authors without a linked publication provider (for example, no OpenAlex match) may not yet have publication coverage.
-- Scopus **author-profile** APIs are not currently relied upon for identity or publications.
+- Scopus publication enrichment requires a DOI match and `ELSEVIER_API_KEY`; it never creates new canonical publication rows.
 - Scopus **cited-by** / **Research Reach** functionality is **not yet implemented** in the product UI.
 
 ## Usage examples
@@ -356,7 +357,7 @@ Publication: Chen, Chi-Fang, Jorge Garza-Vargas, Joel A. Tropp, and Ramon Van Ha
    - checkboxes for the selected authors at the top
    - filters (**Show filters** / **Hide filters**)
    - the **Publications over time** chart (based on loaded publications — see the on-page note)
-   - the detailed publications table with infinite scroll
+   - the detailed publications table with clear pagination (range + page controls)
 10. In the table, useful columns include:
     - **Authors** (the complete author list)
     - **Date**

@@ -70,9 +70,13 @@ COLUMN_CANDIDATES = (
     "Author Departments",
     "Author Countries",
     "Citation Count",
+    "Citations by Provider",
     "DOI",
     "PMID",
     "arXiv ID",
+    "arXiv Version",
+    "OpenAlex ID",
+    "Scopus ID",
     "Primary URL",
     "PDF URL",
     "Open Access Status",
@@ -81,6 +85,7 @@ COLUMN_CANDIDATES = (
     "Grant Numbers",
     "Grant Funders",
     "Grant Agencies",
+    "Grant Providers",
     "Research Topics",
     "Searched Grant",
 )
@@ -90,6 +95,9 @@ CSV_COLUMNS = list(COLUMN_CANDIDATES)
 SOURCE_LABELS = {
     "openalex": "OpenAlex",
     "arxiv": "arXiv",
+    "scopus": "Scopus",
+    "orcid": "ORCID",
+    "elsevier": "Scopus",
 }
 
 _FILENAME_SAFE_RE = re.compile(r"[^a-z0-9]+")
@@ -426,19 +434,74 @@ def _topic_names(raw: Any) -> list[str]:
     return _unique_names(names)
 
 
+def _display_grant_number(value: Any) -> str:
+    """Normalize grant ID formatting noise for export without inventing awards."""
+    text = clean_cell(value)
+    if not text:
+        return ""
+    # Unicode dashes / minus signs → ASCII hyphen; collapse whitespace.
+    for ch in ("\u2010", "\u2011", "\u2012", "\u2013", "\u2014", "\u2212"):
+        text = text.replace(ch, "-")
+    text = " ".join(text.split())
+    text = text.strip(" .;,")
+    # Leading hyphen fragments like "-AC02-…" are truncated agency prefixes.
+    while text.startswith("-"):
+        text = text[1:].lstrip()
+    # Dangling trailing hyphen is formatting noise when the normalized id is unchanged.
+    if text.endswith("-"):
+        trimmed = text.rstrip("-").rstrip()
+        if trimmed and normalize_grant_number(trimmed) == normalize_grant_number(text):
+            text = trimmed
+    return text
+
+
+def _grant_is_provider_label(value: str) -> bool:
+    key = clean_cell(value).casefold()
+    return key in {"openalex", "arxiv", "scopus", "orcid", "elsevier"}
+
+
+def _prefer_grant_display(current: str, candidate: str) -> str:
+    """Prefer the more complete display form when two IDs normalize identically."""
+    left = _display_grant_number(current)
+    right = _display_grant_number(candidate)
+    if not left:
+        return right
+    if not right:
+        return left
+
+    def _score(value: str) -> tuple[int, int, int, int]:
+        has_alpha = 1 if any(ch.isalpha() for ch in value) else 0
+        has_hyphen = 1 if "-" in value else 0
+        has_space = 1 if " " in value else 0
+        return (has_alpha, has_hyphen, -has_space, len(value))
+
+    return right if _score(right) > _score(left) else left
+
+
 def _dedupe_grants(grants: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Source-aware grant dedupe for export.
+
+    - Same provider + identical normalized award id → one row (formatting noise).
+    - Different providers keep separate rows even for the same award text.
+    - Uncertain / non-matching fragments stay separate (no speculative merges).
+    """
     merged: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
     for grant in grants:
         if not isinstance(grant, dict):
             continue
-        number = clean_cell(
+        number = _display_grant_number(
             grant.get("grant_number")
             or grant.get("award_id")
             or grant.get("funder_award_id")
         )
-        if not number:
+        if not number or _grant_is_provider_label(number):
             continue
-        key = normalize_grant_number(number) or number.casefold()
+        provider = clean_cell(grant.get("provider")).casefold()
+        number_key = normalize_grant_number(number)
+        if not number_key:
+            continue
+        key = f"{provider}|{number_key}"
         funder = clean_cell(grant.get("funder_name") or grant.get("funder"))
         agency = clean_cell(grant.get("agency"))
         existing = merged.get(key)
@@ -447,16 +510,111 @@ def _dedupe_grants(grants: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
                 "grant_number": number,
                 "funder": funder,
                 "agency": agency,
+                "provider": provider,
             }
+            order.append(key)
             continue
+        existing["grant_number"] = _prefer_grant_display(
+            existing["grant_number"], number
+        )
         if not existing["funder"] and funder:
             existing["funder"] = funder
         if not existing["agency"] and agency:
             existing["agency"] = agency
-        if len(number) > len(existing["grant_number"]):
-            existing["grant_number"] = number
-    return list(merged.values())
+    return [merged[key] for key in order]
 
+
+def _provider_contributed_to_export(
+    provider: str,
+    *,
+    openalex_id: str = "",
+    arxiv_id: str = "",
+    arxiv_version: str = "",
+    scopus_id: str = "",
+    citations_by_provider: dict[str, int] | None = None,
+    grants: Sequence[dict[str, Any]] | None = None,
+    item_providers: Sequence[Any] | None = None,
+) -> bool:
+    """True when the provider actually contributed exportable work metadata."""
+    key = clean_cell(provider).casefold()
+    if not key:
+        return False
+    cites = citations_by_provider or {}
+    grant_providers = {
+        clean_cell(row.get("provider")).casefold()
+        for row in (grants or [])
+        if isinstance(row, dict)
+    }
+    if key == "openalex":
+        if openalex_id or key in cites or key in grant_providers:
+            return True
+        # Stored OpenAlex corpus rows may omit openalex_id on sparse fixtures.
+        return any(
+            clean_cell(value).casefold() == "openalex" for value in (item_providers or [])
+        )
+    if key == "arxiv":
+        return bool(arxiv_id or arxiv_version or key in cites or key in grant_providers)
+    if key in {"scopus", "elsevier"}:
+        return bool(
+            scopus_id
+            or "scopus" in cites
+            or "elsevier" in cites
+            or "scopus" in grant_providers
+            or "elsevier" in grant_providers
+        )
+    if key == "orcid":
+        return key in cites or key in grant_providers
+    return key in cites or key in grant_providers
+
+
+def _export_source_labels(
+    *,
+    openalex_id: str = "",
+    arxiv_id: str = "",
+    arxiv_version: str = "",
+    scopus_id: str = "",
+    citations_by_provider: dict[str, int] | None = None,
+    grants: Sequence[dict[str, Any]] | None = None,
+    item_providers: Sequence[Any] | None = None,
+    work_providers: Sequence[Any] | None = None,
+    source: Any = None,
+) -> list[str]:
+    """Build Sources from providers that contributed data. OpenAlex stays first."""
+    candidates: list[str] = []
+    for value in list(item_providers or []) + list(work_providers or []):
+        key = clean_cell(value).casefold()
+        if key == "elsevier":
+            key = "scopus"
+        if key and key not in candidates:
+            candidates.append(key)
+    source_key = clean_cell(source).casefold()
+    if source_key == "elsevier":
+        source_key = "scopus"
+    if source_key and source_key not in candidates:
+        candidates.append(source_key)
+    for key in ("openalex", "arxiv", "scopus"):
+        if key not in candidates:
+            candidates.append(key)
+
+    selected: list[str] = []
+    for key in candidates:
+        if not _provider_contributed_to_export(
+            key,
+            openalex_id=openalex_id,
+            arxiv_id=arxiv_id,
+            arxiv_version=arxiv_version,
+            scopus_id=scopus_id,
+            citations_by_provider=citations_by_provider,
+            grants=grants,
+            item_providers=item_providers,
+        ):
+            continue
+        label = _source_label(key)
+        if label and label not in selected:
+            selected.append(label)
+    if "OpenAlex" in selected:
+        selected = ["OpenAlex"] + [label for label in selected if label != "OpenAlex"]
+    return selected
 
 def _extract_biblio_fields(source: dict[str, Any] | None) -> dict[str, str]:
     if not isinstance(source, dict):
@@ -632,12 +790,62 @@ def _format_countries(author: ExportAuthor) -> str:
     return AFFILIATION_DELIMITER.join(_unique_names(author.countries))
 
 
+def _citations_by_provider_map(
+    item: dict[str, Any],
+    *,
+    work_meta: dict[str, Any] | None = None,
+) -> dict[str, int]:
+    merged: dict[str, int] = {}
+    for source in (work_meta or {}, item):
+        raw = source.get("citations_by_provider")
+        if not isinstance(raw, dict):
+            continue
+        for provider, value in raw.items():
+            try:
+                count = int(value) if value is not None else None
+            except (TypeError, ValueError):
+                count = None
+            if count is None or count < 0:
+                continue
+            key = clean_cell(provider).casefold()
+            if key and key not in merged:
+                merged[key] = count
+    return merged
+
+
+def _format_citations_by_provider(citations: dict[str, int]) -> str:
+    if not citations:
+        return ""
+    parts: list[str] = []
+    seen: set[str] = set()
+    preferred = ("openalex", "scopus", "arxiv", "orcid")
+    for provider in preferred:
+        if provider not in citations:
+            continue
+        parts.append(f"{_source_label(provider)}:{citations[provider]}")
+        seen.add(provider)
+    for provider in sorted(citations):
+        if provider in seen:
+            continue
+        parts.append(f"{_source_label(provider)}:{citations[provider]}")
+    return MULTI_VALUE_DELIMITER.join(parts)
+
+
 def _citation_count_cell(
     item: dict[str, Any],
     *,
     work_meta: dict[str, Any] | None = None,
     diagnostics: ExportDiagnostics | None = None,
 ) -> str:
+    from app.services.analysis.publication_enrichment import preferred_citation_count
+
+    by_provider = _citations_by_provider_map(item, work_meta=work_meta)
+    preferred = preferred_citation_count(by_provider)
+    if preferred is not None:
+        if diagnostics is not None:
+            diagnostics.citation_from_item += 1
+        return str(preferred)
+
     for source_name, source in (
         ("item", item),
         ("provider", work_meta or {}),
@@ -878,6 +1086,11 @@ async def _batch_load_work_metadata(
         topics: list[str] = []
         biblio: dict[str, str] = {}
         citation_count = None
+        citations_by_provider: dict[str, int] = {}
+        providers: list[str] = []
+        openalex_id = ""
+        scopus_id = ""
+        arxiv_version = ""
         authorships: list[dict[str, Any]] = []
 
         for match in work.grant_matches or []:
@@ -894,6 +1107,13 @@ async def _batch_load_work_metadata(
             )
 
         for record in work.provider_records or []:
+            provider = clean_cell(record.provider).casefold()
+            if provider and provider not in providers:
+                providers.append(provider)
+            if provider == "openalex" and not openalex_id:
+                openalex_id = clean_cell(record.provider_work_id)
+            if provider == "scopus" and not scopus_id:
+                scopus_id = clean_cell(record.provider_work_id)
             raw = record.raw_metadata if isinstance(record.raw_metadata, dict) else {}
             extracted = _extract_biblio_fields(raw)
             for key, value in extracted.items():
@@ -902,14 +1122,34 @@ async def _batch_load_work_metadata(
             topics.extend(_topic_names(raw.get("topics")))
             topics.extend(_topic_names(raw.get("categories")))
             topics.extend(_topic_names(raw.get("concepts")))
-            if citation_count is None:
-                for key in ("citation_count", "cited_by_count"):
-                    if raw.get(key) is not None:
-                        citation_count = raw.get(key)
-                        break
+            for key in ("citation_count", "cited_by_count"):
+                if raw.get(key) is None:
+                    continue
+                try:
+                    count = int(raw.get(key))
+                except (TypeError, ValueError):
+                    continue
+                if count < 0:
+                    continue
+                if provider and provider not in citations_by_provider:
+                    citations_by_provider[provider] = count
+                if citation_count is None and provider == "openalex":
+                    citation_count = count
+                break
+            if provider == "scopus":
+                scopus_id = clean_cell(raw.get("scopus_id") or raw.get("eid") or scopus_id)
+            if provider == "arxiv" and not arxiv_version:
+                arxiv_version = clean_cell(raw.get("arxiv_version") or raw.get("version"))
             for grant in raw.get("grants") or []:
                 if isinstance(grant, dict):
-                    grants.append(grant)
+                    row = dict(grant)
+                    row.setdefault("provider", provider)
+                    grants.append(row)
+
+        if citation_count is None and citations_by_provider:
+            from app.services.analysis.publication_enrichment import preferred_citation_count
+
+            citation_count = preferred_citation_count(citations_by_provider)
 
         for authorship in sorted(
             work.authorships or [],
@@ -967,8 +1207,12 @@ async def _batch_load_work_metadata(
             "doi": clean_cell(work.doi),
             "pmid": clean_cell(work.pmid),
             "arxiv_id": clean_cell(work.arxiv_id),
+            "arxiv_version": arxiv_version,
+            "openalex_id": openalex_id,
+            "scopus_id": scopus_id,
             "title": clean_cell(work.title, collapse_whitespace=False),
             "publication_year": work.publication_year,
+            "providers": providers,
             "grants": grants,
             "topics": _unique_names(topics),
             "publisher": biblio.get("publisher", ""),
@@ -980,6 +1224,7 @@ async def _batch_load_work_metadata(
             "language": biblio.get("language", ""),
             "citation_count": citation_count,
             "cited_by_count": citation_count,
+            "citations_by_provider": citations_by_provider,
             "authorships": authorships,
         }
     return by_id
@@ -1056,14 +1301,35 @@ def publication_item_to_row_dict(
         list(item.get("grants") or []) + list(work_meta.get("grants") or [])
     )
 
-    sources = item.get("providers") or []
-    if not sources and item.get("source"):
-        sources = [item.get("source")]
-    source_labels = [_source_label(value) for value in sources]
-
     arxiv_id = clean_cell(item.get("arxiv_id") or work_meta.get("arxiv_id"))
     if not arxiv_id and str(item.get("source") or "").casefold() == "arxiv":
         arxiv_id = clean_cell(item.get("source_id"))
+    arxiv_version = clean_cell(item.get("arxiv_version") or work_meta.get("arxiv_version"))
+    openalex_id = clean_cell(item.get("openalex_id") or work_meta.get("openalex_id"))
+    scopus_id = clean_cell(item.get("scopus_id") or work_meta.get("scopus_id"))
+    if not openalex_id:
+        for row in item.get("source_records") or []:
+            if isinstance(row, dict) and clean_cell(row.get("provider")).casefold() == "openalex":
+                openalex_id = clean_cell(row.get("provider_work_id"))
+                break
+    if not scopus_id:
+        for row in item.get("source_records") or []:
+            if isinstance(row, dict) and clean_cell(row.get("provider")).casefold() == "scopus":
+                scopus_id = clean_cell(row.get("provider_work_id"))
+                break
+
+    citations_by_provider = _citations_by_provider_map(item, work_meta=work_meta)
+    source_labels = _export_source_labels(
+        openalex_id=openalex_id,
+        arxiv_id=arxiv_id,
+        arxiv_version=arxiv_version,
+        scopus_id=scopus_id,
+        citations_by_provider=citations_by_provider,
+        grants=grants,
+        item_providers=item.get("providers") or [],
+        work_providers=work_meta.get("providers") or [],
+        source=item.get("source"),
+    )
 
     primary_url = clean_cell(
         item.get("url") or item.get("entry_url") or item.get("primary_url")
@@ -1133,9 +1399,13 @@ def publication_item_to_row_dict(
             [_format_countries(author) for author in export_authors]
         ),
         "Citation Count": citation,
+        "Citations by Provider": _format_citations_by_provider(citations_by_provider),
         "DOI": clean_cell(item.get("doi") or work_meta.get("doi")),
         "PMID": clean_cell(item.get("pmid") or work_meta.get("pmid")),
         "arXiv ID": arxiv_id,
+        "arXiv Version": arxiv_version,
+        "OpenAlex ID": openalex_id,
+        "Scopus ID": scopus_id,
         "Primary URL": primary_url,
         "PDF URL": pdf_url,
         "Open Access Status": oa_status,
@@ -1144,6 +1414,9 @@ def publication_item_to_row_dict(
         "Grant Numbers": join_aligned([g["grant_number"] for g in grants]),
         "Grant Funders": join_aligned([g.get("funder") or "" for g in grants]),
         "Grant Agencies": join_aligned([g.get("agency") or "" for g in grants]),
+        "Grant Providers": join_unique(
+            [_source_label(g.get("provider")) for g in grants]
+        ),
         "Research Topics": join_unique(topics),
     }
     if searched_grant:
@@ -1281,21 +1554,63 @@ async def prepare_author_publication_export(
 ) -> dict[str, Any]:
     started = time.perf_counter()
     diagnostics = ExportDiagnostics()
-    collected = await _collect_author_publications(session, authors=authors, collect_all=True)
-    echo_authors = collected["authors"]
     normalized_filters = normalize_filters(filters)
+    corpus_source = "live"
+    echo_authors = authors
+    items: list[dict[str, Any]] = []
+
+    # Prefer the same verified stored corpus as table / timeline / Insights.
+    if session is not None:
+        from app.services.analysis.author_work_sync import AuthorWorkSyncService
+        from app.services.analysis.publication_corpus import (
+            load_stored_publication_filter_items,
+        )
+        from app.services.analysis.publication_enrichment import (
+            enrich_selected_authors_publications,
+        )
+
+        if await AuthorWorkSyncService(session).fresh_verified_sync_stats(authors) is not None:
+            # Soft enrichment overlays; never expands the OpenAlex corpus.
+            await enrich_selected_authors_publications(session, authors)
+            loaded = await load_stored_publication_filter_items(session, authors)
+            by_id = {
+                str(row.get("canonical_author_id") or "").strip(): row
+                for row in authors
+                if isinstance(row, dict) and row.get("canonical_author_id")
+            }
+            echo_authors = []
+            for row in loaded["authors"]:
+                request_row = by_id.get(str(row["canonical_author_id"])) or {}
+                echo_authors.append(
+                    {
+                        "canonical_author_id": row["canonical_author_id"],
+                        "display_name": row["display_name"],
+                        "provider": request_row.get("provider") or "openalex",
+                        "provider_author_id": request_row.get("provider_author_id")
+                        or row["canonical_author_id"],
+                    }
+                )
+            items = list(loaded.get("publication_items") or [])
+            corpus_source = "stored_complete_corpus"
+
+    if corpus_source != "stored_complete_corpus":
+        collected = await _collect_author_publications(
+            session, authors=authors, collect_all=True
+        )
+        echo_authors = collected["authors"]
+        if collected.get("unsupported"):
+            raise AuthorAnalysisError(
+                collected.get("unsupported_reason")
+                or "Author publication export is not supported for these authors.",
+                status_code=400,
+            )
+        items = list(collected["items"] or [])
+        corpus_source = "live"
+
     filename = build_authors_export_filename(
         echo_authors, filters=normalized_filters
     )
-
-    if collected.get("unsupported"):
-        raise AuthorAnalysisError(
-            collected.get("unsupported_reason")
-            or "Author publication export is not supported for these authors.",
-            status_code=400,
-        )
-
-    filtered_items = apply_publication_filters(collected["items"], normalized_filters)
+    filtered_items = apply_publication_filters(items, normalized_filters)
     filtered_items, author_metadata, work_metadata = await _enrich_export_items(
         session,
         filtered_items,
@@ -1312,7 +1627,11 @@ async def prepare_author_publication_export(
         diagnostics=diagnostics,
     )
     diagnostics.export_duration_ms = (time.perf_counter() - started) * 1000
-    logger.info("author_publications_csv_export %s", diagnostics.as_log_dict())
+    logger.info(
+        "author_publications_csv_export corpus_source=%s %s",
+        corpus_source,
+        diagnostics.as_log_dict(),
+    )
     return {
         "authors": echo_authors,
         "items": filtered_items,
@@ -1321,6 +1640,7 @@ async def prepare_author_publication_export(
         "filename": filename,
         "row_count": len(filtered_items),
         "searched_grant": None,
+        "corpus_source": corpus_source,
         "diagnostics": diagnostics.as_log_dict(),
     }
 

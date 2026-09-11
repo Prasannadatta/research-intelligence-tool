@@ -727,6 +727,307 @@ async def test_undercounted_crawl_is_not_marked_complete(session_factory):
 
 
 @pytest.mark.asyncio
+async def test_finished_crawl_collapses_duplicate_openalex_work_ids(session_factory):
+    """meta.count can count alternate OpenAlex ids that merge to one stored work."""
+    async with session_factory() as session:
+        author = await _seed_author(session, name="Author A", openalex_id="A1")
+        await session.commit()
+
+        first = _work_row("W-primary", "Same Paper", [("A1", "Author A")])
+        first["doi"] = "10.1000/same"
+        second = _work_row("W-alternate", "Same Paper", [("A1", "Author A")])
+        second["doi"] = "10.1000/same"
+
+        with patch(
+            "app.services.analysis.author_work_sync.search_works_by_author_ids",
+            new_callable=AsyncMock,
+            return_value={
+                "results": [first, second],
+                "has_more": False,
+                "next_cursor": None,
+                "count": 2,
+            },
+        ):
+            stats = await AuthorWorkSyncService(session).synchronize_selected_authors(
+                [_author_payload(author)]
+            )
+
+    assert stats[0]["status"] == "complete"
+    assert stats[0]["coverage_verified"] is True
+    assert stats[0]["stored_work_count_after"] == 1
+    assert stats[0]["provider_work_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_sipahigil_shaped_openalex_99_collapses_to_88_canonical_corpus(
+    session_factory,
+):
+    """Regression for Alp Sipahigil (OpenAlex A5064615305): 99 vs 88.
+
+    OpenAlex lists 99 distinct work IDs (meta.count). Eleven are alternate versions
+    of the same papers (shared DOI). Persistence merges them into 88 canonical works
+    via DOI (not title+year alone). Verified Analyze corpus + timeline/graph counts
+    must be 88, not OpenAlex's raw 99. Completeness still requires a finished crawl
+    of all IDs.
+    """
+    openalex_author_id = "A5064615305"
+    results: list[dict] = []
+    for index in range(88):
+        row = _work_row(
+            f"W{index:03d}",
+            f"Canonical Paper {index}",
+            [(openalex_author_id, "Alp Sipahigil")],
+        )
+        row["publication_year"] = 2011 + (index % 15)
+        row["doi"] = f"10.1000/sipahigil-{index}"
+        results.append(row)
+    # Eleven alternate OpenAlex IDs that merge onto the first eleven papers.
+    for index in range(11):
+        alt = _work_row(
+            f"WALT{index:03d}",
+            f"Canonical Paper {index}",
+            [(openalex_author_id, "Alp Sipahigil")],
+        )
+        alt["publication_year"] = results[index]["publication_year"]
+        alt["doi"] = results[index]["doi"]
+        results.append(alt)
+    assert len(results) == 99
+
+    async with session_factory() as session:
+        author = await _seed_author(
+            session, name="Alp Sipahigil", openalex_id=openalex_author_id
+        )
+        record = await _provider_record(session, author)
+        record.works_count = 99
+        await session.commit()
+
+        with patch(
+            "app.services.analysis.author_work_sync.search_works_by_author_ids",
+            new_callable=AsyncMock,
+            return_value={
+                "results": results,
+                "has_more": False,
+                "next_cursor": None,
+                "count": 99,
+            },
+        ) as mock_fetch:
+            stats = await AuthorWorkSyncService(session).synchronize_selected_authors(
+                [_author_payload(author)]
+            )
+
+        provider_links = (
+            await session.execute(
+                select(func.count(ProviderWorkRecord.id)).where(
+                    ProviderWorkRecord.provider == "openalex",
+                    ProviderWorkRecord.provider_work_id.in_(
+                        [row["openalex_id"] for row in results]
+                    ),
+                )
+            )
+        ).scalar_one()
+        linked_canonical = (
+            await session.execute(
+                select(func.count(func.distinct(WorkAuthorship.canonical_work_id))).where(
+                    WorkAuthorship.canonical_author_id == author.id
+                )
+            )
+        ).scalar_one()
+        state = (
+            await session.execute(
+                select(AuthorWorkSyncState).where(
+                    AuthorWorkSyncState.canonical_author_id == author.id,
+                    AuthorWorkSyncState.provider == "openalex",
+                )
+            )
+        ).scalar_one()
+
+    assert mock_fetch.await_count == 1
+    assert stats[0]["status"] == "complete"
+    assert stats[0]["coverage_verified"] is True
+    assert stats[0]["stored_work_count_after"] == 88
+    assert stats[0]["provider_work_count"] == 88
+    assert provider_links == 99
+    assert linked_canonical == 88
+    assert state.stored_work_count == 88
+    assert state.provider_work_count == 88
+
+
+@pytest.mark.asyncio
+async def test_schleier_smith_shaped_openalex_107_collapses_after_empty_title_persist(
+    session_factory,
+):
+    """Regression for Monika Schleier-Smith (OpenAlex A5021463446): 107 vs 96.
+
+    Trace (live OpenAlex, Sep 2026):
+    - meta.count = 107 distinct W-ids
+    - 1 empty-title repository record (W3099820453) was previously dropped in
+      normalize_search_work → only 106 provider rows entered persistence
+    - 10 of those 106 are DOI alternate versions → 96 canonical linked works
+    - Sipahigil-style completeness could not apply (106 < 107), so sync ended
+      partial with resume_cursor=None
+
+    After empty-title recovery, all 107 IDs persist. Ten DOI merges remain
+    legitimate; the recovered repository record is a real additional publication
+    → 97 linked. Completeness still requires a finished crawl of every ID.
+    """
+    openalex_author_id = "A5021463446"
+    author_name = "Monika Schleier-Smith"
+    results: list[dict] = []
+    for index in range(96):
+        row = _work_row(
+            f"W{index:03d}",
+            f"Canonical Paper {index}",
+            [(openalex_author_id, author_name)],
+        )
+        row["publication_year"] = 2008 + (index % 18)
+        row["doi"] = f"10.1000/schleier-{index}"
+        results.append(row)
+    for index in range(10):
+        alt = _work_row(
+            f"WALT{index:03d}",
+            f"Canonical Paper {index}",
+            [(openalex_author_id, author_name)],
+        )
+        alt["publication_year"] = results[index]["publication_year"]
+        alt["doi"] = results[index]["doi"]
+        results.append(alt)
+    # Empty OpenAlex title recovered from landing-page slug (real W3099820453 shape).
+    recovered = _work_row(
+        "W3099820453",
+        "one and twoaxis squeezing of atomic ensembles in optical cavities",
+        [(openalex_author_id, author_name)],
+    )
+    recovered["publication_year"] = None
+    recovered["doi"] = None
+    results.append(recovered)
+    assert len(results) == 107
+
+    async with session_factory() as session:
+        author = await _seed_author(
+            session, name=author_name, openalex_id=openalex_author_id
+        )
+        record = await _provider_record(session, author)
+        record.works_count = 107
+        await session.commit()
+
+        with patch(
+            "app.services.analysis.author_work_sync.search_works_by_author_ids",
+            new_callable=AsyncMock,
+            return_value={
+                "results": results,
+                "has_more": False,
+                "next_cursor": None,
+                "count": 107,
+            },
+        ) as mock_fetch:
+            stats = await AuthorWorkSyncService(session).synchronize_selected_authors(
+                [_author_payload(author)]
+            )
+
+        provider_links = (
+            await session.execute(
+                select(func.count(ProviderWorkRecord.id)).where(
+                    ProviderWorkRecord.provider == "openalex",
+                    ProviderWorkRecord.provider_work_id.in_(
+                        [row["openalex_id"] for row in results]
+                    ),
+                )
+            )
+        ).scalar_one()
+        linked_canonical = (
+            await session.execute(
+                select(func.count(func.distinct(WorkAuthorship.canonical_work_id))).where(
+                    WorkAuthorship.canonical_author_id == author.id
+                )
+            )
+        ).scalar_one()
+        state = (
+            await session.execute(
+                select(AuthorWorkSyncState).where(
+                    AuthorWorkSyncState.canonical_author_id == author.id,
+                    AuthorWorkSyncState.provider == "openalex",
+                )
+            )
+        ).scalar_one()
+
+    assert mock_fetch.await_count == 1
+    assert stats[0]["status"] == "complete"
+    assert stats[0]["coverage_verified"] is True
+    assert stats[0]["stored_work_count_after"] == 97
+    assert stats[0]["provider_work_count"] == 97
+    assert provider_links == 107
+    assert linked_canonical == 97
+    assert state.stored_work_count == 97
+    assert state.provider_work_count == 97
+    assert state.resume_cursor is None
+    assert state.error_message is None
+
+
+@pytest.mark.asyncio
+async def test_schleier_smith_incomplete_when_empty_title_id_still_missing(
+    session_factory,
+):
+    """Do not weaken completeness: 106 fetched of 107 reported must stay partial."""
+    openalex_author_id = "A5021463446"
+    author_name = "Monika Schleier-Smith"
+    results: list[dict] = []
+    for index in range(96):
+        row = _work_row(
+            f"W{index:03d}",
+            f"Canonical Paper {index}",
+            [(openalex_author_id, author_name)],
+        )
+        row["doi"] = f"10.1000/schleier-miss-{index}"
+        results.append(row)
+    for index in range(10):
+        alt = _work_row(
+            f"WALT{index:03d}",
+            f"Canonical Paper {index}",
+            [(openalex_author_id, author_name)],
+        )
+        alt["doi"] = results[index]["doi"]
+        results.append(alt)
+    assert len(results) == 106
+
+    async with session_factory() as session:
+        author = await _seed_author(
+            session, name=author_name, openalex_id=openalex_author_id
+        )
+        record = await _provider_record(session, author)
+        record.works_count = 107
+        await session.commit()
+
+        with patch(
+            "app.services.analysis.author_work_sync.search_works_by_author_ids",
+            new_callable=AsyncMock,
+            return_value={
+                "results": results,
+                "has_more": False,
+                "next_cursor": None,
+                "count": 107,
+            },
+        ):
+            stats = await AuthorWorkSyncService(session).synchronize_selected_authors(
+                [_author_payload(author)]
+            )
+
+        state = (
+            await session.execute(
+                select(AuthorWorkSyncState).where(
+                    AuthorWorkSyncState.canonical_author_id == author.id,
+                    AuthorWorkSyncState.provider == "openalex",
+                )
+            )
+        ).scalar_one()
+
+    assert stats[0]["status"] == "partial"
+    assert stats[0]["coverage_verified"] is False
+    assert "96" in (stats[0]["error_message"] or "")
+    assert "107" in (stats[0]["error_message"] or "")
+    assert state.resume_cursor is None
+
+
+@pytest.mark.asyncio
 async def test_missing_provider_total_cannot_be_marked_complete(session_factory):
     async with session_factory() as session:
         author = await _seed_author(session, name="Author A", openalex_id="A1")

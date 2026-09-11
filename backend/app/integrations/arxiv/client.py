@@ -154,7 +154,13 @@ def reset_arxiv_client_state_for_tests() -> None:
     _last_uncached_request_at = 0.0
 
 
-async def _fetch_arxiv_atom(*, search_query: str, start: int, max_results: int) -> str:
+async def _fetch_arxiv_atom(
+    *,
+    search_query: str | None = None,
+    id_list: str | None = None,
+    start: int = 0,
+    max_results: int = PAGE_SIZE,
+) -> str:
     """Fetch Atom XML with process-wide pacing for uncached requests."""
     global _last_uncached_request_at
 
@@ -165,13 +171,16 @@ async def _fetch_arxiv_atom(*, search_query: str, start: int, max_results: int) 
             status_code=503,
         )
 
-    params = {
-        "search_query": search_query,
+    params: dict[str, Any] = {
         "start": start,
         "max_results": max_results,
-        "sortBy": "relevance",
-        "sortOrder": "descending",
     }
+    if id_list:
+        params["id_list"] = id_list
+    else:
+        params["search_query"] = search_query or ""
+        params["sortBy"] = "relevance"
+        params["sortOrder"] = "descending"
     headers = {
         "User-Agent": settings.arxiv_user_agent,
         "Accept": "application/atom+xml, application/xml, text/xml, */*",
@@ -240,6 +249,52 @@ async def _get_parsed_page(
     parsed = parse_arxiv_feed(xml_text)
     _page_cache.set(key, parsed)
     return parsed
+
+
+async def fetch_arxiv_works_by_ids(
+    arxiv_ids: list[str],
+    *,
+    max_results: int | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch preprint metadata for known arXiv IDs (enrich-only; no author crawl).
+
+    Uses the Atom `id_list` API. Results are cached in-process by id set.
+    """
+    from app.integrations.arxiv.parser import extract_arxiv_id
+    from app.services.work_persistence.normalization import normalize_arxiv_id
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for value in arxiv_ids:
+        normalized = normalize_arxiv_id(value)
+        if not normalized:
+            bare, _version = extract_arxiv_id(value)
+            normalized = normalize_arxiv_id(bare) if bare else None
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        cleaned.append(normalized)
+    if not cleaned:
+        return []
+
+    page_size = max(1, min(int(max_results or len(cleaned)), 50))
+    cache_key = _cache_key(
+        entity_type="work_by_id",
+        query=",".join(cleaned),
+        start=0,
+    )
+    cached = _page_cache.get(cache_key)
+    if cached is not None:
+        return list(cached.get("results") or [])
+
+    xml_text = await _fetch_arxiv_atom(
+        id_list=",".join(cleaned),
+        start=0,
+        max_results=page_size,
+    )
+    parsed = parse_arxiv_feed(xml_text)
+    _page_cache.set(cache_key, parsed)
+    return list(parsed.get("results") or [])
 
 
 def _page_has_more(

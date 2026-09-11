@@ -152,10 +152,10 @@ def _date_only(date_text: str | None) -> str | None:
 
 def normalize_arxiv_work(entry: Any) -> dict[str, Any] | None:
     raw_id = getattr(entry, "id", None) or ""
-    arxiv_id, _version = extract_arxiv_id(raw_id)
+    arxiv_id, version = extract_arxiv_id(raw_id)
     if not arxiv_id:
         abs_link = _entry_link(entry, rel="alternate") or getattr(entry, "link", None)
-        arxiv_id, _version = extract_arxiv_id(abs_link)
+        arxiv_id, version = extract_arxiv_id(abs_link)
 
     if not arxiv_id:
         return None
@@ -175,12 +175,15 @@ def normalize_arxiv_work(entry: Any) -> dict[str, Any] | None:
         or getattr(entry, "link", None)
         or f"https://arxiv.org/abs/{arxiv_id}"
     )
+    version_text = str(version).strip() if version else None
 
     return {
         "result_id": f"arxiv:{arxiv_id}",
         "result_type": "work",
         "source": "arxiv",
         "source_id": arxiv_id,
+        "arxiv_id": arxiv_id,
+        "arxiv_version": version_text,
         "openalex_id": None,
         "title": title,
         "summary": summary,
@@ -189,9 +192,11 @@ def normalize_arxiv_work(entry: Any) -> dict[str, Any] | None:
         "updated_date": updated,
         "authors": authors,
         "primary_source": "arXiv",
+        "journal": "arXiv",
         "doi": None,
         "work_type": "preprint",
         "cited_by_count": None,
+        "citation_count": None,
         "is_open_access": True,
         "categories": categories,
         "pdf_url": pdf_url,

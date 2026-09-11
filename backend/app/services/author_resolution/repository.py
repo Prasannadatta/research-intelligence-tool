@@ -329,15 +329,23 @@ class AuthorIdentityRepository:
         if keep.id == discard.id:
             return keep
 
+        # Transfer via relationship collections so cascade="all, delete-orphan"
+        # does not delete provider records that were only FK-reassigned.
         for record in list(discard.provider_records):
+            discard.provider_records.remove(record)
             record.canonical_author_id = keep.id
+            keep.provider_records.append(record)
 
         keep_aliases = {a.normalized_alias for a in keep.aliases}
         keep_aliases.add(keep.normalized_name)
         for alias in list(discard.aliases):
             if alias.normalized_alias in keep_aliases:
+                discard.aliases.remove(alias)
+                await self.session.delete(alias)
                 continue
+            discard.aliases.remove(alias)
             alias.canonical_author_id = keep.id
+            keep.aliases.append(alias)
             keep_aliases.add(alias.normalized_alias)
 
         # Preserve discard preferred name as alias when distinct.

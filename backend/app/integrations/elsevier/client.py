@@ -138,6 +138,34 @@ class ElsevierClient:
             timeout=20.0,
         )
 
+    async def get_author_by_orcid(
+        self,
+        orcid: str,
+        *,
+        view: str = "ENHANCED",
+    ) -> httpx.Response:
+        """Scopus Author Retrieval by ORCID (profile enrichment only — not search)."""
+        from urllib.parse import quote
+
+        cleaned = str(orcid or "").strip()
+        if not cleaned:
+            raise ElsevierApiError("ORCID is required.", status_code=400)
+        self._require_api_key()
+        base = get_settings().elsevier_api_base_url.rstrip("/")
+        url = f"{base}/content/author/orcid/{quote(cleaned, safe='')}"
+        logger.info(
+            "elsevier_author_by_orcid orcid=%s view=%s",
+            cleaned,
+            view,
+        )
+        return await self._request_func(
+            "elsevier",
+            url,
+            params={"view": view},
+            headers=elsevier_headers(),
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+
 
 def classify_elsevier_status(status_code: int) -> str:
     """Map HTTP status to a journal_metrics status value."""

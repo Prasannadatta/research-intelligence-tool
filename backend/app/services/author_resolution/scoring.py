@@ -124,6 +124,32 @@ def score_candidate_pair(
 
     same_orcid = bool(left_orcid and right_orcid and left_orcid == right_orcid)
 
+    left_provider = str(getattr(left, "provider", None) or "").strip().lower()
+    right_provider = str(getattr(right, "provider", None) or "").strip().lower()
+    left_provider_id = str(getattr(left, "provider_author_id", None) or "").strip()
+    right_provider_id = str(getattr(right, "provider_author_id", None) or "").strip()
+    # OpenAlex can expose multiple author ids for one ORCID. Keep them separate so
+    # corpus sync does not OR-crawl unrelated/duplicate profiles.
+    if (
+        same_orcid
+        and left_provider == "openalex"
+        and right_provider == "openalex"
+        and left_provider_id
+        and right_provider_id
+        and left_provider_id != right_provider_id
+    ):
+        return MatchScore(
+            total_score=0.0,
+            decision=DECISION_SEPARATE,
+            reasoning={
+                "signals": ["distinct_openalex_ids_same_orcid"],
+                "left_orcid": left_orcid,
+                "right_orcid": right_orcid,
+                "left_provider_author_id": left_provider_id,
+                "right_provider_author_id": right_provider_id,
+            },
+        )
+
     name_score = 0.0
     left_name = getattr(left, "normalized_name", None) or normalize_author_name(
         getattr(left, "display_name", "")

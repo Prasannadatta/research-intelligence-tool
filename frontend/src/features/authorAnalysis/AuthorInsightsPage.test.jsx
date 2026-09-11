@@ -473,7 +473,7 @@ describe("AuthorInsightsPage", () => {
       cursor: null,
     });
 
-    fireEvent.click(screen.getByRole("button", { name: /Year/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Year" }));
     await waitFor(() => {
       expect(analysisApi.fetchAuthorPublications).toHaveBeenCalledTimes(2);
     });
@@ -483,7 +483,7 @@ describe("AuthorInsightsPage", () => {
       cursor: null,
     });
 
-    fireEvent.click(screen.getByRole("button", { name: /Year/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Year" }));
     await waitFor(() => {
       expect(analysisApi.fetchAuthorPublications).toHaveBeenCalledTimes(3);
     });

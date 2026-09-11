@@ -154,7 +154,10 @@ def serialize_canonical_author(canonical: CanonicalAuthor) -> dict[str, Any]:
         "openalex_id": next(
             (
                 record.provider_author_id
-                for record in openalex_records
+                for record in sorted(
+                    openalex_records,
+                    key=lambda row: (-(row.works_count or 0), row.provider_author_id or ""),
+                )
             ),
             None,
         ),
@@ -187,21 +190,88 @@ class AuthorResolutionService:
             else settings.author_possible_duplicate_threshold
         )
 
+    async def _lookup_openalex_id_for_orcid(
+        self,
+        candidate: AuthorCandidate,
+    ) -> tuple[str, int | None] | None:
+        """Resolve OpenAlex author id by exact ORCID only (never by name)."""
+        from app.integrations.openalex.client import is_valid_openalex_author_id
+        from app.integrations.openalex.unified_search import (
+            search_openalex_authors_by_orcid,
+        )
+
+        from_meta = linked_openalex_id_from_orcid_metadata(
+            orcid=candidate.orcid,
+            raw_metadata=candidate.raw_metadata,
+        )
+        if from_meta:
+            works_count = None
+            if isinstance(candidate.raw_metadata, dict):
+                try:
+                    works_count = int(
+                        candidate.raw_metadata.get("works_count")
+                        or candidate.works_count
+                        or 0
+                    ) or None
+                except (TypeError, ValueError):
+                    works_count = candidate.works_count
+            return from_meta, works_count
+
+        orcid = normalize_orcid_id(candidate.orcid)
+        if not orcid:
+            return None
+
+        try:
+            payload = await search_openalex_authors_by_orcid(orcid, limit=5)
+        except Exception:
+            logger.warning(
+                "openalex_orcid_lookup_failed orcid=%s",
+                orcid,
+                exc_info=True,
+            )
+            return None
+
+        matches: list[tuple[int, str]] = []
+        for row in payload.get("results") or []:
+            if not isinstance(row, dict):
+                continue
+            if normalize_orcid_id(row.get("orcid")) != orcid:
+                continue
+            openalex_id = str(row.get("openalex_id") or "").strip()
+            if openalex_id and is_valid_openalex_author_id(openalex_id):
+                try:
+                    works_count = int(row.get("works_count") or 0)
+                except (TypeError, ValueError):
+                    works_count = 0
+                matches.append((works_count, openalex_id))
+
+        if not matches:
+            return None
+        # Exact ORCID can match multiple OpenAlex profiles; pick the primary by works.
+        matches.sort(key=lambda item: (-item[0], item[1]))
+        best_works, best_id = matches[0]
+        return best_id, best_works or None
+
     async def _attach_linked_openalex_from_search(
         self,
         candidate: AuthorCandidate,
         canonical: CanonicalAuthor,
     ) -> CanonicalAuthor:
-        """Persist a pre-linked OpenAlex provider record from ORCID search metadata."""
+        """Link OpenAlex for an ORCID selection via exact ORCID (metadata or API)."""
         if candidate.provider != "orcid":
             return canonical
 
-        openalex_id = linked_openalex_id_from_orcid_metadata(
-            orcid=candidate.orcid,
-            raw_metadata=candidate.raw_metadata,
-        )
-        if not openalex_id:
+        if any(
+            record.provider == "openalex"
+            for record in (canonical.provider_records or [])
+        ):
             return canonical
+
+        looked_up = await self._lookup_openalex_id_for_orcid(candidate)
+        if not looked_up:
+            # No OpenAlex identity for this ORCID — leave ORCID-only; never claim complete.
+            return canonical
+        openalex_id, openalex_works_count = looked_up
 
         openalex_candidate = AuthorCandidate(
             provider="openalex",
@@ -212,7 +282,9 @@ class AuthorResolutionService:
             works=list(candidate.works),
             topics=list(candidate.topics),
             orcid=candidate.orcid,
-            works_count=candidate.works_count,
+            works_count=openalex_works_count
+            if openalex_works_count is not None
+            else candidate.works_count,
             raw_metadata=candidate.raw_metadata,
         )
         openalex_record = await self.repo.upsert_provider_record(openalex_candidate)
@@ -220,11 +292,23 @@ class AuthorResolutionService:
             if openalex_record.canonical_author_id == canonical.id:
                 refreshed = await self.repo.load_canonical(canonical.id)
                 return refreshed or canonical
+
             linked_orcid = normalize_orcid_id(openalex_record.orcid)
             candidate_orcid = normalize_orcid_id(candidate.orcid)
             if linked_orcid and candidate_orcid and linked_orcid != candidate_orcid:
+                # Conflicting ORCID on existing OpenAlex record — do not merge by name.
                 return canonical
-            return canonical
+
+            other = await self.repo.load_canonical(openalex_record.canonical_author_id)
+            if other is None:
+                await self.repo.attach_record_to_canonical(openalex_record, canonical)
+                refreshed = await self.repo.load_canonical(canonical.id)
+                return refreshed or canonical
+
+            # Exact ORCID → OpenAlex link: keep the OpenAlex canonical as survivor.
+            merged = await self.repo.merge_canonicals(other, canonical)
+            refreshed = await self.repo.load_canonical(merged.id)
+            return refreshed or merged
 
         await self.repo.attach_record_to_canonical(openalex_record, canonical)
         refreshed = await self.repo.load_canonical(canonical.id)
@@ -431,7 +515,15 @@ async def resolve_author_page(
                 and existing.canonical_author_id is not None
                 and existing.canonical_author is not None
             ):
-                author = serialize_canonical_author(existing.canonical_author)
+                # Re-select must still attempt exact-ORCID → OpenAlex linking when
+                # the stored ORCID canonical has no OpenAlex provider yet.
+                canonical = existing.canonical_author
+                if candidate.provider == "orcid":
+                    canonical = await service._attach_linked_openalex_from_search(
+                        candidate,
+                        canonical,
+                    )
+                author = serialize_canonical_author(canonical)
             else:
                 author, _created = await service.resolve_candidate(candidate)
         except Exception:

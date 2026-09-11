@@ -111,7 +111,15 @@ def test_single_author_openalex_publications(monkeypatch):
     assert item["analysis_match"]["method"] == METHOD_PROVIDER_IDS
     assert item["grants"][0]["award_id"] == "R01GM123456"
     assert mock_oa.await_count == 1
-    assert body["timeline"] is not None
+    # Timeline/facets come from the corpus stats job, not live table pages.
+    assert body["timeline"] is None
+    assert body["facets"] == {
+        "sources": [],
+        "institutions": [],
+        "venues": [],
+        "grants": [],
+        "authors": [],
+    }
     assert mock_oa.await_args.kwargs["author_id_groups"] == [["A1234567890"]]
     assert body["provider_total_count"] == 1
 

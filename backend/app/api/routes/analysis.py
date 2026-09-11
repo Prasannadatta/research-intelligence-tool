@@ -44,6 +44,7 @@ from app.services.analysis.publication_stats_jobs import (
     serialize_publication_stats_job,
 )
 from app.services.analysis.sync_job_errors import incomplete_sync_failure
+from app.services.analysis.publication_enrichment import enrich_selected_authors_publications
 from app.services.analysis.author_publications import (
     build_author_publication_facets,
     search_author_publication_grants,
@@ -83,6 +84,7 @@ async def author_publications_analysis(
             authors=[author.model_dump() for author in body.authors],
             limit=body.limit,
             cursor=body.cursor,
+            page=body.page,
             filters=body.filters.model_dump() if body.filters else None,
             sort_by=body.sort_by,
             sort_direction=body.sort_direction,
@@ -168,6 +170,7 @@ async def create_author_publication_stats_job(
     payload = {
         "authors": [author.model_dump() for author in body.authors],
         "filters": body.filters.model_dump() if body.filters else None,
+        "retry_incomplete_only": bool(body.retry_incomplete_only),
     }
     job = await enqueue_publication_stats_job(session, payload)
     return AuthorPublicationStatsJobResponse.model_validate(job)
@@ -197,6 +200,12 @@ async def author_insights_dashboard(
     body: AuthorInsightsRequest,
     session: AsyncSession = Depends(get_db_session),
 ) -> AuthorInsightsResponse:
+    """Legacy blocking Insights endpoint (tests + API clients).
+
+    The Analyze Authors UI uses POST /authors/insights/jobs instead. Kept so
+    existing integration tests and any non-UI callers still work; do not wire
+    new UI to this path.
+    """
     request_started = time.perf_counter()
     author_payloads = [author.model_dump() for author in body.authors]
     try:
@@ -209,6 +218,10 @@ async def author_insights_dashboard(
                 incomplete["error_message"],
                 status_code=409,
             )
+        enrichment = await enrich_selected_authors_publications(
+            session,
+            author_payloads,
+        )
         result = await AuthorInsightsService(session).build_dashboard(
             authors=author_payloads,
             filters=body.filters.model_dump() if body.filters else None,
@@ -218,7 +231,10 @@ async def author_insights_dashboard(
             "verified": True,
             "corpus_complete": True,
             "source": "stored_complete_corpus",
+            "enrichment_applied": True,
+            "enrichment_affects_completeness": False,
         }
+        result["enrichment"] = enrichment
     except AuthorAnalysisError as exc:
         log_insights_timing(
             "total_request",
@@ -249,6 +265,7 @@ async def create_author_insights_job(
         "authors": [author.model_dump() for author in body.authors],
         "filters": body.filters.model_dump() if body.filters else None,
         "excluded_work_ids": body.excluded_work_ids,
+        "retry_incomplete_only": bool(body.retry_incomplete_only),
     }
     job = await enqueue_insights_job(session, payload)
     return AuthorInsightsJobResponse.model_validate(job)
@@ -309,6 +326,7 @@ async def author_publications_export(
         "Content-Disposition": f'attachment; filename="{filename}"',
         "Cache-Control": "no-store",
         "X-Export-Row-Count": str(prepared["row_count"]),
+        "X-Corpus-Source": str(prepared.get("corpus_source") or "live"),
     }
     return StreamingResponse(
         stream_publication_csv(prepared),

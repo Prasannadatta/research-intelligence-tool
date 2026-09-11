@@ -57,6 +57,9 @@ class AuthorPublicationsRequest(BaseModel):
     sort_direction: Literal["asc", "desc"] = "desc"
     limit: int = Field(20, ge=1, le=20)
     cursor: str | None = None
+    # 1-based page. Preferred once the verified corpus is available; live pages
+    # still may need `cursor` to advance provider crawls before sync completes.
+    page: int | None = Field(None, ge=1)
 
 
 class AuthorPublicationsExportRequest(BaseModel):
@@ -114,11 +117,17 @@ class AnalysisPublicationItem(BaseModel):
     title: str
     authors: list[AnalysisWorkAuthor] = Field(default_factory=list)
     publication_year: int | None = None
+    publication_date: str | None = None
     journal: str | None = None
     primary_source: str | None = None
     citation_count: int | None = None
     cited_by_count: int | None = None
+    citations_by_provider: dict[str, int] = Field(default_factory=dict)
     doi: str | None = None
+    pmid: str | None = None
+    arxiv_id: str | None = None
+    arxiv_version: str | None = None
+    scopus_id: str | None = None
     url: str | None = None
     providers: list[str] = Field(default_factory=list)
     grants: list[AnalysisGrant] = Field(default_factory=list)
@@ -131,6 +140,7 @@ class AnalysisPublicationItem(BaseModel):
     entry_url: str | None = None
     is_open_access: bool | None = None
     work_type: str | None = None
+    publisher: str | None = None
     source_records: list[dict[str, Any]] = Field(default_factory=list)
 
 
@@ -144,6 +154,12 @@ class AnalysisAuthorEcho(BaseModel):
 class AnalysisPagination(BaseModel):
     next_cursor: str | None = None
     has_more: bool = False
+    page: int = 1
+    offset: int = 0
+    limit: int = 20
+    # Matching unique publications after filters when known (stored corpus).
+    total: int | None = None
+    corpus_source: Literal["live", "stored_complete_corpus"] | None = None
 
 
 class PublicationTimelineBucket(BaseModel):
@@ -247,6 +263,9 @@ class AuthorInsightsRequest(BaseModel):
     authors: list[AuthorInsightsAuthorInput] = Field(..., min_length=1)
     filters: AuthorPublicationFilters | None = None
     excluded_work_ids: list[str] = Field(default_factory=list)
+    # When true (Retry), sync only incomplete authors — skip verified-complete and
+    # TTL-stale rows that have no resume cursor.
+    retry_incomplete_only: bool = False
 
 
 class AuthorInsightsPublicationsRequest(BaseModel):
@@ -408,7 +427,9 @@ class AuthorInsightsResponse(BaseModel):
         default_factory=AuthorInsightsInstitutionDataQuality
     )
     facets: PublicationFacets = Field(default_factory=PublicationFacets)
+    # Completeness is OpenAlex-verified corpus only; enrichment metrics are advisory.
     coverage: dict[str, Any] | None = None
+    enrichment: dict[str, Any] | None = None
 
 
 class AuthorInsightsPublicationsResponse(BaseModel):
@@ -440,6 +461,8 @@ class AuthorPublicationCorpusStats(BaseModel):
     total_matching_publications: int = 0
     total_corpus_publications: int = 0
     corpus_complete: bool = False
+    coverage: dict[str, Any] | None = None
+    enrichment: dict[str, Any] | None = None
 
 
 class AuthorPublicationStatsJobResponse(BaseModel):

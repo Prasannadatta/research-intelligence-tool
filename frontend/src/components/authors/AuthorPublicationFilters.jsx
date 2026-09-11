@@ -40,6 +40,9 @@ export function formatCompleteCorpusFilterCaption(totalCount) {
   if (!Number.isFinite(total) || total < 0) {
     return "Filter options and counts are from all matching publications.";
   }
+  if (total === 0) {
+    return "Filter options will appear once matching publications are available.";
+  }
   return `Filter options and counts are from all ${total.toLocaleString("en-US")} publications.`;
 }
 
@@ -541,13 +544,13 @@ function AuthorPublicationFilters({
   };
 
   return (
-    <Box sx={{ mb: 2.5 }} data-testid="publication-filters">
+    <Box sx={{ mb: 0 }} data-testid="publication-filters">
       <Stack
         direction="row"
         alignItems="center"
         justifyContent="space-between"
         spacing={1}
-        sx={{ mb: expanded ? 1 : 0 }}
+        sx={{ mb: expanded || appliedChips.length > 0 ? 0.75 : 0 }}
       >
         <Stack
           direction="row"

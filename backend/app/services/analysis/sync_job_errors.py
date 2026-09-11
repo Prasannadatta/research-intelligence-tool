@@ -63,6 +63,11 @@ def _format_problem_parts(problems: list[dict[str, Any]]) -> str:
 
 
 def _blocking_sync_problems(stats: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Compatibility alias — prefer ``blocking_sync_problems``."""
+    return blocking_sync_problems(stats)
+
+
+def blocking_sync_problems(stats: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return sync rows that block a verified-complete analytics job.
 
     OpenAlex is the source of truth for verified completeness. Name-based arXiv
@@ -151,7 +156,7 @@ def incomplete_sync_failure(
     rate_limit = rate_limit_failure(stats)
     if rate_limit:
         return rate_limit
-    problems = _blocking_sync_problems(stats)
+    problems = blocking_sync_problems(stats)
     if not problems:
         return None
     return {

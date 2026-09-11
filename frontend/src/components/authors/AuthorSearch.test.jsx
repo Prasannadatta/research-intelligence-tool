@@ -168,4 +168,44 @@ describe("AuthorSearch UI", () => {
       ).toBeInTheDocument();
     });
   });
+
+  it("keeps always-visible institution filters clickable without triggering outside close", async () => {
+    vi.spyOn(searchApi, "searchInstitutions").mockResolvedValue([
+      { id: "I100", display_name: "UC Berkeley", works_count: 50 },
+    ]);
+
+    renderSearch();
+
+    const instInput = screen.getByPlaceholderText(/Search institutions/i);
+    expect(instInput).toBeInTheDocument();
+
+    fireEvent.focus(instInput);
+    fireEvent.change(instInput, { target: { value: "UC Berkeley" } });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(450);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("UC Berkeley")).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText("UC Berkeley"));
+
+    await waitFor(() => {
+      expect(screen.getByText(/Institution: UC Berkeley/i)).toBeInTheDocument();
+    });
+  });
+
+  it("hides OpenAlex filters when ORCID is selected", async () => {
+    renderSearch();
+
+    expect(screen.getByTestId("author-filters")).toBeInTheDocument();
+
+    fireEvent.mouseDown(screen.getByLabelText("Search source"));
+    fireEvent.click(screen.getByRole("option", { name: "ORCID" }));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("author-filters")).not.toBeInTheDocument();
+    });
+  });
 });

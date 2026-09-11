@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, patch
+
 import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -23,6 +25,26 @@ from app.services.author_resolution.service import AuthorResolutionService, reso
 
 LIN_BERKELEY = "0000-0001-6860-9566"
 LIN_EDUCATION = "0000-0002-2400-5864"
+
+
+@pytest.fixture(autouse=True)
+def _no_openalex_orcid_lookup_by_default():
+    """Existing tests assert ORCID-only behavior unless they patch this lookup."""
+    empty = {
+        "query": "",
+        "entity_type": "authors",
+        "source": "openalex",
+        "search_mode": "orcid",
+        "results": [],
+        "next_cursor": None,
+        "has_more": False,
+    }
+    with patch(
+        "app.integrations.openalex.unified_search.search_openalex_authors_by_orcid",
+        new_callable=AsyncMock,
+        return_value=empty,
+    ):
+        yield
 
 
 @pytest_asyncio.fixture
@@ -101,14 +123,12 @@ def _enriched_orcid_search_row(
 
 
 def _to_analysis_author_payload(item: dict) -> dict | None:
+    """Mirror frontend toAnalysisAuthorPayload (OpenAlex preferred, ORCID allowed)."""
     source_records = item.get("source_records") or []
     openalex = next((row for row in source_records if row.get("provider") == "openalex"), None)
     arxiv = next((row for row in source_records if row.get("provider") == "arxiv"), None)
-    provider = (
-        (openalex or {}).get("provider")
-        or (arxiv or {}).get("provider")
-        or item.get("source")
-    )
+    orcid_record = next((row for row in source_records if row.get("provider") == "orcid"), None)
+    provider = (openalex or {}).get("provider") or (arxiv or {}).get("provider")
     provider_author_id = (
         (openalex or {}).get("provider_author_id")
         or (arxiv or {}).get("provider_author_id")
@@ -117,6 +137,9 @@ def _to_analysis_author_payload(item: dict) -> dict | None:
     if not provider or not provider_author_id:
         if item.get("openalex_id"):
             provider, provider_author_id = "openalex", item["openalex_id"]
+        elif item.get("orcid") or (orcid_record or {}).get("provider_author_id"):
+            provider = "orcid"
+            provider_author_id = item.get("orcid") or orcid_record["provider_author_id"]
     canonical_author_id = (
         item.get("id") or item.get("result_id") or item.get("canonical_author_id")
     )
@@ -219,7 +242,10 @@ async def test_all_sources_style_enriched_rows_keep_both_provider_records(sessio
     assert {row["provider"] for row in education["source_records"]} == {"orcid"}
     assert berkeley["id"] != education["id"]
     assert _to_analysis_author_payload(berkeley)["provider_author_id"] == "A9"
-    assert _to_analysis_author_payload(education) is None
+    education_payload = _to_analysis_author_payload(education)
+    assert education_payload is not None
+    assert education_payload["provider"] == "orcid"
+    assert education_payload["provider_author_id"] == LIN_EDUCATION
 
 
 @pytest.mark.asyncio
@@ -258,6 +284,31 @@ def test_exact_orcid_match_is_strong_identity_signal():
     )
     assert score.decision == DECISION_AUTO_MERGE
     assert "same_orcid" in score.reasoning["signals"]
+
+
+def test_distinct_openalex_ids_with_same_orcid_stay_separate():
+    left = AuthorCandidate(
+        provider="openalex",
+        provider_author_id="A5107195431",
+        display_name="Lin Lin",
+        orcid=LIN_BERKELEY,
+        works_count=366,
+    )
+    right = AuthorCandidate(
+        provider="openalex",
+        provider_author_id="A5135889380",
+        display_name="Lin Lin",
+        orcid=LIN_BERKELEY,
+        works_count=1,
+    )
+    score = score_candidate_pair(
+        left,
+        right,
+        auto_merge_threshold=85,
+        possible_duplicate_threshold=60,
+    )
+    assert score.decision == DECISION_SEPARATE
+    assert "distinct_openalex_ids_same_orcid" in score.reasoning["signals"]
 
 
 def test_name_alone_does_not_auto_merge_orcid_and_openalex():
@@ -496,3 +547,138 @@ def test_candidate_mapping_keeps_orcid_as_provider_id():
     assert candidate.provider_author_id == LIN_BERKELEY
     assert candidate.orcid == LIN_BERKELEY
     assert candidate.works[0].id == "doi:10.1/abc"
+
+
+@pytest.mark.asyncio
+async def test_orcid_selection_links_exact_openalex_via_api_lookup(session):
+    oa_hit = {
+        "result_id": "openalex:A5107195431",
+        "result_type": "author",
+        "source": "openalex",
+        "openalex_id": "A5107195431",
+        "display_name": "Lin Lin",
+        "orcid": LIN_BERKELEY,
+        "works_count": 120,
+    }
+    with patch(
+        "app.integrations.openalex.unified_search.search_openalex_authors_by_orcid",
+        new_callable=AsyncMock,
+        return_value={
+            "query": LIN_BERKELEY,
+            "entity_type": "authors",
+            "source": "openalex",
+            "search_mode": "orcid",
+            "results": [oa_hit],
+            "next_cursor": None,
+            "has_more": False,
+        },
+    ):
+        page = await resolve_author_page(
+            session,
+            [
+                _orcid_search_row(
+                    LIN_BERKELEY,
+                    institution="University of California Berkeley",
+                    works_count=83,
+                )
+            ],
+        )
+
+    assert len(page["results"]) == 1
+    resolved = page["results"][0]
+    assert resolved["orcid"] == LIN_BERKELEY
+    assert resolved["openalex_id"] == "A5107195431"
+    assert {row["provider"] for row in resolved["source_records"]} == {
+        "orcid",
+        "openalex",
+    }
+    payload = _to_analysis_author_payload(resolved)
+    assert payload["provider"] == "openalex"
+    assert payload["provider_author_id"] == "A5107195431"
+
+
+@pytest.mark.asyncio
+async def test_orcid_reselect_links_openalex_when_previously_orcid_only(session):
+    service = AuthorResolutionService(session)
+    first, _ = await service.resolve_candidate(
+        candidate_from_provider_result(
+            _orcid_search_row(LIN_BERKELEY, institution="UC Berkeley")
+        )
+    )
+    await session.commit()
+    assert first["openalex_id"] is None
+
+    oa_hit = {
+        "result_id": "openalex:A77",
+        "result_type": "author",
+        "source": "openalex",
+        "openalex_id": "A77",
+        "display_name": "Lin Lin",
+        "orcid": LIN_BERKELEY,
+    }
+    with patch(
+        "app.integrations.openalex.unified_search.search_openalex_authors_by_orcid",
+        new_callable=AsyncMock,
+        return_value={
+            "query": LIN_BERKELEY,
+            "entity_type": "authors",
+            "source": "openalex",
+            "search_mode": "orcid",
+            "results": [oa_hit],
+            "next_cursor": None,
+            "has_more": False,
+        },
+    ):
+        page = await resolve_author_page(
+            session,
+            [_orcid_search_row(LIN_BERKELEY, institution="UC Berkeley")],
+        )
+
+    assert page["results"][0]["openalex_id"] == "A77"
+    assert page["results"][0]["id"] == first["id"]
+
+
+@pytest.mark.asyncio
+async def test_orcid_api_link_merges_into_existing_openalex_canonical(session):
+    service = AuthorResolutionService(session)
+    # OpenAlex identity already stored without ORCID; name alone must not merge.
+    openalex, _ = await service.resolve_candidate(
+        AuthorCandidate(
+            provider="openalex",
+            provider_author_id="A5107195431",
+            display_name="Lin Lin",
+        )
+    )
+    await session.commit()
+
+    with patch(
+        "app.integrations.openalex.unified_search.search_openalex_authors_by_orcid",
+        new_callable=AsyncMock,
+        return_value={
+            "query": LIN_BERKELEY,
+            "entity_type": "authors",
+            "source": "openalex",
+            "search_mode": "orcid",
+            "results": [
+                {
+                    "openalex_id": "A5107195431",
+                    "display_name": "Lin Lin",
+                    "orcid": LIN_BERKELEY,
+                }
+            ],
+            "next_cursor": None,
+            "has_more": False,
+        },
+    ):
+        page = await resolve_author_page(
+            session,
+            [_orcid_search_row(LIN_BERKELEY, institution="UC Berkeley")],
+        )
+
+    assert len(page["results"]) == 1
+    assert page["results"][0]["id"] == openalex["id"]
+    assert page["results"][0]["openalex_id"] == "A5107195431"
+    assert {row["provider"] for row in page["results"][0]["source_records"]} == {
+        "openalex",
+        "orcid",
+    }

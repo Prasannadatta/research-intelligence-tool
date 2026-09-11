@@ -4,9 +4,14 @@ import {
   Alert,
   Box,
   Button,
+  Chip,
   CircularProgress,
+  Collapse,
+  Fade,
+  Pagination,
   Paper,
   Snackbar,
+  Stack,
   Typography,
 } from "@mui/material";
 import ArrowBackRoundedIcon from "@mui/icons-material/ArrowBackRounded";
@@ -31,12 +36,17 @@ import { AuthorInfoPopoverProvider } from "./AuthorInfoPopover";
 import { publicationsPageCache } from "./authorAnalysisCache";
 import {
   FILTER_DEBOUNCE_MS,
+  CORPUS_STATUS,
   activeAuthorIdsKey,
   analysisTitleForAuthors,
+  corpusStatusLabel,
+  deriveCorpusStatus,
   emptyStateCopy,
+  formatProviderDedupCaption,
   getActiveAuthors,
   getInitialActiveAuthorIds,
   isAuthorCheckboxDisabled,
+  providerDisplayLabel,
   providerRecordsKey,
   toggleActiveAuthor,
 } from "./authorAnalysisPageLogic";
@@ -51,7 +61,9 @@ import {
 } from "./publicationFilters";
 import {
   DEFAULT_PUBLICATION_SORT,
+  isDefaultPublicationSort,
   normalizePublicationSort,
+  publicationSortChipLabel,
   publicationSortKey,
 } from "./publicationSorting";
 import { getWorkDate, getWorkId } from "./authorPublicationHelpers";
@@ -62,12 +74,57 @@ import * as publicationStatsRequest from "./publicationStatsRequest";
 
 const PAGE_SIZE = 20;
 
+const CORPUS_STATUS_CHIP_SX = {
+  [CORPUS_STATUS.VERIFIED]: { color: "success" },
+  [CORPUS_STATUS.SYNCING]: { color: "info" },
+  [CORPUS_STATUS.PARTIAL]: { color: "default" },
+  [CORPUS_STATUS.RATE_LIMITED]: { color: "warning" },
+  [CORPUS_STATUS.FAILED]: { color: "warning" },
+};
+
 function asProviderTotalCount(value) {
   if (value == null || value === "") {
     return null;
   }
   const number = Number(value);
   return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
+function asMatchedTotal(value) {
+  if (value == null || value === "") {
+    return null;
+  }
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
+function formatPublicationRange({
+  page,
+  pageSize,
+  itemCount,
+  matchedTotal,
+  corpusTotalCount,
+  providerTotalCount,
+  corpusComplete,
+}) {
+  if (!itemCount) {
+    return null;
+  }
+  const offset = Math.max(0, (Math.max(1, page) - 1) * pageSize);
+  const from = offset + 1;
+  const to = offset + itemCount;
+  const total =
+    matchedTotal
+    ?? (corpusComplete ? corpusTotalCount : null)
+    ?? providerTotalCount;
+  const totalLabel = total != null
+    ? Number(total).toLocaleString()
+    : null;
+  const range = `${from.toLocaleString()}–${to.toLocaleString()}`;
+  if (totalLabel != null) {
+    return `Showing ${range} of ${totalLabel} unique publication${Number(total) === 1 ? "" : "s"}`;
+  }
+  return `Showing ${range} publication${itemCount === 1 ? "" : "s"}`;
 }
 const EMPTY_FILTERS_KEY = publicationFiltersKey(emptyPublicationFilters());
 
@@ -198,10 +255,10 @@ function AuthorAnalysisPage() {
   const [timeline, setTimeline] = useState(null);
   const [timelineError, setTimelineError] = useState(null);
   const [providerTotalCount, setProviderTotalCount] = useState(null);
-  const [nextCursor, setNextCursor] = useState(null);
+  const [matchedTotal, setMatchedTotal] = useState(null);
+  const [page, setPage] = useState(1);
   const [hasMore, setHasMore] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState(null);
   const [unsupported, setUnsupported] = useState(false);
   const [unsupportedReason, setUnsupportedReason] = useState(null);
@@ -215,8 +272,6 @@ function AuthorAnalysisPage() {
 
   const requestIdRef = useRef(0);
   const resetAbortRef = useRef(null);
-  const loadMoreAbortRef = useRef(null);
-  const loadMoreInFlightRef = useRef(false);
   const applyInFlightRef = useRef(false);
   const selectionKeyRef = useRef(selectionKey);
   const sortRef = useRef(publicationSort);
@@ -226,15 +281,18 @@ function AuthorAnalysisPage() {
   const appliedFiltersKeyRef = useRef(appliedFiltersKey);
   const appliedFiltersRef = useRef(appliedFilters);
   const hasLoadedOnceRef = useRef(false);
-  const sentinelRef = useRef(null);
-  const seenIdsRef = useRef(new Set());
+  const pageRef = useRef(1);
+  const corpusCompleteRef = useRef(false);
+  const boundToStoredCorpusRef = useRef(false);
+  // Live-mode only: cursor required to request page N before the verified corpus exists.
+  const pageCursorByPageRef = useRef(new Map([[1, null]]));
   const paginationStateRef = useRef({
     hasMore: false,
-    nextCursor: null,
+    page: 1,
     loading: false,
-    loadingMore: false,
     unsupported: false,
     error: null,
+    matchedTotal: null,
   });
 
   /* eslint-disable react-hooks/refs -- This page keeps request guards in refs so async pagination callbacks see the latest state. */
@@ -245,13 +303,15 @@ function AuthorAnalysisPage() {
   appliedFiltersRef.current = appliedFilters;
   filtersPayloadRef.current = appliedFiltersPayload;
   requestKeyRef.current = `${selectionKey}::${appliedFiltersKey}::${sortKey}`;
+  pageRef.current = page;
+  corpusCompleteRef.current = corpusComplete;
   paginationStateRef.current = {
     hasMore,
-    nextCursor,
+    page,
     loading,
-    loadingMore,
     unsupported,
     error,
+    matchedTotal,
   };
   /* eslint-enable react-hooks/refs */
 
@@ -280,6 +340,9 @@ function AuthorAnalysisPage() {
       sortKeyOverride,
       preserveExisting: preserveExistingOption,
       forceRefresh = false,
+      preserveCorpusStats = false,
+      page: pageOverride = 1,
+      resetPagination = true,
     } = {}) => {
       if (activeAuthors.length === 0) {
         setItems([]);
@@ -287,10 +350,11 @@ function AuthorAnalysisPage() {
         setTimelineError(null);
         setFacets(emptyFacets());
         setProviderTotalCount(null);
-        setNextCursor(null);
+        setMatchedTotal(null);
+        setPage(1);
+        pageRef.current = 1;
+        pageCursorByPageRef.current = new Map([[1, null]]);
         setHasMore(false);
-        setLoadingMore(false);
-        loadMoreInFlightRef.current = false;
         applyInFlightRef.current = false;
         setUnsupported(false);
         setUnsupportedReason(null);
@@ -304,11 +368,6 @@ function AuthorAnalysisPage() {
       if (resetAbortRef.current) {
         resetAbortRef.current.abort();
       }
-      if (loadMoreAbortRef.current) {
-        loadMoreAbortRef.current.abort();
-      }
-      loadMoreInFlightRef.current = false;
-      setLoadingMore(false);
 
       const controller = new AbortController();
       resetAbortRef.current = controller;
@@ -330,12 +389,28 @@ function AuthorAnalysisPage() {
           ? sortKeyOverride
           : publicationSortKey(sortForRequest);
       const fetchRequestKey = `${selectionKeyRef.current}::${filtersKeyForCache}::${sortKeyForCache}`;
+      const targetPage = Math.max(1, Number(pageOverride) || 1);
 
       filtersPayloadRef.current = filtersForRequest;
       appliedFiltersKeyRef.current = filtersKeyForCache;
       sortRef.current = sortForRequest;
       sortKeyRef.current = sortKeyForCache;
       requestKeyRef.current = fetchRequestKey;
+
+      if (resetPagination) {
+        pageCursorByPageRef.current = new Map([[1, null]]);
+      }
+
+      const useStoredPaging = corpusCompleteRef.current;
+      const pageCursor = useStoredPaging
+        ? null
+        : (pageCursorByPageRef.current.has(targetPage)
+          ? pageCursorByPageRef.current.get(targetPage)
+          : (targetPage === 1 ? null : undefined));
+      if (!useStoredPaging && targetPage > 1 && pageCursor === undefined) {
+        // Cannot jump ahead in live mode without the prior page cursor.
+        return;
+      }
 
       const preserveExisting =
         preserveExistingOption !== undefined
@@ -348,7 +423,8 @@ function AuthorAnalysisPage() {
         providerRecordsKey: recordsKey,
         filtersKey: filtersKeyForCache,
         sortKey: sortKeyForCache,
-        cursor: "*",
+        cursor: useStoredPaging ? `stored-page-${targetPage}` : (pageCursor ?? "*"),
+        page: targetPage,
         limit: PAGE_SIZE,
       });
 
@@ -356,21 +432,23 @@ function AuthorAnalysisPage() {
         ? null
         : publicationsPageCache.get(cacheKey);
       if (cached) {
-        seenIdsRef.current = new Set(
-          (cached.items || [])
-            .map((item) => item.id || item.result_id)
-            .filter(Boolean),
-        );
         setItems(cached.items || []);
-        setTimeline(null);
-        setTimelineError(null);
-        setFacets(emptyFacets());
-        setCorpusComplete(false);
-        setCorpusTotalCount(null);
-        setStatsError(null);
+        if (!preserveCorpusStats) {
+          setTimeline(null);
+          setTimelineError(null);
+          setFacets(emptyFacets());
+          setCorpusComplete(false);
+          setCorpusTotalCount(null);
+          setStatsError(null);
+        }
         setProviderTotalCount(asProviderTotalCount(cached.provider_total_count));
-        setNextCursor(cached.next_cursor ?? null);
+        setMatchedTotal(asMatchedTotal(cached.matched_total));
+        setPage(cached.page || targetPage);
+        pageRef.current = cached.page || targetPage;
         setHasMore(Boolean(cached.has_more));
+        if (cached.next_cursor) {
+          pageCursorByPageRef.current.set((cached.page || targetPage) + 1, cached.next_cursor);
+        }
         setUnsupported(Boolean(cached.unsupported));
         setUnsupportedReason(cached.unsupported_reason || null);
         setInitialEmpty(
@@ -393,16 +471,19 @@ function AuthorAnalysisPage() {
       setInitialEmpty(false);
       if (!preserveExisting) {
         setItems([]);
-        setTimeline(null);
         setProviderTotalCount(null);
-        setFacets(emptyFacets());
-        setCorpusComplete(false);
-        setCorpusTotalCount(null);
-        setStatsError(null);
+        setMatchedTotal(null);
+        if (!preserveCorpusStats) {
+          setTimeline(null);
+          setFacets(emptyFacets());
+          setCorpusComplete(false);
+          setCorpusTotalCount(null);
+          setStatsError(null);
+        }
       }
-      setNextCursor(null);
+      setPage(targetPage);
+      pageRef.current = targetPage;
       setHasMore(false);
-      seenIdsRef.current = new Set();
 
       try {
         const response = await fetchAuthorPublications({
@@ -412,7 +493,8 @@ function AuthorAnalysisPage() {
           sortBy: sortForRequest.sortBy,
           sortDirection: sortForRequest.sortDirection,
           limit: PAGE_SIZE,
-          cursor: null,
+          page: targetPage,
+          cursor: useStoredPaging ? null : pageCursor,
           signal: controller.signal,
         });
 
@@ -424,31 +506,43 @@ function AuthorAnalysisPage() {
         }
 
         const pageItems = Array.isArray(response.items) ? response.items : [];
-        seenIdsRef.current = new Set(
-          pageItems.map((item) => item.id || item.result_id).filter(Boolean),
-        );
+        const responsePage = response.pagination?.page || targetPage;
+        const responseMatched = asMatchedTotal(response.pagination?.total);
+        const responseHasMore = Boolean(response.has_more);
+        const responseNextCursor = response.next_cursor ?? null;
 
         publicationsPageCache.set(cacheKey, {
           items: pageItems,
           timeline: null,
           facets: emptyFacets(),
           provider_total_count: asProviderTotalCount(response.provider_total_count),
-          next_cursor: response.next_cursor,
-          has_more: response.has_more,
+          matched_total: responseMatched,
+          page: responsePage,
+          next_cursor: responseNextCursor,
+          has_more: responseHasMore,
           unsupported: response.unsupported,
           unsupported_reason: response.unsupported_reason,
+          corpus_source: response.pagination?.corpus_source || null,
         });
 
         setItems(pageItems);
-        setTimeline(null);
-        setTimelineError(null);
-        setFacets(emptyFacets());
-        setCorpusComplete(false);
-        setCorpusTotalCount(null);
-        setStatsError(null);
+        if (!preserveCorpusStats) {
+          setTimeline(null);
+          setTimelineError(null);
+          setFacets(emptyFacets());
+          setCorpusComplete(false);
+          setCorpusTotalCount(null);
+          setStatsError(null);
+        }
         setProviderTotalCount(asProviderTotalCount(response.provider_total_count));
-        setNextCursor(response.next_cursor);
-        setHasMore(Boolean(response.has_more));
+        setMatchedTotal(responseMatched);
+        setPage(responsePage);
+        pageRef.current = responsePage;
+        setHasMore(responseHasMore);
+        pageCursorByPageRef.current.set(responsePage, useStoredPaging ? null : pageCursor);
+        if (responseNextCursor) {
+          pageCursorByPageRef.current.set(responsePage + 1, responseNextCursor);
+        }
         setUnsupported(Boolean(response.unsupported));
         setUnsupportedReason(response.unsupported_reason || null);
         setInitialEmpty(!response.unsupported && pageItems.length === 0);
@@ -469,12 +563,14 @@ function AuthorAnalysisPage() {
         );
         if (!preserveExisting) {
           setItems([]);
-          setTimeline(null);
           setProviderTotalCount(null);
+          setMatchedTotal(null);
+          if (!preserveCorpusStats) {
+            setTimeline(null);
+          }
         }
         setTimelineError(null);
         setHasMore(false);
-        setNextCursor(null);
       } finally {
         applyInFlightRef.current = false;
         if (
@@ -495,124 +591,32 @@ function AuthorAnalysisPage() {
     ],
   );
 
-  const loadMore = useCallback(async () => {
-    const state = paginationStateRef.current;
-    if (
-      !state.hasMore ||
-      !state.nextCursor ||
-      state.loading ||
-      state.loadingMore ||
-      state.unsupported ||
-      loadMoreInFlightRef.current
-    ) {
-      return;
-    }
-
-    const fetchRequestKey = requestKeyRef.current;
-    const pageCursor = state.nextCursor;
-    loadMoreInFlightRef.current = true;
-
-    if (loadMoreAbortRef.current) {
-      loadMoreAbortRef.current.abort();
-    }
-    const controller = new AbortController();
-    loadMoreAbortRef.current = controller;
-
-    const cacheKey = buildAuthorPublicationsCacheKey({
-      mode,
-      canonicalAuthorIds: authorIds,
-      providerRecordsKey: recordsKey,
-      filtersKey: appliedFiltersKeyRef.current,
-      sortKey: sortKeyRef.current,
-      cursor: pageCursor,
-      limit: PAGE_SIZE,
-    });
-
-    const cached = publicationsPageCache.get(cacheKey);
-    if (cached) {
-      const appended = [];
-      for (const item of cached.items || []) {
-        const key = item.id || item.result_id;
-        if (!key || seenIdsRef.current.has(key)) {
-          continue;
-        }
-        seenIdsRef.current.add(key);
-        appended.push(item);
-      }
-      if (fetchRequestKey === requestKeyRef.current) {
-        setItems((current) => [...current, ...appended]);
-        setNextCursor(cached.next_cursor ?? null);
-        setHasMore(Boolean(cached.has_more));
-      }
-      loadMoreInFlightRef.current = false;
-      return;
-    }
-
-    setLoadingMore(true);
-    try {
-      const response = await fetchAuthorPublications({
-        authors: activeAuthors,
-        originalAuthorIds,
-        filters: filtersPayloadRef.current,
-        sortBy: sortRef.current.sortBy,
-        sortDirection: sortRef.current.sortDirection,
-        limit: PAGE_SIZE,
-        cursor: pageCursor,
-        signal: controller.signal,
-      });
-
-      if (fetchRequestKey !== requestKeyRef.current) {
-        return;
-      }
-
-      const pageItems = Array.isArray(response.items) ? response.items : [];
-      publicationsPageCache.set(cacheKey, {
-        items: pageItems,
-        next_cursor: response.next_cursor,
-        has_more: response.has_more,
-        unsupported: response.unsupported,
-        unsupported_reason: response.unsupported_reason,
-      });
-
-      const appended = [];
-      for (const item of pageItems) {
-        const key = item.id || item.result_id;
-        if (!key || seenIdsRef.current.has(key)) {
-          continue;
-        }
-        seenIdsRef.current.add(key);
-        appended.push(item);
-      }
-
-      setItems((current) => [...current, ...appended]);
-      setNextCursor(response.next_cursor);
-      setHasMore(Boolean(response.has_more));
-    } catch (err) {
-      if (err?.name === "CanceledError" || err?.code === "ERR_CANCELED") {
-        return;
-      }
-      if (fetchRequestKey !== requestKeyRef.current) {
-        return;
-      }
-      setError(
-        err?.response?.data?.detail ||
-          "Could not load more publications. Please try again.",
-      );
-    } finally {
-      loadMoreInFlightRef.current = false;
-      if (fetchRequestKey === requestKeyRef.current) {
-        setLoadingMore(false);
-      }
-    }
-  }, [activeAuthors, authorIds, mode, originalAuthorIds, recordsKey]);
-
-  const loadMoreRef = useRef(loadMore);
-  /* eslint-disable react-hooks/refs -- IntersectionObserver callbacks call the latest pagination functions. */
-  loadMoreRef.current = loadMore;
-
   const resetAndLoadRef = useRef(resetAndLoad);
+  /* eslint-disable react-hooks/refs -- Pagination callbacks call the latest load function. */
   resetAndLoadRef.current = resetAndLoad;
   /* eslint-enable react-hooks/refs */
+
+  const handlePageChange = useCallback(
+    (_event, nextPage) => {
+      const target = Math.max(1, Number(nextPage) || 1);
+      if (target === pageRef.current || loading) {
+        return;
+      }
+      setSelectedTableWorkIds(new Set());
+      resetAndLoad({
+        filtersOverride: filtersPayloadRef.current,
+        filtersKeyOverride: appliedFiltersKeyRef.current,
+        sortOverride: sortRef.current,
+        sortKeyOverride: sortKeyRef.current,
+        preserveExisting: false,
+        forceRefresh: false,
+        preserveCorpusStats: true,
+        page: target,
+        resetPagination: false,
+      });
+    },
+    [loading, resetAndLoad],
+  );
 
   const handleExportCsv = useCallback(async () => {
     const response = await exportAuthorPublicationsCsv({
@@ -676,16 +680,28 @@ function AuthorAnalysisPage() {
       .fetchAuthorPublicationCorpusStats({
         authors: statsAuthors,
         filters: appliedFiltersPayload,
+        retryIncompleteOnly: statsRetryToken > 0,
         signal: controller.signal,
         onProgress: (job) => {
           if (requestId !== statsRequestIdRef.current) {
             return;
           }
-          setStatsProgress({
-            status: job.status || "running",
-            stage: job.progress_stage || job.progressStage || "Preparing",
-            percent: Number(job.progress_percent ?? job.progressPercent ?? 0),
-            detail: job.progress_detail || job.progressDetail || null,
+          const nextPercent = Number(job.progress_percent ?? job.progressPercent ?? 0);
+          setStatsProgress((previous) => {
+            const sameJob =
+              previous?.jobId
+              && (job.job_id || job.jobId)
+              && String(previous.jobId) === String(job.job_id || job.jobId);
+            const percent = sameJob
+              ? Math.max(Number(previous.percent) || 0, nextPercent)
+              : nextPercent;
+            return {
+              jobId: job.job_id || job.jobId || previous?.jobId || null,
+              status: job.status || "running",
+              stage: job.progress_stage || job.progressStage || "Preparing",
+              percent,
+              detail: job.progress_detail || job.progressDetail || null,
+            };
           });
         },
       })
@@ -775,10 +791,6 @@ function AuthorAnalysisPage() {
       if (resetAbortRef.current) {
         resetAbortRef.current.abort();
       }
-      if (loadMoreAbortRef.current) {
-        loadMoreAbortRef.current.abort();
-      }
-      loadMoreInFlightRef.current = false;
     };
   }, [location.state?.filters, selectionKey]);
 
@@ -804,6 +816,8 @@ function AuthorAnalysisPage() {
         sortKeyOverride: sortKeyRef.current,
         preserveExisting: true,
         forceRefresh: true,
+        page: 1,
+        resetPagination: true,
       });
     },
     [resetAndLoad],
@@ -829,6 +843,8 @@ function AuthorAnalysisPage() {
       sortKeyOverride: sortKeyRef.current,
       preserveExisting: true,
       forceRefresh: true,
+      page: 1,
+      resetPagination: true,
     });
   }, [resetAndLoad]);
 
@@ -855,6 +871,8 @@ function AuthorAnalysisPage() {
         sortKeyOverride: sortKeyRef.current,
         preserveExisting: true,
         forceRefresh: true,
+        page: 1,
+        resetPagination: true,
       });
     },
     [resetAndLoad],
@@ -1011,43 +1029,108 @@ function AuthorAnalysisPage() {
         sortKeyOverride: nextSortKey,
         preserveExisting: false,
         forceRefresh: true,
+        // Sort only reloads the table; keep corpus timeline/facets/counts.
+        preserveCorpusStats: true,
+        page: 1,
+        resetPagination: true,
       });
     },
     [resetAndLoad],
   );
 
+  // Once the verified corpus is ready, rebind the current page to stored works
+  // so page/sort/filter share the same canonical set as timeline/facets.
   useEffect(() => {
-    const node = sentinelRef.current;
-    if (!node || unsupported || error) {
-      return undefined;
+    if (!corpusComplete) {
+      boundToStoredCorpusRef.current = false;
+      return;
     }
+    if (!hasLoadedOnce || unsupported || boundToStoredCorpusRef.current) {
+      return;
+    }
+    boundToStoredCorpusRef.current = true;
+    pageCursorByPageRef.current = new Map([[1, null]]);
+    resetAndLoadRef.current({
+      filtersOverride: filtersPayloadRef.current,
+      filtersKeyOverride: appliedFiltersKeyRef.current,
+      sortOverride: sortRef.current,
+      sortKeyOverride: sortKeyRef.current,
+      preserveExisting: true,
+      forceRefresh: true,
+      preserveCorpusStats: true,
+      page: pageRef.current,
+      resetPagination: true,
+    });
+  }, [corpusComplete, hasLoadedOnce, unsupported]);
 
-    const observer = new IntersectionObserver(
-      (entries) => {
-        if (!entries.some((entry) => entry.isIntersecting)) {
-          return;
-        }
-        const state = paginationStateRef.current;
-        if (
-          !state.hasMore ||
-          !state.nextCursor ||
-          state.loading ||
-          state.loadingMore ||
-          state.unsupported ||
-          loadMoreInFlightRef.current
-        ) {
-          return;
-        }
-        loadMoreRef.current();
-      },
-      { root: null, rootMargin: "240px", threshold: 0 },
-    );
-    observer.observe(node);
-    return () => observer.disconnect();
-  }, [error, hasMore, loading, unsupported, items.length]);
+  const publicationRangeLabel = formatPublicationRange({
+    page,
+    pageSize: PAGE_SIZE,
+    itemCount: items.length,
+    matchedTotal,
+    corpusTotalCount,
+    providerTotalCount,
+    corpusComplete,
+  });
+
+  const totalForPages =
+    matchedTotal
+    ?? (corpusComplete ? corpusTotalCount : null);
+  const totalPages = totalForPages != null
+    ? Math.max(1, Math.ceil(Number(totalForPages) / PAGE_SIZE))
+    : Math.max(1, page + (hasMore ? 1 : 0));
+
+  const uniqueCountForDedup =
+    matchedTotal
+    ?? (corpusComplete ? corpusTotalCount : null);
+  const providerDedupCaption = formatProviderDedupCaption({
+    uniqueCount: uniqueCountForDedup,
+    providerTotalCount,
+    providerLabel: providerDisplayLabel(activeAuthors),
+  });
+
+  const corpusStatus = deriveCorpusStatus({
+    corpusComplete,
+    statsLoading,
+    statsError,
+    statsProgress,
+    hasLoadedOnce,
+  });
+  const corpusStatusText = corpusStatusLabel(corpusStatus);
+  const statsProgressMessage = publicationStatsRequest.formatPublicationStatsProgressMessage(
+    statsProgress,
+  );
+  const largeAuthorCohort = activeAuthors.length >= 20;
+  const showStatsProgressSnackbar =
+    statsLoading
+    && !statsError
+    && !largeAuthorCohort;
+  const corpusStatusDetail =
+    corpusStatus === CORPUS_STATUS.SYNCING
+      ? statsProgressMessage
+      : corpusStatus === CORPUS_STATUS.RATE_LIMITED || corpusStatus === CORPUS_STATUS.FAILED
+        || corpusStatus === CORPUS_STATUS.PARTIAL
+        ? (statsError || null)
+        : null;
+  const showInlineCorpusRetry =
+    Boolean(statsError)
+    && (corpusStatus === CORPUS_STATUS.FAILED
+      || corpusStatus === CORPUS_STATUS.RATE_LIMITED
+      || corpusStatus === CORPUS_STATUS.PARTIAL);
+  const sortIsDefault = isDefaultPublicationSort(publicationSort);
+  const showPublicationToolbar =
+    !unsupported && (!loading || hasLoadedOnce) && !error && items.length > 0;
 
   const handleToggleAuthor = (authorId) => {
     setActiveAuthorIds((current) => toggleActiveAuthor(current, authorId));
+  };
+
+  const handleResetSort = () => {
+    handleSortChange(DEFAULT_PUBLICATION_SORT);
+  };
+
+  const handleRetryStats = () => {
+    setStatsRetryToken((value) => value + 1);
   };
 
   const handleBack = () => {
@@ -1105,8 +1188,8 @@ function AuthorAnalysisPage() {
             alignItems: { xs: "flex-start", md: "center" },
             justifyContent: "space-between",
             flexDirection: { xs: "column", md: "row" },
-            gap: { xs: 1, md: 2 },
-            mb: 1.5,
+            gap: { xs: 1, md: 1.5 },
+            mb: 1.25,
           }}
         >
           <Typography
@@ -1118,12 +1201,13 @@ function AuthorAnalysisPage() {
             {title}
           </Typography>
           <Box
+            data-testid="author-analysis-page-actions"
             sx={{
               display: "flex",
               flexWrap: "wrap",
               alignItems: "center",
               justifyContent: { xs: "flex-start", md: "flex-end" },
-              gap: 1.5,
+              gap: 1,
               flexShrink: 0,
               alignSelf: { xs: "flex-start", md: "center" },
             }}
@@ -1155,17 +1239,84 @@ function AuthorAnalysisPage() {
             >
               Insight
             </Button>
+            {!unsupported ? (
+              <DownloadCsvButton
+                compact
+                disabled={
+                  loading ||
+                  !hasLoadedOnce ||
+                  unsupported ||
+                  activeAuthors.length === 0 ||
+                  !corpusComplete ||
+                  items.length === 0
+                }
+                onExport={handleExportCsv}
+              />
+            ) : null}
+            {!unsupported ? (
+              <Button
+                size="small"
+                variant="outlined"
+                color="inherit"
+                startIcon={<BookmarkAddRoundedIcon fontSize="small" />}
+                onClick={handleSaveSearch}
+                disabled={saveStatus.saving || originalAuthors.length === 0}
+                sx={{ textTransform: "none", whiteSpace: "nowrap" }}
+              >
+                {saveStatus.saving ? "Saving..." : "Save search"}
+              </Button>
+            ) : null}
           </Box>
         </Box>
 
         {authorFilterSection}
+
+        <Collapse in={Boolean(corpusStatusText)} timeout="auto" unmountOnExit={false}>
+          <Stack
+            direction={{ xs: "column", sm: "row" }}
+            spacing={1}
+            alignItems={{ xs: "flex-start", sm: "center" }}
+            sx={{ mb: 1.25 }}
+            data-testid="publication-corpus-status"
+          >
+            <Fade in={Boolean(corpusStatusText)}>
+              <Chip
+                size="small"
+                variant="outlined"
+                color={CORPUS_STATUS_CHIP_SX[corpusStatus]?.color || "default"}
+                label={corpusStatusText}
+                sx={{ fontWeight: 600 }}
+              />
+            </Fade>
+            {corpusStatusDetail ? (
+              <Typography
+                variant="body2"
+                color="text.secondary"
+                sx={{ lineHeight: 1.4, flex: 1, minWidth: 0 }}
+                data-testid="publication-corpus-status-detail"
+              >
+                {corpusStatusDetail}
+              </Typography>
+            ) : null}
+            {showInlineCorpusRetry ? (
+              <Button
+                size="small"
+                color="inherit"
+                onClick={handleRetryStats}
+                sx={{ textTransform: "none", flexShrink: 0 }}
+              >
+                Retry
+              </Button>
+            ) : null}
+          </Stack>
+        </Collapse>
 
         {selectedTableWorkIdList.length > 0 ? (
           <Paper
             elevation={0}
             data-testid="publication-selection-actions"
             sx={{
-              mb: 2,
+              mb: 1.5,
               p: 1.25,
               border: "1px solid",
               borderColor: "divider",
@@ -1199,108 +1350,48 @@ function AuthorAnalysisPage() {
         />
 
         {!unsupported ? (
-          <AuthorPublicationFilters
-            authors={activeAuthors}
-            draftFilters={draftFilters}
-            appliedFilters={appliedFilters}
-            onDraftChange={setDraftFilters}
-            onApply={handleApplyFilters}
-            onReset={handleResetFilters}
-            onRemoveChip={handleRemoveChip}
-            facets={facets}
-            showLoadedSampleHint={false}
-            corpusComplete={corpusComplete}
-            corpusTotalCount={corpusTotalCount}
-            facetsLoading={statsLoading}
-            disabled={unsupported || activeAuthors.length === 0}
-            applying={loading && hasLoadedOnce}
-          />
-        ) : null}
-
-        {!unsupported ? (
           <AuthorPublicationTrendChart
             timeline={timeline}
             loading={statsLoading}
             mode={mode}
-            error={statsError || timelineError}
+            error={null}
             pageLocal={false}
             corpusComplete={corpusComplete}
             corpusTotalCount={corpusTotalCount}
             providerTotalCount={providerTotalCount}
-            onRetry={
-              statsError
-                ? () => {
-                    setStatsRetryToken((value) => value + 1);
-                  }
-                : undefined
-            }
           />
         ) : null}
 
         <Snackbar
-          open={statsLoading && !statsError}
+          open={showStatsProgressSnackbar}
           anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
           data-testid="publication-stats-progress-snackbar"
         >
           <Alert
             severity="info"
-            variant="filled"
+            variant="outlined"
             icon={<CircularProgress size={18} color="inherit" />}
-            sx={{ alignItems: "center" }}
+            sx={{ alignItems: "center", bgcolor: "background.paper" }}
           >
-            {publicationStatsRequest.formatPublicationStatsProgressMessage(statsProgress)}
+            {statsProgressMessage}
           </Alert>
         </Snackbar>
         <Snackbar
           open={statsReadySnackbarOpen && corpusComplete && !statsLoading}
-          autoHideDuration={4000}
+          autoHideDuration={3500}
           onClose={() => setStatsReadySnackbarOpen(false)}
           anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
           data-testid="publication-stats-ready-snackbar"
         >
           <Alert
             severity="success"
-            variant="filled"
+            variant="outlined"
             onClose={() => setStatsReadySnackbarOpen(false)}
+            sx={{ bgcolor: "background.paper" }}
           >
             Complete publication statistics ready
           </Alert>
         </Snackbar>
-
-        <Snackbar
-          open={Boolean(statsError)}
-          anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
-          data-testid="publication-stats-error-snackbar"
-          onClose={() => setStatsError(null)}
-        >
-          <Alert
-            severity={/rate limit/i.test(String(statsError || "")) ? "warning" : "error"}
-            variant="filled"
-            onClose={() => setStatsError(null)}
-            action={
-              <Button
-                color="inherit"
-                size="small"
-                onClick={() => {
-                  setStatsRetryToken((value) => value + 1);
-                }}
-              >
-                Retry
-              </Button>
-            }
-          >
-            {statsError}
-          </Alert>
-        </Snackbar>
-
-        {!loading && !error && !unsupported && items.length > 0 ? (
-          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-            {items.length}
-            {hasMore ? "+" : ""} publication{items.length === 1 ? "" : "s"}
-          </Typography>
-        ) : (
-          <Box sx={{ mb: 2 }} />
-        )}
 
         {!loading && unsupported ? (
           <Paper
@@ -1332,51 +1423,144 @@ function AuthorAnalysisPage() {
         ) : null}
 
         {!unsupported ? (
-          <AuthorPublicationsTable
-            works={items}
-            loading={loading}
-            loadingMore={loadingMore}
-            error={error}
-            mode={mode}
-            sentinelRef={sentinelRef}
-            emptyCopy={emptyCopy}
-            initialEmpty={initialEmpty}
-            selectedWorkIds={selectedTableWorkIds}
-            excludedWorkIds={excludedWorkIds}
-            onToggleSelected={handleTogglePublicationSelected}
-            onToggleVisible={handleToggleVisiblePublications}
-            sort={publicationSort}
-            onSortChange={handleSortChange}
-          />
-        ) : null}
+          <Paper
+            elevation={0}
+            data-testid="publications-panel"
+            sx={{
+              border: "1px solid",
+              borderColor: "divider",
+              borderRadius: "18px",
+              overflow: "hidden",
+              mb: 1.5,
+            }}
+          >
+            <Box sx={{ px: { xs: 1.5, sm: 2 }, pt: 1.5, pb: 1 }}>
+              <AuthorPublicationFilters
+                authors={activeAuthors}
+                draftFilters={draftFilters}
+                appliedFilters={appliedFilters}
+                onDraftChange={setDraftFilters}
+                onApply={handleApplyFilters}
+                onReset={handleResetFilters}
+                onRemoveChip={handleRemoveChip}
+                facets={facets}
+                showLoadedSampleHint={false}
+                corpusComplete={corpusComplete}
+                corpusTotalCount={corpusTotalCount}
+                facetsLoading={statsLoading}
+                disabled={unsupported || activeAuthors.length === 0}
+                applying={loading && hasLoadedOnce}
+              />
+              {!sortIsDefault ? (
+                <Chip
+                  component="div"
+                  size="small"
+                  label={publicationSortChipLabel(publicationSort)}
+                  onDelete={handleResetSort}
+                  data-testid="publication-sort-chip"
+                  sx={{ mt: 0.75 }}
+                />
+              ) : null}
+            </Box>
 
-        {!unsupported ? (
-          <DownloadCsvButton
-            disabled={
-              loading ||
-              !hasLoadedOnce ||
-              unsupported ||
-              activeAuthors.length === 0 ||
-              items.length === 0
-            }
-            onExport={handleExportCsv}
-          />
-        ) : null}
+            {showPublicationToolbar ? (
+              <Box
+                data-testid="publications-table-toolbar"
+                sx={{
+                  px: { xs: 1.5, sm: 2 },
+                  py: 1,
+                  borderTop: "1px solid",
+                  borderColor: "divider",
+                  display: "flex",
+                  flexWrap: "wrap",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 1,
+                  bgcolor: "action.hover",
+                }}
+              >
+                <Box sx={{ minWidth: 0, flex: "1 1 220px" }}>
+                  <Typography
+                    variant="body2"
+                    color="text.secondary"
+                    data-testid="publications-range-label"
+                    sx={{ fontWeight: 600 }}
+                  >
+                    {publicationRangeLabel}
+                  </Typography>
+                  {providerDedupCaption ? (
+                    <Typography
+                      variant="caption"
+                      color="text.secondary"
+                      data-testid="publications-dedup-caption"
+                      sx={{ display: "block", mt: 0.25, lineHeight: 1.35 }}
+                    >
+                      {providerDedupCaption}
+                    </Typography>
+                  ) : null}
+                </Box>
+                {totalPages > 1 ? (
+                  <Pagination
+                    color="primary"
+                    size="small"
+                    page={page}
+                    count={totalPages}
+                    disabled={loading}
+                    onChange={handlePageChange}
+                    siblingCount={0}
+                    boundaryCount={1}
+                    showFirstButton
+                    showLastButton={totalForPages != null}
+                    data-testid="publications-pagination"
+                    sx={{ flexShrink: 0 }}
+                  />
+                ) : null}
+              </Box>
+            ) : null}
 
-        {!unsupported ? (
-          <Box sx={{ mt: 1, mb: 1 }}>
-            <Button
-              size="small"
-              variant="outlined"
-              color="inherit"
-              startIcon={<BookmarkAddRoundedIcon fontSize="small" />}
-              onClick={handleSaveSearch}
-              disabled={saveStatus.saving || originalAuthors.length === 0}
-              sx={{ textTransform: "none" }}
-            >
-              {saveStatus.saving ? "Saving..." : "Save search"}
-            </Button>
-          </Box>
+            <AuthorPublicationsTable
+              works={items}
+              loading={loading}
+              error={error}
+              mode={mode}
+              emptyCopy={emptyCopy}
+              initialEmpty={initialEmpty}
+              selectedWorkIds={selectedTableWorkIds}
+              excludedWorkIds={excludedWorkIds}
+              onToggleSelected={handleTogglePublicationSelected}
+              onToggleVisible={handleToggleVisiblePublications}
+              sort={publicationSort}
+              onSortChange={handleSortChange}
+              embedded
+            />
+
+            {showPublicationToolbar && totalPages > 1 ? (
+              <Box
+                sx={{
+                  px: { xs: 1.5, sm: 2 },
+                  py: 1,
+                  borderTop: "1px solid",
+                  borderColor: "divider",
+                  display: "flex",
+                  justifyContent: "flex-end",
+                }}
+              >
+                <Pagination
+                  color="primary"
+                  size="small"
+                  page={page}
+                  count={totalPages}
+                  disabled={loading}
+                  onChange={handlePageChange}
+                  siblingCount={0}
+                  boundaryCount={1}
+                  showFirstButton
+                  showLastButton={totalForPages != null}
+                  data-testid="publications-pagination-footer"
+                />
+              </Box>
+            ) : null}
+          </Paper>
         ) : null}
 
         <Snackbar

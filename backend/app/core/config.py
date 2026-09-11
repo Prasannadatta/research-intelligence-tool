@@ -84,6 +84,18 @@ class Settings(BaseSettings):
         le=90,
         description="Days before cached author profile metadata is refreshed from providers.",
     )
+    author_profile_orcid_enrichment_ttl_days: int = Field(
+        default=14,
+        ge=1,
+        le=90,
+        description="TTL for ORCID employment/affiliation enrichment on author hover cards.",
+    )
+    author_profile_scopus_enrichment_ttl_days: int = Field(
+        default=30,
+        ge=1,
+        le=180,
+        description="TTL for Scopus author/affiliation enrichment on author hover cards.",
+    )
 
     # Works / grants persistence (canonical works, sessions, provider cache).
     work_persistence_enabled: bool = Field(
@@ -237,6 +249,41 @@ class Settings(BaseSettings):
         ge=1,
         le=1,
         description="Maximum concurrent canonical-work cited-by syncs (SQLite-safe).",
+    )
+    publication_enrichment_enabled: bool = Field(
+        default=True,
+        description=(
+            "When true, Analyze/Insights jobs enrich existing OpenAlex works "
+            "with arXiv preprint and Scopus citation/journal metadata."
+        ),
+    )
+    publication_enrichment_ttl_seconds: int = Field(
+        default=12 * 60 * 60,
+        ge=60,
+        description="TTL before cached arXiv/Scopus publication enrichment is refreshed.",
+    )
+    publication_enrichment_negative_ttl_seconds: int = Field(
+        default=24 * 60 * 60,
+        ge=60,
+        description="TTL for not_found / unavailable publication enrichment cache rows.",
+    )
+    publication_enrichment_max_works_per_job: int = Field(
+        default=80,
+        ge=1,
+        le=500,
+        description="Maximum canonical works enriched per Analyze/Insights job run.",
+    )
+    publication_enrichment_concurrency: int = Field(
+        default=2,
+        ge=1,
+        le=8,
+        description="Maximum concurrent Scopus Abstract Retrieval calls during enrichment.",
+    )
+    publication_enrichment_arxiv_batch_size: int = Field(
+        default=20,
+        ge=1,
+        le=50,
+        description="arXiv id_list batch size for enrich-only preprint lookups.",
     )
     insights_job_max_concurrency: int = Field(
         default=2,

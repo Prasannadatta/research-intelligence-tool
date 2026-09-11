@@ -274,7 +274,7 @@ def test_canonical_work_matches_any_selected_source():
     assert not item_matches_filters(item, {"sources": ["pubmed"]})
 
 
-def test_analysis_endpoint_applies_filters_and_returns_facets(monkeypatch):
+def test_analysis_endpoint_applies_filters_without_live_facets(monkeypatch):
     with patch(
         "app.services.analysis.author_publications.search_works_by_author_ids",
         new_callable=AsyncMock,
@@ -338,12 +338,15 @@ def test_analysis_endpoint_applies_filters_and_returns_facets(monkeypatch):
     payload = response.json()
     assert len(payload["items"]) == 1
     assert payload["items"][0]["title"] == "Paper One"
-    assert payload["timeline"]["total_matching_publications"] == 1
-    assert any(row["value"] == "openalex" for row in payload["facets"]["sources"])
-    assert any(row["value"] == "nature medicine" for row in payload["facets"]["venues"])
-    assert any(
-        row["grant_number"] == "R01CA123456" for row in payload["facets"]["grants"]
-    )
+    # Filters still apply to the table; timeline/facets come from the stats job.
+    assert payload["timeline"] is None
+    assert payload["facets"] == {
+        "sources": [],
+        "institutions": [],
+        "venues": [],
+        "grants": [],
+        "authors": [],
+    }
 
 
 def test_pagination_preserves_filters(monkeypatch):

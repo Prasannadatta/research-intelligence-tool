@@ -8,6 +8,7 @@ import AuthorPublicationsTable, { COLUMN_COUNT } from "./AuthorPublicationsTable
 import GrantPublicationsPage from "../grants/GrantPublicationsPage";
 import { clearPublicationsPageCache } from "./authorAnalysisCache";
 import * as analysisApi from "../../api/analysisApi";
+import * as publicationStatsRequest from "./publicationStatsRequest";
 
 vi.mock("react-apexcharts", () => ({
   default: () => <div data-testid="apex-chart-mock" />,
@@ -37,17 +38,14 @@ const FULL_WORK = {
 };
 
 function renderTable(props = {}) {
-  const sentinelRef = { current: null };
   return render(
     <ThemeProvider theme={theme}>
       <MemoryRouter>
         <AuthorPublicationsTable
           works={[]}
           loading={false}
-          loadingMore={false}
           error={null}
           mode="single_author"
-          sentinelRef={sentinelRef}
           emptyCopy={{
             heading: "No publications found",
             body: "Nothing here.",
@@ -58,6 +56,29 @@ function renderTable(props = {}) {
       </MemoryRouter>
     </ThemeProvider>,
   );
+}
+
+function basePublicationsResponse(overrides = {}) {
+  return {
+    mode: "single_author",
+    authors: overrides.authors || [],
+    items: overrides.items || [],
+    timeline: overrides.timeline ?? null,
+    facets: overrides.facets || { sources: [], venues: [], grants: [], authors: [] },
+    pagination: {
+      page: 1,
+      total: null,
+      has_more: false,
+      next_cursor: null,
+      corpus_source: null,
+      ...(overrides.pagination || {}),
+    },
+    next_cursor: overrides.next_cursor ?? null,
+    has_more: overrides.has_more ?? false,
+    unsupported: false,
+    unsupported_reason: null,
+    ...overrides,
+  };
 }
 
 describe("AuthorPublicationsTable", () => {
@@ -159,14 +180,12 @@ describe("AuthorPublicationsTable", () => {
     );
   });
 
-  it("mounts the infinite-scroll sentinel as a full-width table row", () => {
-    const sentinelRef = { current: null };
-    renderTable({ works: [FULL_WORK], sentinelRef });
+  it("renders title as plain text not a link", () => {
+    renderTable({ works: [FULL_WORK] });
 
-    const sentinel = screen.getByTestId("publications-scroll-sentinel");
-    expect(sentinel.tagName).toBe("TR");
-    expect(sentinelRef.current).toBe(sentinel);
-    expect(sentinel.querySelector("td")).toHaveAttribute("colspan", String(COLUMN_COUNT));
+    const title = screen.getByText("Quantum Entanglement in Practice");
+    expect(title.closest("a")).toBeNull();
+    expect(title.tagName).toBe("P");
   });
 
   it("shows loading, empty, and error states spanning all columns", () => {
@@ -179,10 +198,8 @@ describe("AuthorPublicationsTable", () => {
           <AuthorPublicationsTable
             works={[]}
             loading={false}
-            loadingMore={false}
             error="Something went wrong"
             mode="single_author"
-            sentinelRef={{ current: null }}
             emptyCopy={{ heading: "No publications found", body: "Nothing here." }}
             initialEmpty={false}
           />
@@ -198,10 +215,8 @@ describe("AuthorPublicationsTable", () => {
           <AuthorPublicationsTable
             works={[]}
             loading={false}
-            loadingMore={false}
             error={null}
             mode="single_author"
-            sentinelRef={{ current: null }}
             emptyCopy={{ heading: "No publications found", body: "Nothing here." }}
             initialEmpty
           />
@@ -213,7 +228,7 @@ describe("AuthorPublicationsTable", () => {
   });
 });
 
-describe("AuthorAnalysisPage infinite scroll", () => {
+describe("AuthorAnalysisPage pagination", () => {
   const AUTHORS = [
     {
       canonical_author_id: "c1",
@@ -226,6 +241,18 @@ describe("AuthorAnalysisPage infinite scroll", () => {
   beforeEach(() => {
     clearPublicationsPageCache();
     vi.spyOn(analysisApi, "fetchAuthorPublications");
+    vi.spyOn(publicationStatsRequest, "fetchAuthorPublicationCorpusStats").mockResolvedValue({
+      mode: "single_author",
+      corpus_complete: false,
+      total_matching_publications: 2,
+      timeline: {
+        interval: "year",
+        total_dated_publications: 2,
+        total_matching_publications: 2,
+        items: [{ period: "2020", label: "2020", count: 2 }],
+      },
+      facets: { sources: [], institutions: [], venues: [], grants: [], authors: [] },
+    });
   });
 
   afterEach(() => {
@@ -233,12 +260,31 @@ describe("AuthorAnalysisPage infinite scroll", () => {
     clearPublicationsPageCache();
   });
 
-  it("appends rows without duplicates when loading more", async () => {
-    let observerCallback;
-
-    analysisApi.fetchAuthorPublications
-      .mockResolvedValueOnce({
-        mode: "single_author",
+  it("replaces rows on page 2 and requests page/cursor", async () => {
+    analysisApi.fetchAuthorPublications.mockImplementation(async ({ page = 1, cursor = null }) => {
+      if (page === 2 || cursor === "page-2") {
+        return basePublicationsResponse({
+          authors: [AUTHORS[0]],
+          items: [
+            {
+              id: "w2",
+              title: "Second Paper",
+              publication_year: 2021,
+              analysis_match: { verified: true, method: "x" },
+            },
+          ],
+          pagination: {
+            page: 2,
+            total: 40,
+            has_more: false,
+            next_cursor: null,
+            corpus_source: null,
+          },
+          next_cursor: null,
+          has_more: false,
+        });
+      }
+      return basePublicationsResponse({
         authors: [AUTHORS[0]],
         items: [
           {
@@ -248,101 +294,16 @@ describe("AuthorAnalysisPage infinite scroll", () => {
             analysis_match: { verified: true, method: "x" },
           },
         ],
-        timeline: {
-          interval: "year",
-          total_dated_publications: 2,
-          total_matching_publications: 2,
-          items: [{ period: "2020", label: "2020", count: 1 }],
+        pagination: {
+          page: 1,
+          total: 40,
+          has_more: true,
+          next_cursor: "page-2",
+          corpus_source: null,
         },
         next_cursor: "page-2",
         has_more: true,
-        unsupported: false,
-        unsupported_reason: null,
-      })
-      .mockResolvedValueOnce({
-        mode: "single_author",
-        authors: [AUTHORS[0]],
-        items: [
-          {
-            id: "w1",
-            title: "First Paper",
-            publication_year: 2020,
-            analysis_match: { verified: true, method: "x" },
-          },
-          {
-            id: "w2",
-            title: "Second Paper",
-            publication_year: 2021,
-            analysis_match: { verified: true, method: "x" },
-          },
-        ],
-        timeline: null,
-        next_cursor: null,
-        has_more: false,
-        unsupported: false,
-        unsupported_reason: null,
       });
-
-    class IntersectionObserverMock {
-      constructor(callback) {
-        observerCallback = callback;
-      }
-
-      observe = vi.fn();
-
-      disconnect = vi.fn();
-
-      unobserve = vi.fn();
-    }
-
-    vi.stubGlobal("IntersectionObserver", IntersectionObserverMock);
-
-    render(
-      <ThemeProvider theme={theme}>
-        <MemoryRouter
-          initialEntries={[
-            { pathname: "/analyze/authors", state: { authors: [AUTHORS[0]] } },
-          ]}
-        >
-          <Routes>
-            <Route path="/analyze/authors" element={<AuthorAnalysisPage />} />
-          </Routes>
-        </MemoryRouter>
-      </ThemeProvider>,
-    );
-
-    await waitFor(() => expect(screen.getByText("First Paper")).toBeInTheDocument());
-
-    observerCallback([{ isIntersecting: true }]);
-    await waitFor(() => expect(screen.getByText("Second Paper")).toBeInTheDocument());
-
-    expect(screen.getAllByText("First Paper")).toHaveLength(1);
-    expect(analysisApi.fetchAuthorPublications).toHaveBeenCalledTimes(2);
-    expect(analysisApi.fetchAuthorPublications.mock.calls[1][0].cursor).toBe("page-2");
-  });
-
-  it("keeps the sentinel mounted after the chart renders", async () => {
-    analysisApi.fetchAuthorPublications.mockResolvedValue({
-      mode: "single_author",
-      authors: [AUTHORS[0]],
-      items: [
-        {
-          id: "w1",
-          title: "First Paper",
-          publication_year: 2020,
-          analysis_match: { verified: true, method: "x" },
-        },
-      ],
-      timeline: {
-        interval: "year",
-        total_dated_publications: 1,
-        total_matching_publications: 1,
-        items: [{ period: "2020", label: "2020", count: 1 }],
-      },
-      next_cursor: "page-2",
-      has_more: true,
-      unsupported: false,
-      unsupported_reason: null,
     });
 
     render(
@@ -360,13 +321,77 @@ describe("AuthorAnalysisPage infinite scroll", () => {
     );
 
     await waitFor(() => expect(screen.getByText("First Paper")).toBeInTheDocument());
-    expect(screen.getByTestId("publications-scroll-sentinel")).toBeInTheDocument();
-    expect(screen.getByText("Publications over time")).toBeInTheDocument();
+    const pagination = await screen.findByTestId("publications-pagination");
+    fireEvent.click(within(pagination).getByRole("button", { name: "Go to page 2" }));
+
+    await waitFor(() => expect(screen.getByText("Second Paper")).toBeInTheDocument());
+    expect(screen.queryByText("First Paper")).not.toBeInTheDocument();
+
+    const pageTwoCall = analysisApi.fetchAuthorPublications.mock.calls.find(
+      ([payload]) => payload.page === 2,
+    );
+    expect(pageTwoCall).toBeTruthy();
+    expect(pageTwoCall[0].cursor).toBe("page-2");
+  });
+
+  it("shows range label and pagination when there are more pages", async () => {
+    analysisApi.fetchAuthorPublications.mockResolvedValue(
+      basePublicationsResponse({
+        authors: [AUTHORS[0]],
+        items: [
+          {
+            id: "w1",
+            title: "First Paper",
+            publication_year: 2020,
+            analysis_match: { verified: true, method: "x" },
+          },
+        ],
+        pagination: {
+          page: 1,
+          total: 40,
+          has_more: true,
+          next_cursor: "page-2",
+          corpus_source: null,
+        },
+        next_cursor: "page-2",
+        has_more: true,
+      }),
+    );
+
+    render(
+      <ThemeProvider theme={theme}>
+        <MemoryRouter
+          initialEntries={[
+            { pathname: "/analyze/authors", state: { authors: [AUTHORS[0]] } },
+          ]}
+        >
+          <Routes>
+            <Route path="/analyze/authors" element={<AuthorAnalysisPage />} />
+          </Routes>
+        </MemoryRouter>
+      </ThemeProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByText("First Paper")).toBeInTheDocument());
+    expect(await screen.findByTestId("publications-range-label")).toBeInTheDocument();
+    expect(screen.getByTestId("publications-pagination")).toBeInTheDocument();
+    expect(screen.getByTestId("publications-range-label")).toHaveTextContent(
+      /Showing 1–1 of 40 unique publications/,
+    );
   });
 });
 
 describe("Other publication pages", () => {
   it("renders grant publications with the shared publications table", async () => {
+    class IntersectionObserverStub {
+      observe() {}
+
+      disconnect() {}
+
+      unobserve() {}
+    }
+    vi.stubGlobal("IntersectionObserver", IntersectionObserverStub);
+
     const grantsApi = await import("../../api/grantsApi");
     const { clearGrantPublicationsPageCache } = await import("../grants/GrantPublicationsPage");
     clearGrantPublicationsPageCache();

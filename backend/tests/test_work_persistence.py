@@ -125,34 +125,171 @@ async def test_same_doi_from_multiple_providers_merges(session):
 
 
 @pytest.mark.asyncio
-async def test_same_title_different_authors_not_merged(session):
+async def test_same_title_same_year_different_month_not_merged(session):
+    service = WorkPersistenceService(session)
+    left = candidate_from_provider_result(
+        {
+            **_work_row(
+                provider="openalex",
+                provider_work_id="W-jan",
+                title="Shared Title Paper",
+                year=2024,
+                authors=[{"name": "Ada Lovelace"}],
+            ),
+            "publication_date": "2024-01-15",
+        },
+        provider="openalex",
+    )
+    right = candidate_from_provider_result(
+        {
+            **_work_row(
+                provider="openalex",
+                provider_work_id="W-jun",
+                title="Shared Title Paper",
+                year=2024,
+                authors=[{"name": "Ada Lovelace"}],
+            ),
+            "publication_date": "2024-06-01",
+        },
+        provider="openalex",
+    )
+    a, _ = await service.resolve_candidate(left)
+    b, _ = await service.resolve_candidate(right)
+    await session.commit()
+    assert a.id != b.id
+
+
+@pytest.mark.asyncio
+async def test_same_title_same_year_without_month_not_merged(session):
+    """Year-only timing is not strong enough — prefer keeping possible duplicates."""
     service = WorkPersistenceService(session)
     left = candidate_from_provider_result(
         _work_row(
             provider="openalex",
-            provider_work_id="W1",
-            title="Attention Is All You Need",
-            year=2017,
-            authors=[{"name": "Ashish Vaswani"}],
+            provider_work_id="W-a",
+            title="Year Only Paper",
+            year=2023,
+            authors=[{"name": "Ada Lovelace"}],
         ),
         provider="openalex",
     )
     right = candidate_from_provider_result(
         _work_row(
             provider="openalex",
-            provider_work_id="W2",
-            title="Attention Is All You Need",
-            year=2017,
-            authors=[{"name": "Someone Else"}],
+            provider_work_id="W-b",
+            title="Year Only Paper",
+            year=2023,
+            authors=[{"name": "Ada Lovelace"}],
         ),
         provider="openalex",
     )
     a, _ = await service.resolve_candidate(left)
     b, _ = await service.resolve_candidate(right)
     await session.commit()
-
     assert a.id != b.id
-    assert normalize_title("Attention Is All You Need") == a.normalized_title
+
+
+@pytest.mark.asyncio
+async def test_same_doi_across_versions_merged(session):
+    service = WorkPersistenceService(session)
+    journal = candidate_from_provider_result(
+        {
+            **_work_row(
+                provider="openalex",
+                provider_work_id="W-journal",
+                title="Versioned Paper",
+                year=2024,
+                doi="10.1000/versioned",
+                authors=[{"name": "Ada Lovelace"}],
+            ),
+            "publication_date": "2024-08-01",
+        },
+        provider="openalex",
+    )
+    preprint = candidate_from_provider_result(
+        {
+            **_work_row(
+                provider="openalex",
+                provider_work_id="W-preprint",
+                title="Versioned Paper",
+                year=2024,
+                doi="10.1000/versioned",
+                authors=[{"name": "Ada Lovelace"}],
+            ),
+            "publication_date": "2024-02-10",
+        },
+        provider="openalex",
+    )
+    a, _ = await service.resolve_candidate(journal)
+    b, _ = await service.resolve_candidate(preprint)
+    await session.commit()
+    assert a.id == b.id
+
+
+@pytest.mark.asyncio
+async def test_same_arxiv_id_across_versions_merged(session):
+    service = WorkPersistenceService(session)
+    first = candidate_from_provider_result(
+        _work_row(
+            provider="arxiv",
+            provider_work_id="2401.11111",
+            title="ArXiv Twin A",
+            year=2024,
+            arxiv_id="2401.11111",
+            authors=[{"name": "Ada Lovelace"}],
+        ),
+        provider="arxiv",
+    )
+    second = candidate_from_provider_result(
+        _work_row(
+            provider="openalex",
+            provider_work_id="W-arxiv-twin",
+            title="ArXiv Twin B",
+            year=2024,
+            arxiv_id="2401.11111",
+            authors=[{"name": "Ada Lovelace"}],
+        ),
+        provider="openalex",
+    )
+    a, _ = await service.resolve_candidate(first)
+    b, _ = await service.resolve_candidate(second)
+    await session.commit()
+    assert a.id == b.id
+
+
+@pytest.mark.asyncio
+async def test_same_title_author_year_month_merged(session):
+    service = WorkPersistenceService(session)
+    left = candidate_from_provider_result(
+        {
+            **_work_row(
+                provider="openalex",
+                provider_work_id="W-m1",
+                title="Strong Timing Paper",
+                year=2022,
+                authors=[{"name": "Ada Lovelace"}],
+            ),
+            "publication_date": "2022-03-01",
+        },
+        provider="openalex",
+    )
+    right = candidate_from_provider_result(
+        {
+            **_work_row(
+                provider="arxiv",
+                provider_work_id="2203.99999",
+                title="Strong Timing Paper",
+                year=2022,
+                authors=[{"name": "Ada Lovelace"}],
+            ),
+            "publication_date": "2022-03-18",
+        },
+        provider="arxiv",
+    )
+    a, _ = await service.resolve_candidate(left)
+    b, _ = await service.resolve_candidate(right)
+    await session.commit()
+    assert a.id == b.id
 
 
 @pytest.mark.asyncio

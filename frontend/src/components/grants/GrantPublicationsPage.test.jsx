@@ -260,7 +260,7 @@ describe("GrantPublicationsPage filters", () => {
 
     renderPage();
     const authorButton = await screen.findByRole("button", {
-      name: "View profile for Ada Lovelace",
+      name: "Author details for Ada Lovelace",
     });
     fireEvent.mouseEnter(authorButton);
 

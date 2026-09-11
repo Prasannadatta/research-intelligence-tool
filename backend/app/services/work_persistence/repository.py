@@ -155,22 +155,53 @@ class WorkPersistenceRepository:
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
-    async def find_canonical_by_title_year_author(
+    async def find_canonical_by_title_author_strong_timing(
         self,
         *,
         normalized_title: str,
         publication_year: int | None,
+        publication_month: int | None,
         normalized_first_author: str | None,
     ) -> CanonicalWork | None:
-        if not normalized_title or publication_year is None or not normalized_first_author:
+        """Fallback merge only when title + first author + year + month all agree.
+
+        Same title + year alone is not enough. If month precision is missing on
+        either side, prefer keeping possible duplicates over incorrect merges.
+        """
+        if (
+            not normalized_title
+            or publication_year is None
+            or publication_month is None
+            or not (1 <= int(publication_month) <= 12)
+            or not normalized_first_author
+        ):
             return None
+
         stmt = select(CanonicalWork).where(
             CanonicalWork.normalized_title == normalized_title,
             CanonicalWork.publication_year == publication_year,
             CanonicalWork.normalized_first_author == normalized_first_author,
         )
-        result = await self.session.execute(stmt)
-        return result.scalar_one_or_none()
+        candidates = list((await self.session.execute(stmt)).scalars().all())
+        if not candidates:
+            return None
+
+        from app.services.work_persistence.normalization import extract_publication_timing
+
+        for work in candidates:
+            provider_rows = (
+                await self.session.execute(
+                    select(ProviderWorkRecord).where(
+                        ProviderWorkRecord.canonical_work_id == work.id
+                    )
+                )
+            ).scalars().all()
+            for record in provider_rows:
+                raw = record.raw_metadata if isinstance(record.raw_metadata, dict) else {}
+                _year, month = extract_publication_timing(raw)
+                if month == publication_month:
+                    return work
+        return None
 
     async def create_canonical_work(self, candidate: WorkCandidate) -> CanonicalWork:
         work = CanonicalWork(

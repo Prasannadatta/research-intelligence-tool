@@ -6,7 +6,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.services.work_persistence.normalization import (
+    arxiv_id_from_doi,
     extract_provider_work_id,
+    extract_publication_timing,
     first_author_name,
     normalize_arxiv_id,
     normalize_doi,
@@ -24,6 +26,7 @@ class WorkCandidate:
     title: str
     normalized_title: str
     publication_year: int | None = None
+    publication_month: int | None = None
     first_author: str | None = None
     normalized_first_author: str | None = None
     doi: str | None = None
@@ -52,13 +55,11 @@ def candidate_from_provider_result(
     arxiv_id = normalize_arxiv_id(
         result.get("arxiv_id") or (result.get("source_id") if provider == "arxiv" else None)
     )
+    if arxiv_id is None:
+        arxiv_id = arxiv_id_from_doi(doi)
     pmid = normalize_pmid(result.get("pmid"))
 
-    year = result.get("publication_year")
-    try:
-        publication_year = int(year) if year is not None else None
-    except (TypeError, ValueError):
-        publication_year = None
+    publication_year, publication_month = extract_publication_timing(result)
 
     grant_number = result.get("matched_grant_number")
     grant_match = result.get("grant_match") if isinstance(result.get("grant_match"), dict) else {}
@@ -71,6 +72,7 @@ def candidate_from_provider_result(
         title=title,
         normalized_title=normalize_title(title),
         publication_year=publication_year,
+        publication_month=publication_month,
         first_author=first_author,
         normalized_first_author=normalize_person_name(first_author) or None,
         doi=doi,

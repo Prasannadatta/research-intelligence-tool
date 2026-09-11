@@ -20,7 +20,6 @@ import {
   Typography,
 } from "@mui/material";
 import { getAnalysisPalette } from "../../theme/analysisPalette";
-import ArticleOutlinedIcon from "@mui/icons-material/ArticleOutlined";
 import LinkIcon from "@mui/icons-material/Link";
 import OpenInNewIcon from "@mui/icons-material/OpenInNew";
 
@@ -33,7 +32,6 @@ import {
   getWorkId,
   getWorkLinks,
   getWorkProviders,
-  getWorkTitleHref,
   getWorkVenue,
 } from "./authorPublicationHelpers";
 import { AuthorNameLink } from "./AuthorInfoPopover";
@@ -97,41 +95,12 @@ function ExternalLink({ href, label, children }) {
 
 function TitleCell({ work }) {
   const title = work?.title || "Untitled";
-  const titleHref = getWorkTitleHref(work);
 
-  if (!titleHref) {
-    return (
-      <Typography variant="body2" fontWeight={600} sx={{ wordBreak: "break-word" }}>
-        {title}
-      </Typography>
-    );
-  }
-
-  if (titleHref.external) {
-    return (
-      <ExternalLink href={titleHref.href} label={`Open ${title}`}>
-        <Typography
-          component="span"
-          variant="body2"
-          fontWeight={600}
-          sx={{ wordBreak: "break-word" }}
-        >
-          {title}
-        </Typography>
-      </ExternalLink>
-    );
-  }
-
+  // Titles are display-only for now — no internal or external navigation.
   return (
-    <Link
-      component={RouterLink}
-      to={titleHref.href}
-      underline="hover"
-      color="primary"
-      sx={{ fontWeight: 600, wordBreak: "break-word" }}
-    >
+    <Typography variant="body2" fontWeight={600} sx={{ wordBreak: "break-word" }}>
       {title}
-    </Link>
+    </Typography>
   );
 }
 
@@ -290,20 +259,10 @@ function LinksCell({ work }) {
   const links = getWorkLinks(work);
   const seenHrefs = new Set();
   const actions = [
-    links.internal
-      ? {
-          key: "internal",
-          href: links.internal,
-          external: false,
-          label: "View work page",
-          icon: ArticleOutlinedIcon,
-        }
-      : null,
     links.doi
       ? {
           key: "doi",
           href: links.doi,
-          external: true,
           label: "Open DOI",
           icon: LinkIcon,
         }
@@ -312,7 +271,6 @@ function LinksCell({ work }) {
       ? {
           key: "arxiv",
           href: links.arxiv,
-          external: true,
           label: "View on arXiv",
           icon: OpenInNewIcon,
         }
@@ -321,7 +279,6 @@ function LinksCell({ work }) {
       ? {
           key: "provider",
           href: links.provider,
-          external: true,
           label: "Open provider page",
           icon: OpenInNewIcon,
         }
@@ -348,10 +305,10 @@ function LinksCell({ work }) {
           <IconButton
             size="small"
             aria-label={action.label}
-            component={action.external ? "a" : RouterLink}
-            {...(action.external
-              ? { href: action.href, target: "_blank", rel: "noopener noreferrer" }
-              : { to: action.href })}
+            component="a"
+            href={action.href}
+            target="_blank"
+            rel="noopener noreferrer"
             sx={{ color: "text.secondary" }}
           >
             <Icon fontSize="small" />
@@ -514,10 +471,10 @@ const SORTABLE_HEADERS = [
 function AuthorPublicationsTable({
   works,
   loading,
-  loadingMore,
+  loadingMore = false,
   error,
   mode,
-  sentinelRef,
+  sentinelRef = null,
   emptyCopy,
   initialEmpty,
   searchedGrantNumber = null,
@@ -528,6 +485,7 @@ function AuthorPublicationsTable({
   onToggleVisible,
   sort,
   onSortChange,
+  embedded = false,
 }) {
   const showEmpty = !loading && !error && (initialEmpty || works.length === 0);
   const selectable = Boolean(onToggleSelected);
@@ -544,10 +502,11 @@ function AuthorPublicationsTable({
       sx={{
         width: "100%",
         maxWidth: "none",
-        border: "1px solid",
+        border: embedded ? "none" : "1px solid",
         borderColor: "divider",
-        borderRadius: "18px",
+        borderRadius: embedded ? 0 : "18px",
         overflow: "hidden",
+        bgcolor: "background.paper",
       }}
     >
       <TableContainer sx={{ width: "100%", maxWidth: "none", overflowX: "auto" }}>
@@ -637,7 +596,8 @@ function AuthorPublicationsTable({
                 ))
               : null}
 
-            {!loading && !error && works.length > 0 ? (
+            {/* Optional sentinel retained for Grant publications infinite scroll only. */}
+            {!loading && !error && works.length > 0 && sentinelRef ? (
               <TableRow ref={sentinelRef} data-testid="publications-scroll-sentinel">
                 <TableCell colSpan={colSpan} sx={{ p: 0, border: 0 }}>
                   <Box sx={{ minHeight: 16, py: loadingMore ? 1.25 : 0, textAlign: "center" }}>

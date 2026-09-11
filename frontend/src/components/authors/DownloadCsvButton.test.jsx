@@ -103,4 +103,19 @@ describe("DownloadCsvButton", () => {
       ),
     ).toBeInTheDocument();
   });
+
+  it("hides helper text in compact mode", () => {
+    render(
+      <DownloadCsvButton
+        compact
+        disabled
+        onExport={vi.fn()}
+        helperText="Exports all filtered publications with available author, institution, grant, venue, and source metadata."
+      />,
+    );
+    expect(screen.getByTestId("download-csv-button")).toBeDisabled();
+    expect(
+      screen.queryByText(/Exports all filtered publications/i),
+    ).not.toBeInTheDocument();
+  });
 });

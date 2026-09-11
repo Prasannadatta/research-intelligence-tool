@@ -5,16 +5,22 @@ import { ThemeProvider, createTheme } from "@mui/material/styles";
 import { ENTITY_TYPES, FALLBACK_CAPABILITIES, SEARCH_SOURCES } from "../../api/searchApi";
 import SourceSelector from "./SourceSelector";
 
-const theme = createTheme({ colorSchemes: { light: true, dark: true } });
+const theme = createTheme();
 
-function renderSelector(props = {}) {
+function renderSelector({
+  sources = FALLBACK_CAPABILITIES.sources,
+  value = SEARCH_SOURCES.ALL,
+  entityType = ENTITY_TYPES.AUTHORS,
+  onChange = vi.fn(),
+  ...props
+} = {}) {
   return render(
     <ThemeProvider theme={theme}>
       <SourceSelector
-        sources={FALLBACK_CAPABILITIES.sources}
-        value={SEARCH_SOURCES.ALL}
-        entityType={ENTITY_TYPES.AUTHORS}
-        onChange={vi.fn()}
+        sources={sources}
+        value={value}
+        entityType={entityType}
+        onChange={onChange}
         {...props}
       />
     </ThemeProvider>,
